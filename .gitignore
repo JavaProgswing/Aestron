@@ -129,7 +129,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-/.idea/.gitignore
+/.idea/*
 /parser.out
 /parsetab.py
 

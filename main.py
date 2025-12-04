@@ -57,6 +57,7 @@ import logging
 import wavelink
 from typing import cast
 from discord import app_commands
+from utils import get_traceback, constructmsg, constructctx, constructslashephemeralctx, channelNotProvided, userNotProvided, rateExceeded, fakeGuildMember, checkstaff, convertwords, PaginateEmbed, loginfo, checkProfane, check_ensure_permissions, is_bot_staff, convert, ConfirmDecline, botowners
 
 
 def noglobal(f):
@@ -66,7 +67,7 @@ def noglobal(f):
 load_dotenv()
 load_dotenv(dotenv_path="github.env")
 load_dotenv(dotenv_path="database.env")
-botowners = ["488643992628494347", "625265223250608138"]
+
 token = os.getenv("DISCORD_TOKEN")
 valorant_api_key = os.getenv("VAL_API_TOKEN")
 valorant_rso_api_key = os.getenv("VAL_RSO_API_TOKEN")
@@ -178,7 +179,6 @@ SUPPORT_SERVER_INVITE = "https://discord.gg/TZDYSHSZgg"
 # https://brainshop.ai/
 conn = None
 pool = None
-logger = None
 forceexecstop = False
 afterchannelupdate = []
 beforechannelupdate = []
@@ -411,14 +411,13 @@ class MyHelp(commands.HelpCommand):
 
     async def on_help_command_error(self, ctx, error):
         await super().on_help_command_error(ctx, error)
-        logger.error(f"Error in help command: {error}")
 
     async def send_bot_help(self, mapping):
         global customCog
         filteredcmds = []
         allcommands = []
         for cog, commands in mapping.items():
-            filcmds = await self.filter_commands(commands=commands, sort=True)
+            filcmds = await self.filter_commands(commands, sort=True)
             for cmd in filcmds:
                 if (
                     cog == customCog
@@ -1187,12 +1186,13 @@ async def runBot():
     pool = await asyncpg.create_pool(
         DATABASE_URL, max_size=max(20, len(client.guilds)), min_size=1
     )
+    client.pool = pool
     logging.log(logging.DEBUG, f"The database sql has been set to {conn}")
     client.session = aiohttp.ClientSession()
     logging.log(logging.DEBUG, f"The session has been set to {client.session}")
     client.github_session = aiohttp.ClientSession()
     nodes = [
-        wavelink.Node(uri="http://192.168.29.64:27051/", password="youshallnotpass")
+        wavelink.Node(uri="http://192.168.29.64:27000/", password="youshallnotpass")
     ]
     await wavelink.Pool.connect(nodes=nodes, client=client)
     valorantMatchSave.start()
@@ -1240,10 +1240,14 @@ class MyBot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+
+
     async def is_owner(self, user: discord.User):
         return checkstaff(user)
 
     async def setup_hook(self):
+        await self.load_extension("cogs.listeners")
+        await self.load_extension("cogs.moderation")
         self.add_view(Verification())
         self.loop.create_task(runBot())
 
@@ -1311,6 +1315,7 @@ client = MyBot(
     help_command=MyHelp(),
     strip_after_prefix=True,
 )
+client.service = service
 
 
 class CustomFormatter(logging.Formatter):
@@ -1950,29 +1955,7 @@ class Confirmpvp(discord.ui.View):
         self.stop()
 
 
-class ConfirmDecline(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=299)
-        self.value = None
-        self.authorcancel = None
 
-    # When the confirm button is pressed, set the inner value to `True` and
-    # stop the View from listening to more input.
-    # We also send the user an ephemeral message that we're confirming their choice.
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red)
-    async def confirm(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        # await interaction.response.send_message('Confirming', ephemeral=True)
-        if not interaction.channel.permissions_for(interaction.user).manage_guild:
-            await interaction.response.send_message(
-                "You do not have permissions to do so!", ephemeral=True
-            )
-            return
-        self.authorcancel = interaction.user.mention
-        self.value = True
-        self.stop()
 
 
 class Confirm(discord.ui.View):
@@ -2156,11 +2139,7 @@ async def on_command_error(ctx, error):
         
     await send_generic_error_embed(ctx, error_data)
 
-async def send_generic_error_embed(ctx, error_data):
-    embed = discord.Embed(
-        title=f"🚫 Command Error ", description=error_data, color=Color.dark_red()
-    )
-    await ctx.send(embed=embed)
+
 
 async def send_error_log_embed(ctx, error):
     embederror = discord.Embed(
@@ -2168,9 +2147,8 @@ async def send_error_log_embed(ctx, error):
         description=f"Command: {ctx.command}.",
         color=Color.dark_red(),
     )
-    pastecode = await mystbin_client.create_paste(
-        content=get_traceback(error), filename=f"AE-{genrandomstr(10)}"
-    )
+    file = mystbin.File(filename=f"AE-{genrandomstr(10)}", content=get_traceback(error))
+    pastecode = await mystbin_client.create_paste(files=[file])
     embederror.add_field(name="Traceback: ", value=pastecode.url)
     await client.get_channel(CHANNEL_ERROR_LOGGING_ID).send(embed=embederror)
 
@@ -2222,25 +2200,10 @@ def getcodeblock(code):
     return (lang, code)
 
 
-async def loginfo(logguild, title, description, changes):
-    logchannel = None
-    async with pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    msgsent = None
-    if logchannel:
-        embed = discord.Embed(title=title, description=description, color=Color.blue())
-        embed.add_field(name="** **", value=changes)
-        msgsent = await logchannel.send(embed=embed)
-    return msgsent
 
 
-def convertwords(lst):
-    return " ".join(lst).split()
+
+
 
 
 async def uservoted(member: discord.Member):
@@ -2255,15 +2218,7 @@ async def uservoted(member: discord.Member):
         return False
 
 
-def is_bot_staff():
-    def predicate(ctx):
-        is_staff = False
-        for i in botowners:
-            if str(ctx.author.id) == i:
-                is_staff = True
-        return is_staff
 
-    return commands.check(predicate)
 
 
 def is_guild_owner():
@@ -2273,13 +2228,7 @@ def is_guild_owner():
     return commands.check(predicate)
 
 
-def checkstaff(member):
-    is_staff = False
-    for i in botowners:
-        if str(member.id) == i:
-            is_staff = True
-            break
-    return is_staff
+
 
 
 def checkCapsNum(sentence):
@@ -2352,20 +2301,7 @@ def getProgress(value, divisions=10):
     return progressstr
 
 
-def checkProfane(_message):
-    analyze_request = {
-        "comment": {"text": _message},
-        "requestedAttributes": {"PROFANITY": {}},
-    }
-    attributes = ["PROFANITY"]
-    try:
-        response = service.comments().analyze(body=analyze_request).execute()
-        for attribute in attributes:
-            attribute_dict = response["attributeScores"][attribute]
-            score_value = attribute_dict["spanScores"][0]["score"]["value"]
-            return score_value >= 0.45
-    except:
-        return False
+
 
 
 def minimumPrice(items):
@@ -2510,38 +2446,10 @@ async def dangPerm(ctx, author, theChannel=None):
     return dangerousperms
 
 
-def convert(timesen):
-    totaltime = 0
-    if timesen is None:
-        return None
-    for i in timesen.split():
-        convtime = convertword(i)
-        if convtime == -1:
-            return -1
-        elif convtime == -2:
-            return -2
-        elif convtime == -3:
-            return -3
-        totaltime = totaltime + convtime
-    return totaltime
 
 
-def convertword(time):
-    pos = ["s", "m", "h", "d"]
 
-    time_dict = {"s": 1, "m": 60, "h": 3600, "d": 3600 * 24}
 
-    unit = time[-1]
-
-    if unit not in pos:
-        return -1
-    try:
-        val = int(time[:-1])
-    except:
-        return -2
-    if val <= 0:
-        return -3
-    return val * time_dict[unit]
 
 
 def validurl(theurl):
@@ -2680,10 +2588,7 @@ async def valorantMatchSave():
         logging.log(logging.DEBUG, f"\rGetting match history for {puuidstr}(100% complete)", end="")
 
 
-def check_ensure_permissions(ctx, member, perms):
-    for perm in perms:
-        if not getattr(ctx.channel.permissions_for(member), perm):
-            raise discord.ext.commands.errors.BotMissingPermissions([perm])
+
 
 
 @tasks.loop(seconds=15)
@@ -3017,727 +2922,7 @@ def ismuted(ctx, member):
     return False
 
 
-class Moderation(commands.Cog):
-    """Moderation commands."""
 
-    @commands.hybrid_command(
-        brief="This command locks the given channel until a duration.",
-        description="This command locks the given channel until a duration(requires manage guild).",
-        usage="#channel reason @role duration",
-        aliases=["lockdown", "restrict", "startlockdown"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def lock(
-        self,
-        ctx,
-        channel: typing.Union[
-            discord.VoiceChannel, discord.TextChannel, discord.StageChannel
-        ],
-        reason: str = "no reason provided",
-        role: discord.Role = None,
-        duration: str = None,
-    ):
-        check_ensure_permissions(ctx, ctx.guild.me, ["manage_channels"])
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
-            return
-        await channel.edit(name=f"🔒-{channel.name}")
-        if role is None:
-            role = ctx.guild.default_role
-        overw = channel.overwrites
-        overw[ctx.guild.me] = discord.PermissionOverwrite(
-            view_channel=True,
-            read_messages=True,
-            send_messages=True,
-        )
-        overw[role] = discord.PermissionOverwrite(
-            view_channel=True,
-            read_messages=True,
-            send_messages=False,
-        )
-        for roleL in ctx.guild.roles:
-            overw[roleL] = discord.PermissionOverwrite(view_channel=True)
-            for pair in channel.overwrites_for(roleL):
-                if not pair[1]:
-                    overw[roleL]._set(pair[0], pair[1])
-        overw[role]._set("send_messages", False)
-        await channel.edit(overwrites=overw)
-        embed = discord.Embed(
-            title=f"Channel locked",
-            description=f"{channel.mention} locked by {ctx.author.mention} for {reason}.",
-            color=0x2FA737,
-        )  # Green
-        if channel.id != ctx.channel.id:
-            await channel.send(embed=embed)
-        await ctx.channel.send(embed=embed)
-        if not duration is None:
-            timenum = convert(duration)
-            if timenum == -1:
-                await send_generic_error_embed(ctx, error_data=
-                    "You didn't answer with a proper unit. Use (s|m|h|d) next time!"
-                )
-                return
-            elif timenum == -2:
-                await send_generic_error_embed(ctx, error_data=
-                    "The time must be an integer. Please enter an integer next time."
-                )
-                return
-            elif timenum == -3:
-                await send_generic_error_embed(ctx, error_data=
-                    "The time must be an positive number. Please enter an positive number next time."
-                )
-                return
-            await asyncio.sleep(timenum)
-            await channel.edit(name=channel.name.removeprefix("🔒-"))
-            overw = channel.overwrites
-            overw[ctx.guild.me] = discord.PermissionOverwrite(
-                view_channel=True,
-                read_messages=True,
-                send_messages=True,
-            )
-            overw[role] = discord.PermissionOverwrite(
-                view_channel=True,
-                read_messages=True,
-                send_messages=True,
-            )
-            await channel.edit(overwrites=overw)
-            embed = discord.Embed(
-                title=f"Channel unlocked",
-                description=f"{channel.mention} unlocked by {ctx.author.mention} for {reason}.",
-                color=0x2FA737,
-            )  # Green
-            if channel.id != ctx.channel.id:
-                await channel.send(embed=embed)
-            await ctx.channel.send(embed=embed)
-
-    @commands.hybrid_command(
-        brief="This command unlocks the given channel.",
-        description="This command unlocks the given channel(requires manage guild).",
-        usage="@role #channel reason",
-        aliases=["stoplockdown", "unrestrict"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def unlock(
-        self,
-        ctx,
-        channel: typing.Union[
-            discord.VoiceChannel, discord.TextChannel, discord.StageChannel
-        ],
-        reason: str = "no reason provided",
-        role: discord.Role = None,
-    ):
-        check_ensure_permissions(ctx, ctx.guild.me, ["manage_guild"])
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
-            return
-        await channel.edit(name=channel.name.removeprefix("🔒-"))
-        if role is None:
-            role = ctx.guild.default_role
-        overw = channel.overwrites
-        overw[ctx.guild.me] = discord.PermissionOverwrite(
-            view_channel=True,
-            read_messages=True,
-            send_messages=True,
-        )
-        overw[role] = discord.PermissionOverwrite(
-            view_channel=True,
-            read_messages=True,
-            send_messages=True,
-        )
-        for roleL in ctx.guild.roles:
-            overw[roleL] = discord.PermissionOverwrite(view_channel=True)
-            for pair in channel.overwrites_for(roleL):
-                if not pair[1]:
-                    overw[roleL]._set(pair[0], pair[1])
-        overw[role]._set("send_messages", True)
-        await channel.edit(overwrites=overw)
-        embed = discord.Embed(
-            title=f"Channel unlocked",
-            description=f"{channel.mention} unlocked by {ctx.author.mention} for {reason}.",
-            color=0x2FA737,
-        )  # Green
-        if channel.id != ctx.channel.id:
-            await channel.send(embed=embed)
-        await ctx.channel.send(embed=embed)
-
-    @commands.cooldown(1, 30, BucketType.channel)
-    @commands.hybrid_command(
-        brief="This command retrieves the previously deleted message in a channel.",
-        description="This command retrieves the previously deleted message in a channel.",
-        usage="",
-        aliases=["snipemsg", "whodeleted", "sn"],
-    )
-    @commands.guild_only()
-    async def snipe(self, ctx):
-        async with pool.acquire() as con:
-            snipelist = await con.fetchrow(
-                f"SELECT * FROM snipelog where channelid = {ctx.channel.id}"
-            )
-        if snipelist is not None:
-            username = snipelist["username"]
-            content = snipelist["content"]
-            jsonembeds = snipelist["embeds"]
-            jsonembeds = json.loads(jsonembeds)
-            timeembed = snipelist["timedeletion"]
-            if not "1" in jsonembeds:
-                embedDeleted = discord.Embed.from_dict(jsonembeds)
-            listofsentence = [content]
-            listofwords = convertwords(listofsentence)
-            for word in listofwords:
-                serverinvitecheck = re.compile(
-                    "(?:https?://)?discord(?:app)?\.(?:com/invite|gg)/[a-zA-Z0-9]+/?"
-                )
-                if serverinvitecheck.match(word):
-                    content = "||Hidden for containing server invites||"
-                    break
-                if not word.startswith("http:") and not word.startswith("https:"):
-                    wordone = "http://" + word
-                    wordtwo = "https://" + word
-                    if validurl(wordone) or validurl(wordtwo):
-                        content = "||Hidden for containing links||"
-                        break
-                else:
-                    if validurl(word):
-                        content = "||Hidden for containing links||"
-                        break
-            if checkProfane(content):
-                content = "||Hidden for containing profane text||"
-            embed = discord.Embed(
-                title="** **",
-                description="Recently deleted messages :",
-                timestamp=timeembed,
-            )
-            embed.add_field(name="Author", value=username)
-            embed.add_field(name="Content", value=f"{content} ** **")
-            await ctx.send(embed=embed, ephemeral=True)
-            if not "1" in jsonembeds:
-                safeembed = True
-                linkchecktitle = str(embedDeleted.title) + " " + str(embedDeleted.url)
-                listofwords = convertwords(linkchecktitle)
-                for word in listofwords:
-                    if not word.startswith("http:") and not word.startswith("https:"):
-                        wordone = "http://" + word
-                        wordtwo = "https://" + word
-                        if validurl(wordone) or validurl(wordtwo):
-                            safeembed = False
-                    else:
-                        if validurl(word):
-                            safeembed = False
-                if safeembed:
-                    embed = discord.Embed(
-                        title="** **", description="Recently deleted embeds :"
-                    )
-                    await ctx.send(embed=embed, ephemeral=True)
-                    await ctx.send(embed=embedDeleted, ephemeral=True)
-        else:
-            embed = discord.Embed(
-                title="** **", description="There are no recently deleted messages."
-            )
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command sets slowmode delay to a certain channel.",
-        description="This command sets slowmode delay to a certain channel(requires manage messages).",
-        usage="delay",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_messages=True))
-    async def setslowmode(self, ctx, delay: int = 0):
-        check_ensure_permissions(ctx, ctx.guild.me, ["manage_channels"])
-        if delay < 0:
-            await send_generic_error_embed(ctx, error_data=
-                "You cannot set slowmode to negative amount of delay."
-            )
-            return
-        try:
-            await ctx.channel.edit(slowmode_delay=delay)
-            await ctx.send(
-                f"Successfully set slowmode of {ctx.channel.name} to {delay} seconds.",
-                ephemeral=True,
-            )
-        except:
-            raise commands.BotMissingPermissions(["manage_channels"])
-
-    @commands.hybrid_command(
-        brief="This command clears given number of messages from the same channel.",
-        description="This command clears given number of messages from the same channel(requires manage messages).",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_messages=True))
-    async def selfpurge(self, ctx, numberstr: int, reason: str = None):
-        if reason is None:
-            reason = "no reason provided"
-        try:
-            number = int(numberstr)
-        except:
-            await send_generic_error_embed(ctx, error_data="Enter a valid number to purge messages.")
-            return
-        if number <= 0:
-            await send_generic_error_embed(ctx, error_data=
-                " You cannot purge negative/zero amount of messages."
-            )
-            return
-        try:
-
-            def is_me(m):
-                return m.author == ctx.guild.me
-
-            await ctx.channel.purge(check=is_me, limit=number)
-        except:
-            pass
-        embed = discord.Embed(
-            title="Self Messages purged", description=f"{number} messages ."
-        )
-        embed.add_field(name="Moderator", value=ctx.author.mention)
-        embed.add_field(name="Reason", value=reason)
-        try:
-            await ctx.send(embed=embed, ephemeral=True)
-        except:
-            await ctx.send(embed=embed)
-
-    @commands.hybrid_command(
-        brief="This command clears given number of messages from the same channel.",
-        description="This command clears given number of messages from the same channel(requires manage guild).",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_messages=True))
-    async def purge(
-        self, ctx, numberstr: int, list_members: str = None, *, reason: str = None
-    ):
-        check_ensure_permissions(
-            ctx, ctx.guild.me, ["manage_messages", "read_message_history"]
-        )
-        if reason is None:
-            reason = "no reason provided"
-        members = None
-
-        if list_members:
-            membernames = list_members.replace(" ", ",")
-            members = []
-            for membername in membernames.split(","):
-                try:
-                    member = await commands.MemberConverter().convert(ctx, membername)
-                    members.append(member)
-                except:
-                    pass
-        if members is None:
-            try:
-                number = int(numberstr)
-            except:
-                await send_generic_error_embed(ctx, error_data="Enter a valid number to purge messages.")
-                return
-            if number <= 0:
-                await send_generic_error_embed(ctx, error_data=
-                    " You cannot purge negative/zero amount of messages."
-                )
-                return
-            try:
-                await ctx.channel.purge(limit=number)
-            except:
-                pass
-            embed = discord.Embed(
-                title="Messages purged", description=f"{number} messages ."
-            )
-            embed.add_field(name="Moderator", value=ctx.author.mention)
-            embed.add_field(name="Reason", value=reason)
-            try:
-                await ctx.send(embed=embed, ephemeral=True)
-            except:
-                await ctx.send(embed=embed)
-        else:
-            try:
-                number = int(numberstr)
-            except:
-                await send_generic_error_embed(ctx, error_data="Enter a valid number to purge messages.")
-                return
-            if number <= 0:
-                await send_generic_error_embed(ctx, error_data=
-                    " You cannot purge negative/zero amount of messages."
-                )
-                return
-            if len(members) == 0:
-                raise commands.BadArgument("Nothing")
-            for member in members:
-                try:
-
-                    def is_me(m):
-                        return m.author == member
-
-                    await ctx.channel.purge(limit=number, check=is_me)
-                except:
-                    pass
-                embed = discord.Embed(
-                    title="Messages purged",
-                    description=f"{number} messages from {member.mention}.",
-                )
-                embed.add_field(name="Moderator", value=ctx.author.mention)
-                embed.add_field(name="Reason", value=reason)
-                try:
-                    await ctx.send(embed=embed, ephemeral=True)
-                except:
-                    await ctx.send(embed=embed)
-
-    @commands.hybrid_command(
-        brief="This command warns users for a given reason provided.",
-        description="This command warns users for a given reason provided and can be used by bot staff.",
-    )
-    @commands.guild_only()
-    @is_bot_staff()
-    async def silentwarn(self, ctx, member: discord.Member, *, reason: str = None):
-        if reason is None:
-            reason = "no reason provided"
-        statement = """INSERT INTO warnings (userid,guildid,warning,messageid) VALUES($1, $2 ,$3,$4);"""
-        async with pool.acquire() as con:
-            await con.execute(
-                statement, member.id, ctx.guild.id, reason, ctx.message.id
-            )
-
-    @commands.hybrid_command(
-        brief="This command warns users for a given reason provided.",
-        description="This command warns users for a given reason provided(requires manage roles).",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_roles=True))
-    async def warn(self, ctx, list_members: str, *, reason: str = None):
-        membernames = list_members.replace(" ", ",")
-        members = []
-        for membername in membernames.split(","):
-            try:
-                member = await commands.MemberConverter().convert(ctx, membername)
-                members.append(member)
-            except:
-                pass
-
-        if len(members) == 0:
-            raise commands.BadArgument("Nothing")
-        for member in members:
-            if (
-                ctx.author.top_role <= member.top_role
-                and not checkstaff(ctx.author)
-                and not ctx.author.bot
-                and not ctx.author == member
-                and not ctx.author.id == ctx.guild.owner.id
-            ):
-                await send_generic_error_embed(ctx, error_data="You cannot warn members having higher roles than your highest role.")
-                continue
-            if reason is None:
-                reason = "no reason provided"
-            reason = "`" + reason + "`"
-            reason = reason + f"({ctx.author.mention})"
-            # "SELECT * FROM userdata WHERE Name = %s;", (name,)
-            sqlcommand = """INSERT INTO warnings (userid,guildid,warning,messageid) VALUES($1, $2 ,$3,$4);"""
-            async with pool.acquire() as con:
-                await con.execute(
-                    sqlcommand, member.id, ctx.guild.id, reason, ctx.message.id
-                )
-            try:
-                await member.send(f"You were warned in {ctx.guild} for {reason} .")
-            except:
-                pass
-            embed = discord.Embed(
-                title="Member warned", description=f"{member.mention}."
-            )
-            embed.add_field(name="Moderator", value=ctx.author.mention)
-            embed.add_field(name="Reason", value=reason)
-            await loginfo(
-                ctx.guild,
-                "Warn logging",
-                "** **",
-                f"{member.mention} was warned by {ctx.author.mention} for {reason}.",
-            )
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        aliases=["punishments"],
-        brief="This command shows user warnings in the guild.",
-        description="This command shows user warnings in the guild(requires manage roles).",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_roles=True))
-    async def warnings(self, ctx, list_members: str):
-        membernames = list_members.replace(" ", ",")
-        members = []
-        for membername in membernames.split(","):
-            try:
-                member = await commands.MemberConverter().convert(ctx, membername)
-                members.append(member)
-            except:
-                pass
-
-        if len(members) == 0:
-            raise commands.BadArgument("Nothing")
-        for member in members:
-            async with pool.acquire() as con:
-                warninglist = await con.fetch(
-                    f"SELECT * FROM warnings WHERE userid = {member.id} AND guildid = {ctx.guild.id}"
-                )
-            embedlist = []
-            embed = discord.Embed(
-                description=f"{member.mention}'s warnings", title="** **"
-            )
-            count = 0
-            loopexited = False
-            for warning in warninglist:
-                embed.add_field(name=f"Warning #{count}", value=f"{warning['warning']}")
-                count = count + 1
-                if count >= 12:
-                    count = 0
-                    embedlist.append(embed)
-                    embed = discord.Embed(title="** **")
-                    loopexited = True
-            if not loopexited:
-                embedlist.append(embed)
-            pagview = PaginateEmbed(embedlist)
-            pagview.set_message(
-                await ctx.send(view=pagview, embed=embedlist[0], ephemeral=True)
-            )
-
-    @commands.hybrid_command(
-        brief="This command unbans user from the guild.",
-        description="This command unbans user from the guild(requires ban members).",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(ban_members=True))
-    async def unban(self, ctx, list_members: str, *, reason: str = None):
-        membernames = list_members.replace(" ", ",")
-        members = []
-        for membername in membernames.split(","):
-            try:
-                member = await commands.MemberConverter().convert(ctx, membername)
-                members.append(member)
-            except:
-                pass
-
-        if len(members) == 0:
-            raise commands.BadArgument("Nothing")
-        bannedmembers = await ctx.guild.bans(limit=None).flatten()
-        for member in members:
-            if member is None or member == ctx.author:
-                await send_generic_error_embed(ctx, error_data="You cannot apply ban/unban actions to your own account.")
-                continue
-            exists = False
-            for loopmember in bannedmembers:
-                if loopmember.user.id == member.id:
-                    exists = True
-                    break
-            if not exists:
-                await send_generic_error_embed(ctx, error_data=f"The member {member.mention} is already not banned from the guild.")
-                continue
-            if reason is None:
-                reason = "being forgiven."
-            _message = f"You have been unbanned from {ctx.guild.name} for {reason}"
-   
-            try:
-                await ctx.guild.unban(member, reason=reason)
-            except:
-                await send_generic_error_embed(ctx, error_data=f"I do not have ban members permissions or I am not high enough in role hierarchy to unban {member}.")
-                continue
-            try:
-                await member.send(_message)
-
-            except:
-                await ctx.send(
-                    f"{member.mention} couldn't be direct messaged about the server unban",
-                    ephemeral=True,
-                )
-            cmd = client.get_command("silentwarn")
-            try:
-                await cmd(
-                    ctx,
-                    member,
-                    reason=(
-                        f"unbanned from {ctx.guild.name} by {ctx.author.mention} for {reason}"
-                    ),
-                )
-            except:
-                pass
-            embed = discord.Embed(
-                title="Member unbanned", description=f"{member.mention}."
-            )
-            embed.add_field(name="Moderator", value=ctx.author.mention)
-            embed.add_field(name="Reason", value=reason)
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command checks guild previous bans.",
-        description="This command checks guild previous bans(requires ban members).",
-        aliases=["bans", "guildbans", "prevbans", "banned", "serverbans"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(ban_members=True))
-    async def checkbans(self, ctx):
-        check_ensure_permissions(ctx, ctx.guild.me, ["ban_members"])
-        bans = await ctx.guild.bans(limit=None).flatten()
-        embed = discord.Embed(title="Guild bans", description="** **")
-        count = 0
-        loopexited = False
-        for ban in bans:
-            loopexited = False
-            embed.add_field(
-                name=ban.user, value=f"User-id : {ban.user.id} \nReason : {ban.reason}"
-            )
-            count = count + 1
-            if count >= 12:
-                count = 0
-                await ctx.send(embed=embed, ephemeral=True)
-                embed = discord.Embed(title="** **")
-                loopexited = True
-        if not loopexited:
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command bans user from the guild.",
-        description="This command bans user from the guild(requires ban members).",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(ban_members=True))
-    async def ban(self, ctx, list_members: str, *, reason: str = None):
-        membernames = list_members.replace(" ", ",")
-        members = []
-        for membername in membernames.split(","):
-            try:
-                member = await commands.MemberConverter().convert(ctx, membername)
-                members.append(member)
-            except:
-                pass
-
-        if len(members) == 0:
-            raise commands.BadArgument("Nothing")
-        bannedmembers = await ctx.guild.bans(limit=None).flatten()
-        for member in members:
-            if (
-                ctx.author.top_role <= member.top_role
-                and not checkstaff(ctx.author)
-                and not ctx.author.bot
-                and not ctx.author.id == ctx.guild.owner.id
-            ):
-                await send_generic_error_embed(ctx, error_data=
-                    "You cannot ban members having higher roles than your highest role."
-                )
-                continue
-            if member is None or member == ctx.message.author:
-                await send_generic_error_embed(ctx, error_data=
-                    "You cannot apply ban/unban actions to your own account."
-                )
-                continue
-            exists = False
-            for loopmember in bannedmembers:
-                if loopmember.user.id == member.id:
-                    exists = True
-                    break
-            if exists:
-                await send_generic_error_embed(ctx, error_data=
-                    f"The member {member.name} is already banned from the guild."
-                )
-                continue
-            if reason is None:
-                reason = "being a jerk!"
-            _message = f"You have been banned from {ctx.guild.name} for {reason}"
-
-            try:
-                await ctx.guild.ban(member, reason=reason)
-            except:
-                await send_generic_error_embed(ctx, error_data=
-                    f"I do not have ban members permissions or I am not high enough in role hierarchy to ban {member}."
-                )
-                continue
-            try:
-                await member.send(_message)
-            except:
-                await ctx.send(
-                    f"{member.mention} couldn't be direct messaged about the server ban ",
-                    ephemeral=True,
-                )
-            cmd = client.get_command("silentwarn")
-            try:
-                await cmd(
-                    ctx,
-                    member,
-                    reason=(
-                        f"banned from {ctx.guild.name} by {ctx.author.mention} for {reason}"
-                    ),
-                )
-            except:
-                pass
-            embed = discord.Embed(
-                title="Member banned", description=f"{member.mention}."
-            )
-            embed.add_field(name="Moderator", value=ctx.author.mention)
-            embed.add_field(name="Reason", value=reason)
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command kicks user from the guild.",
-        description="This command kicks user from the guild(requires kick members).",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(kick_members=True))
-    async def kick(self, ctx, list_members: str, *, reason: str = None):
-        membernames = list_members.replace(" ", ",")
-        members = []
-        for membername in membernames.split(","):
-            try:
-                member = await commands.MemberConverter().convert(ctx, membername)
-                members.append(member)
-            except:
-                pass
-
-        if len(members) == 0:
-            raise commands.BadArgument("Nothing")
-        for member in members:
-            if (
-                ctx.author.top_role <= member.top_role
-                and not checkstaff(ctx.author)
-                and not ctx.author.bot
-                and not ctx.author.id == ctx.guild.owner.id
-            ):
-                await send_generic_error_embed(ctx, error_data=
-                    "You cannot kick members having higher roles than your highest role."
-                )
-                continue
-            if member is None or member == ctx.message.author:
-                await send_generic_error_embed(ctx, error_data=
-                    "You cannot kick your own account from this guild."
-                )
-                continue
-
-            if reason is None:
-                reason = "being a jerk!"
-            _message = f"You have been kicked from {ctx.guild.name} for {reason}"
-
-            try:
-                await ctx.guild.kick(member, reason=reason)
-            except:
-                await send_generic_error_embed(ctx, error_data=
-                    f"I do not have kick members permissions or I am not high enough in role hierarchy to kick {member}."
-                )
-                continue
-            try:
-                await member.send(_message)
-            except:
-                await ctx.send(
-                    f"{member.mention} couldn't be direct messaged about the server kick ",
-                    ephemeral=True,
-                )
-            cmd = client.get_command("silentwarn")
-            try:
-                await cmd(
-                    ctx,
-                    member,
-                    reason=(
-                        f"kicked from {ctx.guild.name} by {ctx.author.mention} for {reason}"
-                    ),
-                )
-            except:
-                pass
-            embed = discord.Embed(
-                title="Member kicked", description=f"{member.mention}."
-            )
-            embed.add_field(name="Moderator", value=ctx.author.mention)
-            embed.add_field(name="Reason", value=reason)
-            await ctx.send(embed=embed, ephemeral=True)
 
 
 class Logging(commands.Cog):
@@ -3814,86 +2999,7 @@ class Logging(commands.Cog):
         )
 
 
-class AntiRaid(commands.Cog):
-    @commands.hybrid_command(
-        brief="This command disables the anti-raid in a guild and sets the anti-raid log to the channel.",
-        description="This command disables the anti-raid in a guild(requires manage guild).",
-        usage="",
-        aliases=["disableantiraid"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def deactivateantiraid(self, ctx):
-        async with pool.acquire() as con:
-            cautionlist = await con.fetchrow(
-                f"SELECT * FROM cautionraid WHERE guildid = {ctx.guild.id}"
-            )
-        isRaided = cautionlist is not None
-        if isRaided:
-            await ctx.send(
-                f"{ctx.author.mention} tried to disable anti-raid while a suspicious activity was detected , anti-raid was not disabled!",
-                ephemeral=True,
-            )
-            return
-        view = ConfirmDecline()
-        msg = await ctx.send(
-            f":no_entry_sign: Due to security reasons , this command will take `5 minutes` to successfully disable! (Click decline to cancel disabling anti raid)",
-            view=view,
-            ephemeral=True,
-        )
-        await view.wait()
-        if view.value:
-            await ctx.send(
-                f"anti-raid couldn't be disabled due to request by {view.authorcancel}.",
-                ephemeral=True,
-            )
-            return
-        try:
-            await msg.edit(
-                content=":no_entry_sign: anti-raid has been successfully disabled in this guild."
-            )
-        except:
-            pass
 
-    @commands.hybrid_command(
-        brief="This command enables the antiraid in a guild and sets the antiraid log to the channel.",
-        description="This command enables the antiraid in a guild(requires manage guild).",
-        usage="#channel",
-        aliases=["enableantiraid"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def activateantiraid(self, ctx, channel: discord.TextChannel = None):
-        if channel is None:
-            channel = ctx.channel
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
-            return
-        if not channel.permissions_for(ctx.guild.me).send_messages:
-            raise commands.BotMissingPermissions(["send_messages"])
-        if not channel.permissions_for(ctx.guild.me).view_channel:
-            raise commands.BotMissingPermissions(["view_channel"])
-        if not channel.permissions_for(ctx.guild.me).embed_links:
-            raise commands.BotMissingPermissions(["embed_links"])
-        if not channel.permissions_for(ctx.guild.me).view_audit_log:
-            raise commands.BotMissingPermissions(["view_audit_log"])
-        async with pool.acquire() as con:
-            logchannellist = await con.fetchrow(
-                f"SELECT * FROM antiraid WHERE guildid = {ctx.guild.id}"
-            )
-        if logchannellist is None:
-            statement = """INSERT INTO antiraid (guildid,channelid) VALUES($1, $2);"""
-            async with pool.acquire() as con:
-                await con.execute(statement, ctx.guild.id, channel.id)
-        else:
-            async with pool.acquire() as con:
-                await con.execute(
-                    f"UPDATE antiraid VALUES SET channelid = {channel.id} WHERE guildid = {ctx.guild.id}"
-                )
-        await ctx.send(
-            f"Successfully enabled anti-raid and set the anti-raid logging channel to {channel.mention}.",
-            ephemeral=True,
-        )
 
 
 class AutoMod(commands.Cog):
@@ -6303,108 +5409,7 @@ async def take_screenshot(ctx, url, save_fn="capture.png"):
     return my_file
 
 
-class PaginateEmbed(discord.ui.View):  # EMBED PAGINATOR
-    def __init__(self, embeds):
-        super().__init__(timeout=120)
-        self.count = 0
-        self.embed = embeds[self.count]
-        self.limit = len(embeds) - 1
-        self.embeds = embeds
-        self._message = None
 
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
-
-    @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.green)
-    async def firstmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        self.count = 0
-        self.embed = self.embeds[self.count]
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except:
-            pass
-
-    @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.green)
-    async def leftmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if not self.count == 0:
-            self.count = self.count - 1
-        self.embed = self.embeds[self.count]
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except:
-            pass
-
-    @discord.ui.button(emoji="🛑", style=discord.ButtonStyle.green)
-    async def stopmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if isinstance(self._message, discord.InteractionResponse):
-            try:
-                await self._message.edit_message(view=None)
-            except:
-                pass
-        elif isinstance(self._message, discord.Interaction):
-            await self._message.delete_original_message()
-        else:
-            await self._message.edit(view=None)
-        self.stop()
-
-    @discord.ui.button(emoji="➡️", style=discord.ButtonStyle.green)
-    async def rightmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if not self.count == self.limit:
-            self.count = self.count + 1
-        self.embed = self.embeds[self.count]
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except:
-            pass
-
-    @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.green)
-    async def lastmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        self.count = self.limit
-        self.embed = self.embeds[self.count]
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except:
-            pass
 
 
 class PaginateFileEmbed(discord.ui.View):
@@ -9102,12 +8107,7 @@ class Social(commands.Cog):
             pass
 
 
-def constructslashephemeralctx(ctx):
-    async def fakerespond(*args, **kwargs):
-        return await ctx.send(*args, **kwargs, ephemeral=True)
 
-    ctx.send = fakerespond
-    return ctx
 
 
 def message_probability(
@@ -10369,9 +9369,8 @@ class Support(commands.Cog):
     )
     async def pastebin(self, ctx, *, text: str):
         try:
-            pastecode = await mystbin_client.create_paste(
-                content=text, filename=genrandomstr(10)
-            )
+            file = mystbin.File(filename=genrandomstr(10), content=text)
+            pastecode = await mystbin_client.create_paste(files=[file])
         except:
             await send_generic_error_embed(ctx, error_data="Posting to pastebin failed!")
             return
@@ -10472,9 +9471,8 @@ class Support(commands.Cog):
             color=Color.green(),
         )
         try:
-            erroutput = await mystbin_client.create_paste(
-                content=erroutput, filename=f"{genrandomstr(10)}.txt"
-            )
+            file = mystbin.File(filename=f"{genrandomstr(10)}.txt", content=erroutput)
+            erroutput = await mystbin_client.create_paste(files=[file])
         except:
             erroutput = erroutput
         defaultembed.add_field(name="Error :", value=erroutput, inline=False)
@@ -10791,30 +9789,7 @@ async def getimageurl(url):
     return meta_og_image.get("content") if meta_og_image else None
 
 
-def constructmsg(guild, member):
-    class defcontext:
-        def __init__(self, guild, member):
-            self.guild = guild
-            self.author = member
 
-    constructedctx = defcontext(guild, member)
-    return constructedctx
-
-
-class channelNotProvided(Exception):
-    pass
-
-
-class userNotProvided(Exception):
-    pass
-
-
-class rateExceeded(Exception):
-    pass
-
-
-class fakeGuildMember(Exception):
-    pass
 
 
 def constructsafeclient(member):
@@ -10950,86 +9925,7 @@ async def constructmember(id, guild):
     return constructeduser
 
 
-def constructctx(guild, member, channel=None):
-    async def defsend(
-        content="** **",
-        tts=None,
-        embed=None,
-        embeds=None,
-        file=None,
-        files=None,
-        stickers=None,
-        delete_after=None,
-        nonce=None,
-        allowed_mentions=None,
-        reference=None,
-        mention_author=None,
-        view=None,
-    ):
-        if channel is None:
-            raise channelNotProvided("No channels found to send a message to!")
-        await channel.send(
-            content=content,
-            tts=tts,
-            embed=embed,
-            embeds=embeds,
-            file=file,
-            files=files,
-            stickers=stickers,
-            delete_after=delete_after,
-            nonce=nonce,
-            allowed_mentions=allowed_mentions,
-            reference=reference,
-            mention_author=mention_author,
-            view=view,
-        )
 
-    async def defrespond(
-        content="** **",
-        tts=None,
-        embed=None,
-        embeds=None,
-        file=None,
-        files=None,
-        stickers=None,
-        delete_after=None,
-        nonce=None,
-        allowed_mentions=None,
-        reference=None,
-        mention_author=None,
-        view=None,
-        ephemeral=None,
-    ):
-        if channel is None:
-            raise channelNotProvided("No channels found to send a message to!")
-        await channel.send(
-            content=content,
-            tts=tts,
-            embed=embed,
-            embeds=embeds,
-            file=file,
-            files=files,
-            stickers=stickers,
-            delete_after=delete_after,
-            nonce=nonce,
-            allowed_mentions=allowed_mentions,
-            reference=reference,
-            mention_author=mention_author,
-            view=view,
-        )
-
-    class defcontext:
-        def __init__(self, guild, member):
-            self.guild = guild
-            self.author = member
-            self.channel = channel
-            self.send = defsend
-            self.respond = defrespond
-            self.me = guild.me
-            self.voice_client = guild.voice_client
-
-    constructedctx = defcontext(guild, member)
-    return constructedctx
 
 
 def get_guilds():
@@ -14841,106 +13737,11 @@ async def on_invite_create(invite):
         logging.log(logging.ERROR, f" on_invite_create: {get_traceback(ex)}")
 
 
-@client.event
-async def on_invite_delete(invite):
-    logguild = invite.guild
-    logchannel = None
-    async with pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
-        )
-    if not logchannellist is None:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    else:
-        return
-    try:
-        embed = discord.Embed(
-            title=(f"Invite deletion"), description=invite.url, color=Color.red()
-        )
-        await logchannel.send(embed=embed)
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_invite_update: {get_traceback(ex)}")
 
 
-@client.event
-async def on_voice_state_update(member, before, after):
-    logguild = member.guild
-    logchannel = None
-    async with pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
-        )
-    if not logchannellist is None:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    try:
-        changes = ""
-        if before.channel == None:
-            changes = (
-                changes
-                + f" The member {member.mention} connected to the voice channel {after.channel.mention}.\n"
-            )
-        if after.channel == None:
-            changes = (
-                changes
-                + f" The member {member.mention} disconnected from the voice channel {before.channel.mention}.\n"
-            )
-            vc = before.channel
-        if before.self_mute != after.self_mute:
-            micMsg = ""
-            if before.self_mute == True:
-                micMsg = f" The member {member.mention} unmuted themselves in the voice channel {before.channel.mention}.\n"
-            else:
-                micMsg = f" The member {member.mention} muted themselves in the voice channel {before.channel.mention}.\n"
-            changes = changes + micMsg
-        if before.self_deaf != after.self_deaf:
-            micMsg = ""
-            if before.self_deaf == True:
-                micMsg = f" The member {member.mention} undeafened themselves in the voice channel {before.channel.mention}.\n"
-            else:
-                micMsg = f" The member {member.mention} deafened themselves in the voice channel {before.channel.mention}.\n"
-            changes = changes + micMsg
-        if before.mute != after.mute:
-            micMsg = ""
-            if before.mute == True:
-                micMsg = f" The member {member.mention} was unmuted by an admin in the voice channel {before.channel.mention}.\n"
-            else:
-                micMsg = f" The member {member.mention} was muted by an admin in the voice channel {before.channel.mention}.\n"
-            changes = changes + micMsg
-        if before.deaf != after.deaf:
-            micMsg = ""
-            if before.deaf == True:
-                micMsg = f" The member {member.mention} was undeafened by an admin in the voice channel {before.channel.mention}.\n"
-            else:
-                micMsg = f" The member {member.mention} was deafened by an admin in the voice channel {before.channel.mention}.\n"
-            changes = changes + micMsg
-        if before.self_stream != after.self_stream:
-            micMsg = ""
-            if before.self_stream == True:
-                micMsg = f" The member {member.mention} stopped streaming content in the voice channel {before.channel.mention}.\n"
-            else:
-                micMsg = f" The member {member.mention} is streaming content in the voice channel {before.channel.mention}.\n"
-            changes = changes + micMsg
-        if before.self_video != after.self_video:
-            micMsg = ""
-            if before.self_video == True:
-                micMsg = f" The member {member.mention} stopped their video in the voice channel {before.channel.mention}.\n"
-            else:
-                micMsg = f" The member {member.mention} shared their video in the voice channel {before.channel.mention}.\n"
-            changes = changes + micMsg
 
-        if not changes == "":
-            if not logchannel == None:
-                embed = discord.Embed(
-                    title=(f"Voice channel update"),
-                    description=member.mention,
-                    color=Color.blue(),
-                )
-                embed.add_field(name="** **", value=changes)
-                await logchannel.send(embed=embed)
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_voice_state_update: {get_traceback(ex)}")
+
+
 
 
 try:
