@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block page_id %}home{% endblock %}
+{% block content %}
+<section class="hero section-shell">
+  <div class="hero-copy reveal">
+    <p class="eyebrow"><span></span> ONE BOT · BUILT FOR REAL COMMUNITIES</p>
+    <h1>Run the server.<br><em>Enjoy the community.</em></h1>
+    <p class="hero-lede">Aestron brings dependable moderation, fast music, useful utilities, community tools, and privacy-conscious game integrations into one consistent Discord experience.</p>
+    <div class="hero-actions"><a class="button button-primary" href="/dashboard">Explore Aestron <span>↗</span></a>{% if topgg_bot_url %}<a class="button button-ghost" href="{{ topgg_bot_url }}">Add to Discord</a>{% endif %}</div>
+    <div class="trust-row"><span>Slash + prefix commands</span><span>Async by design</span><span>Clear permissions</span></div>
+  </div>
+  <div class="hero-visual reveal" aria-label="Example Aestron server overview">
+    <div class="radar-ring ring-one"></div><div class="radar-ring ring-two"></div>
+    <div class="match-card glass-card">
+      <div class="card-topline"><span>SERVER OVERVIEW</span><span class="live-dot">ONLINE</span></div>
+      <div class="match-title"><div class="agent-glyph">A</div><div><strong>Your community</strong><small>Protected · Active · Connected</small></div></div>
+      <div class="metric-grid"><div><small>TOOLS</small><strong>90+</strong><span class="up">ready</span></div><div><small>VOICE</small><strong>24/7</strong><span class="up">async</span></div><div><small>SETUP</small><strong>Clear</strong><span>guided</span></div></div>
+      <div class="insight-line"><span class="insight-icon">01</span><p>Moderation, music, tickets, leveling, social tools, utilities, and game insights share one clean command system.</p></div>
+      <div class="mini-chart"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    </div>
+  </div>
+</section>
+
+<section class="manifesto section-shell" id="features">
+  <p class="section-index">01 / CAPABILITIES</p>
+  <div class="manifesto-grid"><h2 class="reveal">Less bot clutter.<br><em>More useful tools.</em></h2><p class="reveal">Aestron groups everyday server needs behind documented commands, consistent errors, permission checks, and useful defaults.</p></div>
+  <div class="feature-strip">
+    <article class="feature-panel reveal"><span>01</span><h3>Moderation & safety</h3><p>Ban, timeout, purge, warnings, anti-raid controls, automod, logging, captcha, and support tickets.</p></article>
+    <article class="feature-panel reveal"><span>02</span><h3>Music & voice</h3><p>Search, queue, pause, skip, seek, filters, and dependable voice lifecycle powered by Lavalink.</p></article>
+    <article class="feature-panel reveal"><span>03</span><h3>Community & utility</h3><p>Leveling, giveaways, custom commands, social tools, Minecraft, activities, stats, and more.</p></article>
+  </div>
+</section>
+
+<section class="flow-section section-shell" id="flow">
+  <p class="section-index">02 / EXPERIENCE</p>
+  <div class="flow-layout"><div class="sticky-copy"><h2>Easy to discover.<br><em>Predictable to use.</em></h2><p>Commands explain their arguments, permissions, and failure conditions so members and moderators are never left guessing.</p></div><div class="flow-steps">
+    <article class="flow-card reveal"><span class="flow-number">01</span><div><h3>Invite and configure</h3><p>Start with sane defaults, then opt into logging channels and integrations with environment-backed configuration.</p></div></article>
+    <article class="flow-card reveal"><span class="flow-number">02</span><div><h3>Use clear commands</h3><p>Hybrid commands work naturally from slash commands or the configured server prefix.</p></div></article>
+    <article class="flow-card reveal"><span class="flow-number">03</span><div><h3>See what matters</h3><p>Bot statistics expose activity, guild reach, uptime, latency, and command usage without leaking private content.</p></div></article>
+  </div></div>
+</section>
+
+<section class="coaching section-shell" id="integrations">
+  <p class="section-index">03 / FEATURE SPOTLIGHT</p>
+  <div class="coaching-head"><h2 class="reveal">VALORANT review.<br><em>Opt in, then improve.</em></h2><p class="reveal">Aestron's dedicated VALORANT area turns a linked player's own official match history into transparent post-match trends—never opponent scouting or live tactical advice.</p></div>
+  <div class="signal-board glass-card reveal"><div class="signal-sidebar"><button class="active">Official match data</button><button>Player controlled</button><button>Post-match only</button></div><div class="signal-content"><div class="signal-kicker">DEDICATED PRODUCT AREA</div><div class="signal-score">8<small>recent matches</small></div><div class="coach-note"><strong>Review your own play</strong><p>See ACS, ADR, K/D/A, opening duels, hit locations, utility rhythm, and evidence-based reflection prompts.</p></div><a class="button button-primary" href="/valorant">Explore VALORANT <span>↗</span></a></div></div>
+</section>
+
+<section class="feedback section-shell" id="feedback">
+  <div class="feedback-copy reveal"><p class="section-index">04 / BUILD WITH US</p><h2>Found a rough edge?<br><em>Shape the next release.</em></h2><p>Suggestions and bug reports from the website and Discord bot share one review queue.</p></div>
+  <form class="feedback-form glass-card reveal" data-feedback-form>
+    <label>Type<select name="kind" required><option value="suggestion">Suggestion</option><option value="bug">Bug report</option></select></label>
+    <label>Title<input name="title" minlength="4" maxlength="120" required placeholder="A concise summary"></label>
+    <label class="full">Details<textarea name="body" minlength="15" maxlength="4000" required placeholder="What happened, or what would make Aestron more useful?"></textarea></label>
+    <label>Contact (optional)<input name="contact" maxlength="160" placeholder="Discord username or email"></label>
+    <label class="honeypot" aria-hidden="true">Website<input name="website" tabindex="-1" autocomplete="off"></label>
+    <div class="form-submit"><p data-form-status aria-live="polite">Stored securely for the Aestron team.</p><button class="button button-primary" type="submit">Send feedback <span>↗</span></button></div>
+  </form>
+</section>
+{% endblock %}

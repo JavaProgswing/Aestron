@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Aestron for VALORANT — dashboard prototype{% endblock %}
+{% block page_id %}dashboard{% endblock %}
+{% block head %}<link rel="stylesheet" href="{{ url_for('static', path='css/dashboard.css') }}">{% endblock %}
+{% block content %}
+<section class="page-hero section-shell dashboard-hero">
+  <div><p class="eyebrow"><span></span> FUNCTIONAL PRODUCT PROTOTYPE</p><h1>Player review<br><em>at a glance.</em></h1><p>This preview demonstrates the player-facing flow Riot reviewers and Discord users will see. Live personal data appears only after the player opts in through RSO.</p></div>
+  <span class="status-chip {% if rso_ready %}ready{% else %}pending{% endif %}">{% if rso_ready %}RSO ready{% else %}RSO awaiting credentials{% endif %}</span>
+</section>
+<section class="dashboard-shell section-shell">
+  <aside class="dashboard-nav">
+    <button class="active" data-tab-target="overview">Overview</button>
+    <button data-tab-target="matches">Match review</button>
+    <button data-tab-target="coaching">Coaching plan</button>
+    <button data-tab-target="privacy">Data controls</button>
+    <a href="/api/docs">API reference ↗</a>
+  </aside>
+  <div class="dashboard-content">
+    <section class="dashboard-tab active" data-tab="overview">
+      <div class="dash-heading"><div><span>DEMO PLAYER</span><h2>JettDiff#AEST</h2><p>Last 8 competitive matches · prototype data</p></div><div class="agent-glyph large">J</div></div>
+      <div class="dash-metrics"><article><small>WIN RATE</small><strong>62.5%</strong><span class="positive">+12.5%</span></article><article><small>AVG. ACS</small><strong>228</strong><span class="positive">+9</span></article><article><small>K / D</small><strong>1.18</strong><span>stable</span></article><article><small>HEADSHOT HITS</small><strong>23%</strong><span class="positive">+3%</span></article></div>
+      <div class="dash-grid"><article class="dash-card wide"><div class="card-label">PERFORMANCE TREND</div><div class="trend-chart"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div><div class="chart-axis"><span>M1</span><span>M8</span></div></article><article class="dash-card"><div class="card-label">NEXT REVIEW</div><h3>Low-buy first contact</h3><p>Compare the three opening deaths where your team spent below its recent average.</p><div class="focus-tag">Evidence: 3 rounds</div></article></div>
+    </section>
+    <section class="dashboard-tab" data-tab="matches"><div class="dash-heading"><div><span>RECENT HISTORY</span><h2>Match review</h2><p>Official match history after opt-in.</p></div></div><div class="match-list"><article><span class="result win">W</span><div><strong>Ascent · Jett</strong><small>Competitive · 13—10</small></div><b>22 / 17 / 6</b><span>ACS 241</span></article><article><span class="result loss">L</span><div><strong>Lotus · Omen</strong><small>Competitive · 9—13</small></div><b>16 / 18 / 11</b><span>ACS 194</span></article><article><span class="result win">W</span><div><strong>Haven · Sova</strong><small>Competitive · 13—8</small></div><b>19 / 14 / 9</b><span>ACS 218</span></article></div></section>
+    <section class="dashboard-tab" data-tab="coaching"><div class="dash-heading"><div><span>POST-MATCH REFLECTION</span><h2>Practice priorities</h2><p>Transparent heuristics, not an invented skill rating.</p></div></div><div class="coaching-list"><article><span>01</span><div><h3>Opening discipline</h3><p>Your first-kill rate is improving, while first deaths remain concentrated in low-economy rounds. Review whether utility could create a safer first contact.</p></div><b>High impact</b></article><article><span>02</span><div><h3>Damage conversion</h3><p>ADR is steady but assists fell in the last three matches. Compare damage events that teammates could not trade or finish.</p></div><b>Review</b></article><article><span>03</span><div><h3>Agent rhythm</h3><p>Your utility casts per round vary sharply. Review whether unused utility remained at death rather than chasing a fixed cast target.</p></div><b>Explore</b></article></div></section>
+    <section class="dashboard-tab" data-tab="privacy"><div class="dash-heading"><div><span>PLAYER CONTROL</span><h2>Data and consent</h2><p>The final product exposes these controls to every linked user.</p></div></div><div class="privacy-controls"><article><h3>Explicit Riot opt-in</h3><p>Authentication happens on Riot's domain. Aestron stores the linked Riot identity and permitted match history, never the password or transient OAuth tokens.</p></article><article><h3>Visibility</h3><p>Only opted-in players are analyzed. The Discord bot defaults to private responses for personal coaching and does not support pre-match scouting.</p></article><article><h3>Unlink and delete</h3><p>The unlink command removes the Riot identity and cached match references associated with the Discord user.</p></article></div></section>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', path='js/dashboard.js') }}" defer></script>{% endblock %}

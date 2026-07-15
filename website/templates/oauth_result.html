@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}{% if success %}Account linked{% else %}Linking failed{% endif %} — Aestron{% endblock %}
+{% block page_id %}oauth-result{% endblock %}
+{% block content %}
+<section class="oauth-result section-shell"><div class="oauth-card glass-card"><span class="oauth-symbol {% if success %}success{% else %}failure{% endif %}">{% if success %}✓{% else %}×{% endif %}</span><p class="eyebrow"><span></span> RIOT SIGN ON</p><h1>{% if success %}Account linked.<br><em>You're in control.</em>{% else %}Linking stopped.<br><em>Nothing was stored.</em>{% endif %}</h1><p>{{ message }}</p><a class="button button-primary" href="/">Return to Aestron</a></div></section>
+{% endblock %}

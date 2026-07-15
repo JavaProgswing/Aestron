@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Aestron is a fast, modern Discord bot for moderation, music, utilities, community tools, and opt-in game integrations.">
+    <meta name="theme-color" content="#07090d">
+    <title>{% block title %}Aestron — one capable Discord bot{% endblock %}</title>
+    <link rel="icon" href="{{ url_for('static', path='favicon.svg') }}" type="image/svg+xml">
+    <link rel="stylesheet" href="{{ url_for('static', path='css/site.css') }}">
+    {% block head %}{% endblock %}
+  </head>
+  <body data-page="{% block page_id %}page{% endblock %}">
+    <div class="ambient" aria-hidden="true">
+      <span class="orb orb-one"></span>
+      <span class="orb orb-two"></span>
+      <span class="grid-plane"></span>
+    </div>
+    <header class="site-header" data-header>
+      <a class="brand" href="/" aria-label="Aestron home">
+        <span class="brand-mark">A</span>
+        <span>AESTRON</span>
+      </a>
+      <button class="menu-button" type="button" aria-label="Toggle navigation" aria-expanded="false" data-menu-button>
+        <span></span><span></span>
+      </button>
+      <nav class="site-nav" data-menu>
+        <a href="/#features">Features</a>
+        <a href="/valorant">VALORANT</a>
+        <a href="/dashboard">Dashboard</a>
+        <a href="/api/docs">API</a>
+        <a href="/#feedback">Feedback</a>
+      </nav>
+      <a class="button button-small button-ghost header-cta" href="/dashboard">Open dashboard</a>
+    </header>
+    <main>{% block content %}{% endblock %}</main>
+    <footer class="site-footer">
+      <div>
+        <a class="brand footer-brand" href="/"><span class="brand-mark">A</span><span>AESTRON</span></a>
+        <p>Useful community tools, reliable moderation, music, and opt-in game insights.</p>
+      </div>
+      <div class="footer-links">
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+        <a href="/api/docs">API docs</a>
+        {% if support_url %}<a href="{{ support_url }}" rel="noreferrer">Support</a>{% endif %}
+        {% if topgg_bot_url %}<a href="{{ topgg_bot_url }}" rel="noreferrer">Top.gg</a>{% endif %}
+      </div>
+      {% if riot_page %}<p class="riot-legal">Aestron isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties, are trademarks or registered trademarks of Riot Games, Inc.</p>{% endif %}
+    </footer>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/ScrollTrigger.min.js" defer></script>
+    <script src="{{ url_for('static', path='js/site.js') }}" defer></script>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

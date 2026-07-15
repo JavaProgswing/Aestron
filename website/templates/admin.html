@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Aestron Admin — Feedback queue{% endblock %}
+{% block page_id %}admin{% endblock %}
+{% block head %}<link rel="stylesheet" href="{{ url_for('static', path='css/dashboard.css') }}">{% endblock %}
+{% block content %}
+<section class="page-hero section-shell admin-hero"><div><p class="eyebrow"><span></span> RESTRICTED OPERATIONS</p><h1>Feedback<br><em>control room.</em></h1><p>The token stays in this browser's session storage and is sent only to same-origin admin endpoints.</p></div></section>
+<section class="admin-shell section-shell">
+  <form class="admin-login glass-card" data-admin-login><label>Admin bearer token<input type="password" name="token" autocomplete="current-password" required></label><button class="button button-primary">Load queue</button><p data-admin-status aria-live="polite"></p></form>
+  <div class="admin-stats" data-admin-stats></div>
+  <div class="feedback-queue" data-feedback-queue></div>
+</section>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', path='js/admin.js') }}" defer></script>{% endblock %}

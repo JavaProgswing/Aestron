@@ -1,34 +1,173 @@
-To intregrate this bot, you need to get the api keys from the following websites
+# Aestron
 
-1. `PUBLIC Code compiler API` - https://www.jdoodle.com/compiler-api
-2. `Chatbot API` - https://brainshop.ai/
-3. `Spotify API` - https://developer.spotify.com/dashboard/applications
-4. `Postgres SQL server` - Any sql server...
-5. `Google Message analyser API` - https://developers.perspectiveapi.com/s/docs
-6. `TOP.GG server update API` - https://top.gg/api/docs/
+Aestron targets Python 3.12, discord.py 2.7, Wavelink 3.5, and Lavalink 4.
 
-After storing all the api keys, you need to fill in the keys in the empty .env file.
-Now everything is setup, you can create a new bot at https://discord.com/developers/applications
-and fill in the DISCORD_TOKEN.
+The actively maintained runtime features are split into focused modules:
 
-You also would have to edit the bot owner ids stored as the list botowners.
-In the line botowners = [`Your discord id here`]
-Line no. 76 in main.py
+- `aestron_bot/lavalink.py` owns node connection, health, and reconnection.
+- `aestron_bot/music.py` owns searches, queues, playback, controls, and errors.
+- `aestron_bot/moderation.py` owns validated moderation commands, native
+  timeouts, hierarchy checks, and warning records.
+- `aestron_bot/database.py` owns the async PostgreSQL pool lifecycle and
+  readiness checks; command code no longer depends on module-level `conn` or
+  `pool` globals.
+- `aestron_bot/diagnostics.py` formats chained tracebacks without capturing
+  local variables or secrets.
+- `aestron_bot/statistics.py` batches persistent activity counters without adding
+  a database query to every command.
+- `aestron_bot/valorant.py` provides secure account linking, official on-demand
+  match retrieval, and transparent post-match review without pickle caches or
+  unofficial rank APIs.
+- `aestron_bot/feedback.py` sends `/suggest` and `/reportbug` submissions to one
+  website queue, with a configured Discord channel as a fallback.
+- `website/` is the standalone FastAPI product site and versioned API. The main
+  pages cover the entire bot; VALORANT has a dedicated consent-aware area.
 
-You also have to change the ids these channels:
-Line no. 2429 in main.py
+## Setup
+
+Create an isolated environment and install the pinned, verified dependency set:
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+The dependency pins are current as of this audit. `libretranslatepy` remains at
+2.1.1 because the latest `translate` release requires that exact version;
+forcing 2.1.4 produces a resolver conflict. PyNaCl is pinned at 1.5.0 because
+discord.py 2.7.1's voice extra explicitly requires PyNaCl below 1.6.
+
+For development checks, install `requirements-dev.txt` instead, then run:
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q
+.venv\Scripts\python.exe -m ruff check .
+.venv\Scripts\python.exe -m ruff format --check .
+.venv\Scripts\python.exe -m scripts.check_commands
+```
+
+The command validator registers the same cogs as production without logging in.
+It rejects duplicate names/aliases and commands missing a summary, description,
+help body, or parameter usage. The in-bot help command, category help, command
+help, and `/cmdusage <command>` views all use this validated metadata; usage
+remains available even when no demonstration GIF exists. The prefix defaults to
+`a!` and can be changed with `DEFAULT_PREFIX`.
+
+Copy `.env.example` to `.env` and fill in only the services you use. Database
+credentials remain in `database.env` for compatibility with the existing setup.
+
+The only required application value is `DISCORD_TOKEN`. Add optional service
+keys only for features you enable:
+
+- `CHATBOT_ID` and `CHATBOT_TOKEN` enable Brainshop chat responses.
+- `GCOM_TOKEN` enables Perspective API message analysis.
+- `VAL_API_TOKEN` enables official VALORANT match retrieval after the website
+  and approved Riot Sign On product are configured.
+- `DBL_TOKEN` enables Top.gg vote checks and links.
+- `OPENWEATHER_API_KEY` enables weather lookup.
+
+Store bot and optional integration settings in `.env` and PostgreSQL credentials
+in `database.env`. Do not commit either file. Create the bot in the Discord
+developer portal and set `DISCORD_TOKEN`.
+
+Music playback requires Lavalink 4 and the maintained YouTube source plugin.
+Use [docs/lavalink.md](docs/lavalink.md) and the included
+`lavalink/application.yml.example`; setting only a Lavalink URL is not enough
+when the node has no working audio source.
+
+## Runtime commands
+
+- `/play <song name or URL>` — connect, search, queue, and start playback.
+- `/currentlyplaying` — show the current track and progress.
+- `/queue` — show upcoming tracks.
+- `/pause`, `/skip`, `/stop`, `/volume <0-150>` — control playback.
+- `/voicehealth` — diagnose the Lavalink node and latest voice error.
+- `/stats` — show commands used, successful/failed invocations, current and
+  historical guild activity, uptime, latency, process activity, and music health.
+- `/suggest <title> <details>` and `/reportbug <feature> <details>` — submit
+  validated feedback to the shared website/admin queue.
+- `/linkaccount`, `/unlinkaccount`, `/vstats [member]`, and `/valcoach [member]`
+  — secure opt-in VALORANT linking, official recent stats, and evidence-based
+  post-match review prompts.
+
+## Website and API
+
+Install `requirements-web.txt` and run the product site separately from the bot:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-web.txt
+.venv\Scripts\python.exe -m uvicorn website.main:app --host 0.0.0.0 --port 27009 --env-file website.env
+```
+
+The generalized product site is at `/`, the bot overview is `/dashboard`, the
+VALORANT product and prototype dashboard are `/valorant` and
+`/valorant/dashboard`, and OpenAPI documentation is at `/api/docs`. Production
+Pterodactyl, HTTPS proxy, Riot callback, environment, and rollout instructions
+are in [docs/website-deployment.md](docs/website-deployment.md).
+
+Keep `AESTRON_SITE_BASE_URL` empty in the bot environment until the public site
+is deployed and verified. Then set it to the HTTPS origin and copy the exact same
+`AESTRON_SERVICE_TOKEN` into both bot and website environments.
+
+Frequently used moderation commands are typed hybrid commands, so they work as
+both slash and prefix commands with the same validation and help text:
+
+- `/ban`, `/kick`, `/unban`, and `/softban` — hierarchy-checked member actions
+  with Discord audit-log reasons.
+- `/timeout <member> <duration>` and `/untimeout` — Discord-native timeouts;
+  durations accept forms such as `30m`, `2h`, or `1d12h` up to 28 days.
+- `/warn`, `/warnings`, and `/clearwarnings` — bounded, parameterized warning
+  history operations.
+- `/lock`, `/unlock`, `/setslowmode`, and `/purge` — bounded channel tools that
+  preserve unrelated permission overwrites.
+- `/nick` — set or clear a member nickname after hierarchy validation.
+
+Invalid members, unsafe hierarchy targets, out-of-range values, missing bot
+permissions, and failed Discord API operations now reach the shared command
+error handler instead of being silently ignored.
+
+All music failures are logged with guild/channel context and also produce a
+clear Discord response. `/voicehealth` also loads an encoded test track, so it
+detects a connected node whose search plugin is not actually usable. Lavalink
+reconnection runs in the background.
+
+Configure comma-separated bot owners and optional operational channels in
+`.env`; no source edit is required:
+
+```dotenv
+BOT_OWNER_IDS=your-discord-user-id,another-owner-id
+CHANNEL_ERROR_LOGGING_ID=your-error-channel-id
+CHANNEL_BUG_LOGGING_ID=your-bug-channel-id
+CHANNEL_DEV_ID=your-development-channel-id
+SUPPORT_SERVER_INVITE=https://discord.gg/your-invite
+DEFAULT_PREFIX=a!
+BOT_VERSION=development
+```
+
+All values except `DISCORD_TOKEN` and database credentials are optional. When
+`BOT_OWNER_IDS` is empty, discord.py's application-owner check is used. Unset
+logging channels, support links, and external integrations are disabled cleanly
+instead of falling back to deployment-specific IDs or credentials.
+
+## Security and portability
+
+Legacy owner IDs, bot IDs, channel IDs, custom-emoji IDs, avatar URLs, webhook
+credentials, and private network addresses are not embedded in the source. Bot
+ownership falls back to the Discord application owner, invite and Top.gg links
+use the authenticated bot ID, and mutable maintenance/rate-limit state belongs
+to the running bot instance.
+
+The old arbitrary Python execution, public code runner, token generator/parser,
+webhook sender, dashboard control channel, automatic GitHub self-updater,
+website screenshot commands, and third-party-bot answer scraper were removed.
+The calculator now accepts bounded arithmetic only and never evaluates Python
+code. Optional integrations fail with a clear response when their environment
+settings are absent.
+
+Create the legacy feature tables below in PostgreSQL before the first start.
+Runtime statistics tables are managed automatically as described afterward.
 
 ```
-    channelerrorlogging = client.get_channel(ERROR LOGGING CHANNEL ID)
-    channelbuglogging = client.get_channel(BUG LOGGING CHANNEL ID)
-    channeldev = client.get_channel(DEVELOPER TESTING CHANNEL ID)
-    channelgitlogging = client.get_channel(GITHUB LOGS CHANNEL ID)
-```
-
-Also you have to add these tables into the sql server
-
-```
-CREATE TABLE debugCommand(requestid bigint);
 CREATE TABLE callsettings
 (settingbool boolean ,userid bigint PRIMARY KEY);
 CREATE TABLE spamchannels
@@ -37,8 +176,6 @@ CREATE TABLE leveling
 (messagecount bigint ,memberid bigint,guildid bigint);
 CREATE TABLE snipelog
 (timedeletion timestamp without time zone ,embeds text ,content text ,username text ,channelid bigint PRIMARY KEY);
-CREATE TABLE developer
-(bypass boolean ,userid bigint );
 CREATE TABLE logchannels
 (channelid bigint ,guildid bigint PRIMARY KEY);
 CREATE TABLE customcommands
@@ -49,8 +186,6 @@ CREATE TABLE verifychannels
 (channelid bigint,guildid bigint PRIMARY KEY);
 CREATE TABLE levelconfig
 (messagecount bigint ,channelid bigint);
-CREATE TABLE musicchannel
-(channelid bigint ,guildid bigint);
 CREATE TABLE antiraid
 (channelid bigint ,guildid bigint);
 CREATE TABLE prefixes
@@ -65,36 +200,33 @@ CREATE TABLE levelsettings
 (setting boolean ,channelid bigint PRIMARY KEY);
 CREATE TABLE verifymsg
 (messageid bigint ,channelid bigint ,guildid bigint PRIMARY KEY);
-CREATE TABLE pendingunmute
-(epochtime bigint ,reason text ,memberid bigint ,channelid bigint ,guildid bigint);
 CREATE TABLE leaderboard
 (mention text PRIMARY KEY);
 CREATE TABLE cautionraid
 (guildid bigint PRIMARY KEY);
-CREATE TABLE pendingunblacklist
-(epochtime bigint ,reason text ,memberid bigint ,channelid bigint ,guildid bigint);
 CREATE TABLE warnings
 (messageid bigint ,warning text ,guildid bigint ,userid bigint );
-CREATE TABLE dankcmds
-(implemented boolean ,rawtext text );
 CREATE TABLE commandguildstatus
 (commandname text ,guildid bigint);
-CREATE TABLE riotmatches
-(discorduserid bigint PRIMARY KEY,accountpuuid text,matchids text[]);
-CREATE TABLE riotaccount
-(accounttag text ,accountname text ,accountimage text ,accountregion text ,accountpuuid text ,discorduserid bigint PRIMARY KEY);
-CREATE TABLE riotseason (
-    act text,
-    episode text
-);
-CREATE TABLE riotparsedmatches (id text PRIMARY KEY, data bytea);
 CREATE TABLE mceconomy
 (memberid bigint PRIMARY KEY,balance bigint,inventory text);
-CREATE TABLE IF NOT EXISTS githubcommits (
-    userid TEXT PRIMARY KEY,
-    latestcommitsha TEXT
-);
+CREATE TABLE restrictedUsers
+(guildid bigint, memberid bigint, epochtime bigint);
 ```
-I'll add the bot to my server for the emojis.
 
-After doing this, you can run the bot with the command `python main.py`
+The `bot_runtime_stats` and `bot_command_usage` tables are created and migrated
+automatically at startup. Statistics are collected in memory and flushed in
+batches every five seconds for low command latency. If the database account
+cannot create those tables, `/stats` continues with session-only counters and
+reports that persistence is unavailable.
+
+The website creates and migrates its Riot identity and feedback tables. The bot
+retrieves recent matches on demand from official Riot endpoints with bounded
+parallelism and rate-limit handling; the old fixed-shard pollers, pickled match
+objects, static metadata extractors, and third-party MMR endpoint are not used.
+
+After doing this, run the bot with:
+
+```powershell
+.venv\Scripts\python.exe main.py
+```

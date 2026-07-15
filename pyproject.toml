@@ -1,0 +1,16 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+extend-exclude = ["resources/temp"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "W", "UP", "ASYNC", "N", "D", "S608"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+# Public command names remain stable through decorator metadata while Python
+# identifiers are checked against PEP 8 naming conventions throughout the repo.
+[tool.ruff.lint.per-file-ignores]
+"main.py" = ["D"]
+"tests/*.py" = ["D"]

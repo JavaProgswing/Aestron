@@ -1,941 +1,409 @@
-from __future__ import unicode_literals
-from youtubesearchpython.__future__ import *
-
 import asyncio
-import base64
 import contextlib
-import datetime
+import enum
 import io
 import itertools
 import json
+import logging
 import os
 import random
 import re
 import string
+import sys
 import time
-import traceback
-import types
-import typing
-import urllib.request
 from collections import Counter
-from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
-from io import BytesIO, StringIO
-from textwrap import wrap
+from io import BytesIO
+from pathlib import Path
+
 import aiohttp
-import asyncpg
 import discord
 import mystbin
-import ply.lex as lex
-import ply.yacc as yacc
 import psutil
-import pydoodle
-import requests
-import selenium
 import validators
 from aiohttp.client import ClientTimeout
 from bs4 import BeautifulSoup
 from captcha.image import ImageCaptcha
-from discord import Color, Webhook
-from discord.ext import commands, tasks
-from discord.ext.commands import BucketType, bot
-from discord_together import DiscordTogether
+from discord import Color, app_commands
+from discord.ext import commands
+from discord.ext.commands import BucketType
 from dotenv import load_dotenv
 from googleapiclient import discovery
-from googlesearch import search as gsearch
-from idevision import async_client
 from langdetect import detect
 from mcstatus import JavaServer
 from PIL import Image, ImageDraw, ImageFont
-from selenium import webdriver
 from translate import Translator
-import enum
-import pickle
-import sys
-import subprocess
-import logging
-import wavelink
-from typing import cast
-from discord import app_commands
-from utils import get_traceback, constructmsg, constructctx, constructslashephemeralctx, channelNotProvided, userNotProvided, rateExceeded, fakeGuildMember, checkstaff, convertwords, PaginateEmbed, loginfo, checkProfane, check_ensure_permissions, is_bot_staff, convert, ConfirmDecline, botowners
 
-
-def noglobal(f):
-    return types.FunctionType(f.__code__, {}, argdefs=f.__defaults__)
-
+from aestron_bot import (
+    BotStatistics,
+    DatabaseService,
+    DatabaseSettings,
+    LavalinkService,
+    RateLimits,
+    RuntimeSettings,
+    RuntimeState,
+    Statistics,
+    audit_command_metadata,
+    command_invocation,
+    format_exception,
+    normalize_command_metadata,
+)
+from aestron_bot.calculator import evaluate_expression
+from aestron_bot.feedback import Feedback as ModernFeedback
+from aestron_bot.moderation import Moderation as ModernModeration
+from aestron_bot.music import Music as ModernMusic
+from aestron_bot.valorant import Valorant as ModernValorant
 
 load_dotenv()
-load_dotenv(dotenv_path="github.env")
 load_dotenv(dotenv_path="database.env")
-
-token = os.getenv("DISCORD_TOKEN")
-valorant_api_key = os.getenv("VAL_API_TOKEN")
-valorant_rso_api_key = os.getenv("VAL_RSO_API_TOKEN")
-doodleclient = pydoodle.Compiler(
-    clientId=os.getenv("DOODLE_API_ID"), clientSecret=os.getenv("DOODLE_API_KEY")
+log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_name, logging.INFO)
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+LOGGER = logging.getLogger("aestron")
+SCRIPT_PATH = str(Path(__file__).resolve())
+SETTINGS = RuntimeSettings.from_environment()
+token = os.getenv("DISCORD_TOKEN")
 dbltoken = os.getenv("DBL_TOKEN")
-# https://www.jdoodle.com/compiler-api
-# REQUIRES API KEY
 
 mystbin_client = mystbin.Client()
-rtfmclient = async_client()
-maintenancemodestatus = False
-onlystaffaccess = False
-maintenancemodereason = "fixing a bug"
-forcelogerrors = False
-firstgithubcheck = True
-customCog = None
+
+EMBEDDED_APPLICATION_IDS = {
+    "youtube": 880218394199220334,
+    "poker": 755827207812677713,
+    "chess": 832012774040141894,
+}
 
 
-async def chatbotfetch(session, url):
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36"
-        }
-        timeout = ClientTimeout(total=0)
-        async with session.get(url, headers=headers, timeout=timeout) as resp:
-            assert resp.status == 200, f"{resp.status}"
-            respjson = await resp.json()
-        return respjson["cnt"]
-    except Exception as ex:
-        return ex
+async def search_sphinx_docs(location, query):
+    url = "https://idevision.net/api/public/rtfm.sphinx"
+    params = {
+        "location": location,
+        "query": query,
+        "show-labels": "false",
+        "label-labels": "false",
+    }
+    async with client.session.get(url, params=params) as response:
+        response.raise_for_status()
+        result = await response.json()
+    return result.get("nodes", {})
+
+
+async def create_activity_invite(channel, activity, *, max_age=3600, max_uses=0):
+    invite = await channel.create_invite(
+        max_age=max_age,
+        max_uses=max_uses,
+        target_type=discord.InviteTarget.embedded_application,
+        target_application_id=EMBEDDED_APPLICATION_IDS[activity],
+    )
+    return str(invite)
+
+
+async def send_to_configured_channel(channel_id, *args, **kwargs):
+    """Send to an optional configured channel with consistent diagnostics."""
+    if channel_id is None:
+        LOGGER.debug("Optional Discord logging channel is not configured")
+        return None
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        LOGGER.warning("Configured Discord channel %s is unavailable", channel_id)
+        return None
+    return await channel.send(*args, **kwargs)
+
+
+async def chatbotfetch(session, url, params):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36"
+    }
+    timeout = ClientTimeout(total=15)
+    async with session.get(
+        url, params=params, headers=headers, timeout=timeout
+    ) as resp:
+        resp.raise_for_status()
+        response_json = await resp.json()
+    return response_json["cnt"]
 
 
 async def fetch_json(session, url, headers=None):
     if headers is None:
         headers = {}
-    async with session.get(url, headers=headers) as response:
-        if response.status == 200:
-            json_data = await response.json()
-            return (response.status, json_data)
-        return (response.status, None)
+    async with session.get(
+        url, headers=headers, timeout=ClientTimeout(total=15)
+    ) as response:
+        response.raise_for_status()
+        return await response.json()
 
 
 class ChatExtractor:
-    def __init__(self):
-        pass
-
     async def aget_response(self, _message, author):
-        _message = _message.replace(" ", "%20")
         session = client.session
-        url = f"http://api.brainshop.ai/get?bid={CHATBOT_ID}&key={CHATBOT_TOKEN}&uid={author.id}&msg={_message}"
-        resp = await chatbotfetch(session, url)
+        url = "https://api.brainshop.ai/get"
+        resp = await chatbotfetch(
+            session,
+            url,
+            {
+                "bid": CHATBOT_ID,
+                "key": CHATBOT_TOKEN,
+                "uid": author.id,
+                "msg": _message,
+            },
+        )
         return resp
-
-    def get_response(self, _message, author):
-        _message = _message.replace(" ", "%20")
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36"
-        }
-        url = f"http://api.brainshop.ai/get?bid={CHATBOT_ID}&key={CHATBOT_TOKEN}&uid={author.id}&msg={_message}"
-        f = requests.get(url, headers=headers)
-        assert f.status_code == 200, f"{f.status_code}"
-        respjson = f.json()
-        return respjson["cnt"]
 
 
 class LyricsExtractor:
-    def __init__(self):
-        pass
-
     async def aget_lyrics(self, songname):
-        songname = songname.replace(" ", "+")
-        url = f"https://api.popcat.xyz/lyrics?song={songname}"
+        url = "https://api.popcat.xyz/lyrics"
         session = client.session
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36"
         }
-        timeout = ClientTimeout(total=0)
-        async with session.get(url, headers=headers, timeout=timeout) as resp:
-            assert resp.status == 200, f"{resp.status}"
+        timeout = ClientTimeout(total=15)
+        async with session.get(
+            url,
+            params={"song": songname},
+            headers=headers,
+            timeout=timeout,
+        ) as resp:
+            resp.raise_for_status()
             resptext = await resp.json()
         return resptext
 
-    def get_lyrics(self, songname):
-        songname = songname.replace(" ", "+")
-        url = f"https://api.popcat.xyz/lyrics?song={songname}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36"
-        }
-        f = requests.get(url, headers=headers)
-        assert f.status_code == 200, f"{f.status_code}"
-        return f.json()
-
 
 extract_lyrics = LyricsExtractor()
-DATABASE_URL = f"postgres://{os.getenv('DATABASE_USERNAME')}:{os.getenv('DATABASE_PASSWORD')}@{os.getenv('DATABASE_URL')}:{os.getenv('DATABASE_PORT')}/{os.getenv('DATABASE_NAME')}"
 # Sql database 1
 # REQUIRES API KEY
 
 CHATBOT_ID = os.getenv("CHATBOT_ID")
 CHATBOT_TOKEN = os.getenv("CHATBOT_TOKEN")
-CHANNEL_ERROR_LOGGING_ID = 840193232885121094
-CHANNEL_BUG_LOGGING_ID = 855310400366444584
-CHANNEL_DEV_ID = 843081057506426880
-CHANNEL_GIT_LOGGING_ID = 895884797099008050
-SUPPORT_SERVER_INVITE = "https://discord.gg/TZDYSHSZgg"
+CHANNEL_ERROR_LOGGING_ID = SETTINGS.error_logging_channel_id
+CHANNEL_BUG_LOGGING_ID = SETTINGS.bug_logging_channel_id
+CHANNEL_DEV_ID = SETTINGS.development_channel_id
 # REQUIRES API KEY
 # https://brainshop.ai/
-conn = None
-pool = None
-forceexecstop = False
-afterchannelupdate = []
-beforechannelupdate = []
-
-
-def get_example(command, guild):
-    commandDict = dict(command.clean_params)
-    exStr = ""
-    optType = False
-    for key in commandDict.keys():
-        value = commandDict[key]
-        if not value.default == None:
-            exStr = exStr + " "
-        else:
-            optType = True
-            exStr = exStr + " (OPT.)"
-        origvalue = value
-        value = value.annotation
-        if value == typing.Union[discord.guild.Guild, discord.channel.TextChannel]:
-            if len(guild.text_channels):
-                exStr = exStr + str(random.choice(guild.text_channels).mention)
-            else:
-                exStr = exStr + "#textchannel"
-        elif value == typing.Union[discord.user.User, int]:
-            exStr = exStr + "Coder.py#7250"
-        elif value == typing.Union[discord.user.User, discord.member.Member]:
-            if len(guild.members):
-                exStr = exStr + str(random.choice(guild.members).mention)
-            else:
-                exStr = exStr + "@members"
-        elif value == discord.Member or value == discord.User:
-            if len(guild.members):
-                exStr = exStr + str(random.choice(guild.members).mention)
-            else:
-                exStr = exStr + "@members"
-        elif value == discord.Role:
-            if len(guild.roles):
-                exStr = exStr + str(random.choice(guild.roles).mention)
-            else:
-                exStr = exStr + "@rolename"
-        elif (
-            value == typing.Union[discord.channel.TextChannel, str]
-            or value == discord.TextChannel
-        ):
-            if len(guild.text_channels):
-                exStr = exStr + str(random.choice(guild.text_channels).mention)
-            else:
-                exStr = exStr + "#textchannel"
-        elif (
-            value == typing.Union[discord.channel.VoiceChannel, str]
-            or value == discord.VoiceChannel
-        ):
-            if len(guild.voice_channels):
-                exStr = exStr + str(random.choice(guild.voice_channels).mention)
-            else:
-                exStr = exStr + "#voicechannel"
-        elif (
-            value
-            == typing.Union[
-                discord.VoiceChannel, discord.TextChannel, discord.StageChannel
-            ]
-        ):
-            if len(guild.text_channels):
-                exStr = exStr + str(random.choice(guild.text_channels).mention)
-            else:
-                exStr = exStr + "#textchannel"
-        elif value == int:
-            exStr = exStr + "1"
-        elif value == bool:
-            exStr = exStr + "False"
-        elif value == discord.Guild:
-            exStr = exStr + "Guild-A"
-        elif value == discord.Emoji:
-            if len(guild.emojis):
-                exStr = exStr + str(random.choice(guild.emojis))
-            else:
-                exStr = exStr + ":emojiname:"
-        else:
-            if value != str:
-                key = origvalue.name
-            if key == "timenum":
-                exStr = exStr + "15m"
-            elif key == "Cmdoutput":
-                exStr = exStr + "https://www.google.com/"
-            elif key == "Cmdname":
-                exStr = exStr + "google"
-            elif key == "reason":
-                exStr = exStr + '"asked for it"'
-            elif key == "reasonafk":
-                exStr = exStr + '"feeling tired"'
-            elif key == "reaction":
-                exStr = exStr + ":tada:"
-            elif key == "duration":
-                exStr = exStr + "10s"
-            elif key == "avatarprovided":
-                exStr = (
-                    exStr
-                    + "https://cdn.discordapp.com/avatars/1061480715172200498/89424d67ceb481fa6ad2613e3037ae43.png?size=1024"
-                )
-            elif key == "riotaccount":
-                exStr = exStr + "ValoName#Id"
-            elif key == "copytemplate":
-                exStr = exStr + "H5qAZdEEeWdR"
-            elif key == "list_members":
-                if len(guild.members):
-                    exStr = (
-                        exStr
-                        + str(random.choice(guild.members))
-                        + " "
-                        + str(random.choice(guild.members))
-                        + " ..."
-                    )
-                else:
-                    exStr = exStr + "Member-A Member-B ..."
-            elif key == "list_users":
-                if len(guild.members):
-                    exStr = (
-                        exStr
-                        + str(random.choice(guild.members))
-                        + " "
-                        + str(random.choice(guild.members))
-                        + " ..."
-                    )
-                else:
-                    exStr = exStr + "Member-A Member-B ..."
-            elif key == "list_textstagevoicechannels":
-                if len(guild.channels):
-                    exStr = (
-                        exStr
-                        + str(random.choice(guild.channels))
-                        + " "
-                        + str(random.choice(guild.channels))
-                        + " ..."
-                    )
-                else:
-                    exStr = exStr + "Channel-A VoiceChannel-B ..."
-            elif key == "list_textchannels":
-                if len(guild.text_channels):
-                    exStr = (
-                        exStr
-                        + str(random.choice(guild.text_channels))
-                        + " "
-                        + str(random.choice(guild.text_channels))
-                        + " ..."
-                    )
-                else:
-                    exStr = exStr + "Channel-A Channel-B ..."
-            elif key == "list_guilds":
-                if len(client.guilds):
-                    exStr = (
-                        exStr
-                        + str(random.choice(client.guilds))
-                        + " "
-                        + str(random.choice(client.guilds))
-                        + " ..."
-                    )
-                else:
-                    exStr = exStr + "Guild-A Guild-B" + " ..."
-            else:
-                exStr = exStr + key
-    return (exStr, optType)
 
 
 async def get_guild_prefixid(guildid):
     if guildid:
         try:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 prefixeslist = await con.fetchrow(
-                    f"SELECT * FROM prefixes WHERE guildid = {guildid}"
+                    "SELECT * FROM prefixes WHERE guildid = $1", guildid
                 )
             if prefixeslist is None:
                 statement = """INSERT INTO prefixes (guildid,
                                     prefix) VALUES($1, $2);"""
-                async with pool.acquire() as con:
-                    await con.execute(statement, guildid, "a!")
-                async with pool.acquire() as con:
-                    await con.execute(
-                        f"INSERT INTO prefixes VALUES (%s,%s)", guildid, "a!"
-                    )
-                chars = "a!"
+                async with client.database.pool.acquire() as con:
+                    await con.execute(statement, guildid, SETTINGS.default_prefix)
+                chars = SETTINGS.default_prefix
             else:
                 chars = prefixeslist["prefix"]
-        except:
-            chars = "a!"
+        except Exception:
+            chars = SETTINGS.default_prefix
     else:
-        chars = "a!"
+        chars = SETTINGS.default_prefix
     return chars
 
 
 async def get_guild_prefix(guild):
     if guild:
         try:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 prefixeslist = await con.fetchrow(
-                    f"SELECT * FROM prefixes WHERE guildid = {guild.id}"
+                    "SELECT * FROM prefixes WHERE guildid = $1", guild.id
                 )
             if prefixeslist is None:
                 statement = """INSERT INTO prefixes (guildid,
                                     prefix) VALUES($1, $2);"""
-                async with pool.acquire() as con:
-                    await con.execute(statement, guild.id, "a!")
-                async with pool.acquire() as con:
-                    await con.execute(
-                        f"INSERT INTO prefixes VALUES (%s,%s)", guild.id, "a!"
-                    )
-                chars = "a!"
+                async with client.database.pool.acquire() as con:
+                    await con.execute(statement, guild.id, SETTINGS.default_prefix)
+                chars = SETTINGS.default_prefix
             else:
                 chars = prefixeslist["prefix"]
-        except:
-            chars = "a!"
+        except Exception:
+            chars = SETTINGS.default_prefix
     else:
-        chars = "a!"
+        chars = SETTINGS.default_prefix
     return chars
 
 
-def get_command_signature(command, guild):
-    return "%s%s" % (command.qualified_name, get_example(command, guild)[0])
-
-
 class MyHelp(commands.HelpCommand):
-    # !help
+    """Render consistent bot, category, group, and command documentation."""
+
     def __init__(self):
         attrs = {
             "cooldown": commands.CooldownMapping.from_cooldown(
                 1, 5, commands.BucketType.member
             ),
             "aliases": ["commands"],
+            "brief": "Show command categories or detailed command help.",
+            "description": (
+                "Show available command categories, or get usage and aliases for "
+                "one command or category."
+            ),
+            "help": (
+                "Show available command categories, or get usage and aliases for "
+                "one command or category."
+            ),
+            "usage": "[command or category]",
         }
         super().__init__(command_attrs=attrs)
+
+    def set_footer(self, embed, text=None):
+        """Add a consistent footer without assuming a project-specific invite."""
+        footer_text = text or f"Aestron v{SETTINGS.version}"
+        if SETTINGS.support_server_invite:
+            footer_text += f" · Support: {SETTINGS.support_server_invite}"
+        embed.set_footer(
+            text=footer_text,
+            icon_url=str(self.context.author.display_avatar),
+        )
 
     async def on_help_command_error(self, ctx, error):
         await super().on_help_command_error(ctx, error)
 
     async def send_bot_help(self, mapping):
-        global customCog
-        filteredcmds = []
-        allcommands = []
-        for cog, commands in mapping.items():
-            filcmds = await self.filter_commands(commands, sort=True)
-            for cmd in filcmds:
-                if (
-                    cog == customCog
-                    and (
-                        cmd.name == "addcommand"
-                        or cmd.name == "removecommand"
-                        or cmd.name == "customcommands"
-                    )
-                    or cog != customCog
-                ):
-                    filteredcmds.append(cmd.name)
-
-            for cmd in commands:
-                if not "is_bot_staff" in cmd.checks.__str__():
-                    allcommands.append(cmd.name)
+        prefix = self.context.clean_prefix
         embed = discord.Embed(
             title="Aestron help",
-            description="""Aestron is a cool bot having features such as Moderation, Logging, Music, Giveaways, Custom commands and more...
-**Features:**
-1. Anti-raid Protection(AntiRaid)
-2. Auto Moderation(AutoMod)
-3. Custom commands(CustomCommands)
-4. Fun commands(Fun)
-5. Ticket panel commands(SupportTicket)
-6. Logging commands(Logging)
-7. Minecraft commands(MinecraftFun)
-8. Template server commands(Templates)
-9. Captcha verification commands(Captcha)
-10. Leveling commands(Leveling)
-11. Music commands(Music)
-12. Giveaway commands(Giveaways)
-13. Valorant commands(Valorant)""",
+            description=(
+                f"Use `{prefix}help <command>` for detailed usage or "
+                f"`{prefix}help <category>` to list that category's commands."
+            ),
+            color=discord.Color.blurple(),
         )
-        embed.add_field(name="Version and info", value=f"v{botVersion}")
-        embed.add_field(
-            name="Additional Usage: ",
-            value="`a!help <command>`\n`a!help <category-shortname>`",
-        )
-        embed.set_footer(
-            text="Want support? Join here: https://discord.gg/TZDYSHSZgg",
-            icon_url=self.context.author.display_avatar,
-        )
-        view = DefaultHelp(filteredcmds, allcommands, self.context.author)
-        view.set_message(
-            await self.context.send(
-                embed=embed,
-                view=view,
+        command_count = 0
+        for cog, cog_commands in mapping.items():
+            visible = await self.filter_commands(cog_commands, sort=True)
+            if not visible:
+                continue
+            command_count += len(visible)
+            category = cog.qualified_name if cog is not None else "Other"
+            summary = (
+                cog.description if cog is not None else "Other commands"
+            ) or "Commands"
+            embed.add_field(
+                name=f"{category} ({len(visible)})",
+                value=summary.splitlines()[0][:180],
+                inline=True,
             )
+        embed.add_field(
+            name="Available commands",
+            value=(
+                f"{command_count} commands visible to you · Aestron v{SETTINGS.version}"
+            ),
+            inline=False,
         )
+        self.set_footer(embed)
+        await self.context.send(embed=embed)
 
     # !help <command>
     async def send_command_help(self, commandname):
         command = commandname
         embed = discord.Embed(
-            title=f"{commandname} help", description=command.description
+            title=f"{command.qualified_name} help",
+            description=command.help or command.description,
+            color=discord.Color.blurple(),
         )
-        prefix = None
-        prefix = await get_guild_prefix(self.context.guild)
-        aliases = ", ".join(command.aliases) + "** **"
-        example = get_example(command, self.context.guild)
-        exampleLine = example[0]
-        if example[1]:
-            exampleLine = (
-                exampleLine
-                + "\n\nNote: (OPT.) means that argument in the command is optional."
-            )
-        embed.add_field(name="Usage", value=f"{prefix}{commandname} {exampleLine}")
-        embed.add_field(name="Aliases", value=aliases)
+        invocation = command_invocation(command, self.context.clean_prefix)
+        aliases = ", ".join(f"`{alias}`" for alias in command.aliases) or "None"
+        embed.add_field(name="Usage", value=f"`{invocation}`", inline=False)
+        embed.add_field(name="Aliases", value=aliases, inline=False)
         channel = self.get_destination()
-        embed.set_footer(
-            text="Want support? Join here: https://discord.gg/TZDYSHSZgg",
-            icon_url=self.context.author.display_avatar,
-        )
-        try:
+        self.set_footer(embed)
+        usage_path = Path(f"resources/command_usages/{command.name}.gif")
+        if await asyncio.to_thread(usage_path.is_file):
             embed.set_image(url=f"attachment://{command.name}.gif")
-            file = discord.File(
-                f"./resources/command_usages/{command.name}.gif",
-                filename=f"{command.name}.gif",
-            )
-            await channel.send(embed=embed, file=file)
-            return
-        except Exception as ex:
-            logging.log(logging.WARNING, f"No command usages found for {command.name}: {get_traceback(ex)}")
+            try:
+                file = discord.File(usage_path, filename=f"{command.name}.gif")
+                await channel.send(embed=embed, file=file)
+                return
+            except (OSError, discord.HTTPException):
+                LOGGER.warning(
+                    "Could not send usage image command=%s", command.name, exc_info=True
+                )
+                embed.remove_image()
         await channel.send(embed=embed)
 
     # !help <group>
     async def send_group_help(self, commandname):
         command = commandname
-        embed = discord.Embed(title=f"{commandname} help", description="** **")
-        prefix = await get_guild_prefix(self.context.guild)
-        for c in command.commands:
-            example = get_example(c, self.context.guild)
-            exampleLine = example[0]
-            if example[1]:
-                exampleLine = (
-                    exampleLine
-                    + "\n\nNote: **...** indicates all other members or channels or roles you want."
-                )
-            if example[2]:
-                exampleLine = (
-                    exampleLine
-                    + "\n\nNote: (OPT.) means that argument in the command is optional."
-                )
-            embed.add_field(name=f"{prefix}{c.name} {exampleLine}", value=c.brief)
-            aliases = ", ".join(c.aliases) + "** **"
-            embed.add_field(name="Aliases", value=aliases)
-        channel = self.get_destination()
-        embed.set_footer(
-            text="Want support? Join here: https://discord.gg/TZDYSHSZgg",
-            icon_url=self.context.author.display_avatar,
+        embed = discord.Embed(
+            title=f"{command.qualified_name} help",
+            description=command.help or command.description,
+            color=discord.Color.blurple(),
         )
+        for c in command.commands:
+            embed.add_field(
+                name=command_invocation(c, self.context.clean_prefix),
+                value=c.brief,
+                inline=False,
+            )
+        channel = self.get_destination()
+        self.set_footer(embed)
         await channel.send(embed=embed)
 
     # !help <cog>
     async def send_cog_help(self, cog):
-        cogdes = "** **"
-        try:
-            cogdes = cog.description
-        except:
-            pass
-        embed = discord.Embed(title=f"{cog.qualified_name} help", description=cogdes)
-        embed.set_footer(
-            text="Want support? Join here: https://discord.gg/TZDYSHSZgg",
-            icon_url=self.context.author.display_avatar,
-        )
-        view = CommandHelp(cog, self.context.author)
-        view.set_message(await self.context.send(embed=embed, view=view))
+        visible = await self.filter_commands(cog.get_commands(), sort=True)
+        pages = []
 
+        def new_page():
+            return discord.Embed(
+                title=f"{cog.qualified_name} help",
+                description=cog.description or "Commands in this category.",
+                color=discord.Color.blurple(),
+            )
 
-class CommandHelpSelect(discord.ui.Select):
-    def __init__(self, cog, cauthor):
-        self.author = cauthor
-        commands = [
-            cmd
-            for cmd in cog.get_commands()
-            if isinstance(cmd, discord.ext.commands.HybridCommand)
-        ]
-        options = []
-        for c in commands:
-            if not "is_bot_staff" in c.checks.__str__():
-                options.append(
-                    discord.SelectOption(label=c.name, description=c.brief[:100])
-                )
-        super().__init__(
-            placeholder="Select a help command.",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.user.id == self.author.id:
-            await interaction.response.send_message(
-                content=f"You have not invoked this help command!", ephemeral=True
+        embed = new_page()
+        for command in visible:
+            name = command_invocation(command, self.context.clean_prefix)
+            value = command.brief
+            if embed.fields and (
+                len(embed.fields) == 25 or len(embed) + len(name) + len(value) > 5600
+            ):
+                pages.append(embed)
+                embed = new_page()
+            embed.add_field(name=name, value=value, inline=False)
+        if embed.fields:
+            pages.append(embed)
+        for index, embed in enumerate(pages, start=1):
+            self.set_footer(embed, f"Page {index}/{len(pages)}")
+        if not pages:
+            await self.context.send(
+                "No commands in this category are available to you."
             )
             return
-        commandname = self.values[0]
-        command = client.get_command(commandname)
-        if command is None:
-            await send_generic_error_embed(interaction.channel, error_data=f"No commands named {commandname} were found!")
-            return
-        embed = discord.Embed(
-            title=f"{commandname} help", description=command.description
-        )
-        prefix = None
-        prefix = await get_guild_prefix(interaction.guild)
-        example = get_example(command, interaction.guild)
-        exampleLine = example[0]
-        if example[1]:
-            exampleLine = (
-                exampleLine
-                + "\n\nNote: (OPT.) means that argument in the command is optional."
-            )
-        embed.add_field(name="Usage", value=f"{prefix}{commandname} {exampleLine}")
-        try:
-            embed.set_image(url=f"attachment://{command.name}.gif")
-            file = discord.File(
-                f"./resources/command_usages/{command.name}.gif",
-                filename=f"{command.name}.gif",
-            )
-            await interaction.response.send_message(
-                embed=embed, file=file, ephemeral=True
-            )
-            return
-        except Exception as ex:
-            logging.log(logging.WARNING, f"No command usages found for {command.name}: {get_traceback(ex)}")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-class CommandHelp(discord.ui.View):
-    def __init__(self, cog, author):
-        super().__init__(timeout=65)
-        self.add_item(CommandHelpSelect(cog, author))
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
-
-
-class CodingLanguageView(discord.ui.View):
-    def __init__(self, code, author, channel):
-        super().__init__(timeout=60)
-        self.add_item(CodingLanguageSelect(code, author, channel))
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
-
-
-class CodingLanguageSelect(discord.ui.Select):
-    def __init__(self, code, author, channel):
-        self.code = code
-        self.author = author
-        self.channel = channel
-        # Set the options that will be presented inside the dropdown
-        options = [
-            discord.SelectOption(label="c", description="Run code in C"),
-            discord.SelectOption(label="cpp", description="Run code in C++"),
-            discord.SelectOption(label="python3", description="Run code in Python 3"),
-            discord.SelectOption(label="java", description="Run code in Java"),
-            discord.SelectOption(label="nodejs", description="Run code in NodeJS"),
-            discord.SelectOption(label="lua", description="Run code in Lua"),
-            discord.SelectOption(label="sql", description="Run code in SQL"),
-            discord.SelectOption(label="rust", description="Run code in Rust"),
-            discord.SelectOption(label="ruby", description="Run code in Ruby"),
-        ]
-        super().__init__(
-            placeholder="Select a language!",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.user.id == self.author.id:
-            await interaction.response.send_message(
-                content=f"You have not invoked this execpublic command!", ephemeral=True
-            )
-            return
-        langname = self.values[0]
-        result = doodleclient.execute(script=self.code, language=langname)
-        stdOutput = result.output
-        memTaken = "".join(filter(lambda i: i.isdigit(), str(result.memory)))
-        try:
-            memTaken = int(memTaken) / 1000
-        except:
-            memTaken = "None"
-        timeTaken = result.cpuTime
-        stdOutputstr = ""
-        for i in stdOutput:
-            stdOutputstr = stdOutputstr + i
-        myFile = discord.File(io.StringIO(str(stdOutputstr)), filename="output.text")
-        embedtwo = discord.Embed(
-            title=f"",
-            description=(f"{langname} program executed!"),
-            color=Color.green(),
-        )
-        embedtwo.add_field(
-            name="Output :", value=f"Attached as a file** **", inline=False
-        )
-        embedtwo.add_field(name="Memory :", value=memTaken, inline=False)
-        embedtwo.add_field(name="Time :", value=timeTaken, inline=False)
-        embedtwo.set_footer(text=f"executed by {interaction.user}")
-        try:
-            await interaction.response.send_message(file=myFile, embed=embedtwo)
-        except:
-            await self.channel.send(file=myFile, embed=embedtwo)
-
-
-class DefaultHelpSelect(discord.ui.Select):
-    def __init__(self, filteredcmds, cauthor, showingall):
-
-        # Set the options that will be presented inside the dropdown
-        options = [
-            discord.SelectOption(
-                label="AntiRaid",
-                description="Protects the guild from mass raids.",
-                emoji="⛔",
-            ),
-            discord.SelectOption(
-                label="AutoMod",
-                description="Auto moderation settings for various purposes.",
-                emoji="🚨",
-            ),
-            discord.SelectOption(
-                label="Templates",
-                description="Can restore all channel , roles and guild settings from a template and can save into one.",
-                emoji="🎫",
-            ),
-            discord.SelectOption(
-                label="Captcha",
-                description="Captcha verification commands to prevent self-bots from entering the server!",
-                emoji="<:captcha:879225291136991292>",
-            ),
-            discord.SelectOption(
-                label="CustomCommands",
-                description="It helps you to further customize your server with commands you need!",
-                emoji="✍️",
-            ),
-            discord.SelectOption(
-                label="Fun",
-                description="It helps and lets you have fun using its exclusive commands!",
-                emoji="🤩",
-            ),
-            discord.SelectOption(
-                label="Giveaways",
-                description="Giveaway and poll commands for guild events.",
-                emoji="🎉",
-            ),
-            discord.SelectOption(
-                label="Logging",
-                description="Logs every action on your server except message edit/delete events.",
-                emoji="📖",
-            ),
-            discord.SelectOption(
-                label="MinecraftFun",
-                description="Minecraft game related fun commands.",
-                emoji="<:grass:825355420604039219>",
-            ),
-            discord.SelectOption(
-                label="Moderation",
-                description="Moderation commands for moderating your server.",
-                emoji="🔨",
-            ),
-            discord.SelectOption(
-                label="Music",
-                description="Listen to the finest music brought to you by youtube.",
-                emoji="🎵",
-            ),
-            discord.SelectOption(
-                label="Support",
-                description="Support and misc developer commands!",
-                emoji="👀",
-            ),
-            discord.SelectOption(
-                label="SupportTicket",
-                description="Create a customisable support ticket panel!",
-                emoji="🤝",
-            ),
-            discord.SelectOption(
-                label="AestronInfo",
-                description="Get information about the bot and much more!",
-                emoji="📜",
-            ),
-            discord.SelectOption(
-                label="YoutubeTogether",
-                description="Play youtubetogether in your voicechannel!",
-                emoji="<:youtube:947131039418052658>",
-            ),
-            discord.SelectOption(
-                label="Leveling",
-                description="Create a customizable level system by setting messages required for a level.",
-                emoji="📈",
-            ),
-            discord.SelectOption(
-                label="Misc",
-                description="Miscellaneous commands useful in certain situations.",
-                emoji="🧮",
-            ),
-            discord.SelectOption(
-                label="Call",
-                description="Communicate by calling/chatting in bot's dm with a user.",
-                emoji="📞",
-            ),
-            discord.SelectOption(
-                label="Social",
-                description="Fun commands to interact with users in your server!",
-                emoji="🔤",
-            ),
-            discord.SelectOption(
-                label="Valorant",
-                description="Valorant commands to get stats and more!",
-                emoji="<:valorant:996410911743033374>",
-            ),
-        ]
-        self.author = cauthor
-        self.fcommands = filteredcmds
-        if showingall:
-            super().__init__(
-                placeholder="Select a help category.",
-                min_values=1,
-                max_values=1,
-                options=options,
-                custom_id="defaulthelpselect:init",
-            )
-        else:
-            super().__init__(
-                placeholder="Select a help category.",
-                min_values=1,
-                max_values=1,
-                options=options,
-                custom_id="defaulthelpselect:init",
-            )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.user.id == self.author.id:
-            await interaction.response.send_message(
-                content=f"You have not invoked this help command!", ephemeral=True
-            )
-            return
-        cogname = self.values[0]
-        guild = interaction.guild
-        author = interaction.user
-        cog = client.get_cog(cogname)
-        cogemoji = {
-            "AntiRaid": "⛔",
-            "AutoMod": "🚨",
-            "Templates": "🎫",
-            "Captcha": "<:captcha:879225291136991292>",
-            "CustomCommands": "✍️",
-            "Fun": "🤩",
-            "Giveaways": "🎉",
-            "Logging": "📖",
-            "MinecraftFun": "<:grass:825355420604039219>",
-            "Moderation": "🔨",
-            "Music": "🎵",
-            "Support": "👀",
-            "SupportTicket": "🤝",
-            "AestronInfo": "📜",
-            "YoutubeTogether": "<:youtube:947131039418052658>",
-            "Leveling": "📈",
-            "Misc": "🧮",
-            "Call": "📞",
-            "Social": "🔤",
-            "Valorant": "<:valorant:996410911743033374>",
-        }
-        if cog is None:
-            await send_generic_error_embed(interaction.channel, error_data=f"No cogs named {cogname} were found!")
-            return
-        embed = discord.Embed(title=f"{cogemoji[cogname]} {cogname}")
-        for c in cog.get_commands():
-            cmd_name = c.name
-            cmd_description = c.description
-            embed.add_field(name=cmd_name, value=cmd_description, inline=False)
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-class DefaultHelp(discord.ui.View):
-    def __init__(self, filteredcmds, allcommands, author):
-        super().__init__(timeout=65)
-        self.filteredcmds = filteredcmds
-        self.allcommands = allcommands
-        self.showAll = False
-        self.author = author
-        self.currentSelectMenu = DefaultHelpSelect(
-            filteredcmds, self.author, self.showAll
-        )
-        self.add_item(self.currentSelectMenu)
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    @discord.ui.button(
-        label="⚪Click to toggle(Showing your commands)",
-        style=discord.ButtonStyle.green,
-    )
-    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.showAll = not self.showAll
-        if self.showAll:
-            button.label = "🔵Click to toggle(Showing all commands)"
-            await interaction.response.send_message(
-                content="Help toggled to show all commands!", ephemeral=True
-            )
-            cmds = self.allcommands
-        else:
-            button.label = "⚪Click to toggle(Showing your commands)"
-            await interaction.response.send_message(
-                content="Help toggled to show only commands you can use!",
-                ephemeral=True,
-            )
-            cmds = self.filteredcmds
-
-        await self._message.edit(view=self)
-        self.remove_item(self.currentSelectMenu)
-        self.currentSelectMenu = DefaultHelpSelect(cmds, self.author, self.showAll)
-        self.add_item(self.currentSelectMenu)
-        await self._message.edit(view=self)
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
+        for page in pages:
+            await self.context.send(embed=page)
 
 
 async def addmoney(ctx, userid, money):
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         memberoneeco = await con.fetchrow(
-            f"SELECT * FROM mceconomy WHERE memberid = {userid}"
+            "SELECT * FROM mceconomy WHERE memberid = $1", userid
         )
         if memberoneeco is None:
             statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
             newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, userid, 500, json.dumps(newjson))
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 memberoneeco = await con.fetchrow(
-                    f"SELECT * FROM mceconomy WHERE memberid = {userid}"
+                    "SELECT * FROM mceconomy WHERE memberid = $1", userid
                 )
     oldbal = memberoneeco["balance"]
     newbal = oldbal + money
     if newbal < 0:
-        await send_generic_error_embed(ctx, error_data="You don't have enough money to do that.")
+        await send_generic_error_embed(
+            ctx, error_data="You don't have enough money to do that."
+        )
         return
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         await con.execute(
-            f"UPDATE mceconomy VALUES SET balance = {newbal} WHERE memberid = {userid}"
+            "UPDATE mceconomy SET balance = $1 WHERE memberid = $2", newbal, userid
         )
 
 
@@ -946,62 +414,62 @@ class MCShopSelect(discord.ui.Select):
             discord.SelectOption(
                 label="Wooden Sword",
                 description="This item is available for 300 credits.",
-                emoji="<:WoodenSword:891651573674041365>",
+                emoji="⚔️",
             ),
             discord.SelectOption(
                 label="Stone Sword",
                 description="This item is available for 475 credits.",
-                emoji="<:StoneSword:891651573858566174>",
+                emoji="⚔️",
             ),
             discord.SelectOption(
                 label="Golden Sword",
                 description="This item is available for 750 credits.",
-                emoji="<:GoldenSword:891651573627908126>",
+                emoji="⚔️",
             ),
             discord.SelectOption(
                 label="Iron Sword",
                 description="This item is available for 1550 credits.",
-                emoji="<:IronSword:891651573397200907>",
+                emoji="⚔️",
             ),
             discord.SelectOption(
                 label="Diamond Sword",
                 description="This item is available for 10570 credits.",
-                emoji="<:DiamondSword:891651573669855282>",
+                emoji="⚔️",
             ),
             discord.SelectOption(
                 label="Netherite Sword",
                 description="This item is available for 40720 credits.",
-                emoji="<:NetheriteSword:891651573325893683>",
+                emoji="⚔️",
             ),
             discord.SelectOption(
                 label="Leather Armor",
                 description="This item is available for 600 credits.",
-                emoji="<:LeatherArmor:891651573481107506>",
+                emoji="🛡️",
             ),
             discord.SelectOption(
                 label="Chainmail Armor",
                 description="This item is available for 505 credits.",
-                emoji="<:ChainmailArmor:891651573787279380>",
+                emoji="🛡️",
             ),
             discord.SelectOption(
                 label="Golden Armor",
                 description="This item is available for 1850 credits.",
-                emoji="<:GoldArmor:891651573535637584>",
+                emoji="🛡️",
             ),
             discord.SelectOption(
                 label="Iron Armor",
                 description="This item is available for 3500 credits.",
-                emoji="<:IronArmor:891651573657251870>",
+                emoji="🛡️",
             ),
             discord.SelectOption(
                 label="Diamond Armor",
                 description="This item is available for 20585 credits.",
-                emoji="<:DiamondArmor:891651573569163345>",
+                emoji="🛡️",
             ),
             discord.SelectOption(
                 label="Netherite Armor",
                 description="This item is available for 70650 credits.",
-                emoji="<:NetheriteArmor:891651573464318032>",
+                emoji="🛡️",
             ),
         ]
         super().__init__(
@@ -1014,7 +482,7 @@ class MCShopSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         if not interaction.user.id == self.author.id:
             await interaction.response.send_message(
-                content=f"This store command is not yours, invoke your own by store command!",
+                content="This store command is not yours, invoke your own by store command!",
                 ephemeral=True,
             )
             return
@@ -1049,18 +517,18 @@ class MCShopSelect(discord.ui.Select):
             "Diamond Armor": 20585,
             "Netherite Armor": 70650,
         }
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             memberoneeco = await con.fetchrow(
-                f"SELECT * FROM mceconomy WHERE memberid = {self.author.id}"
+                "SELECT * FROM mceconomy WHERE memberid = $1", self.author.id
             )
         if memberoneeco is None:
             statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
             newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, self.author.id, 500, json.dumps(newjson))
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 memberoneeco = await con.fetchrow(
-                    f"SELECT * FROM mceconomy WHERE memberid = {self.author.id}"
+                    "SELECT * FROM mceconomy WHERE memberid = $1", self.author.id
                 )
         balance = memberoneeco["balance"]
         price = pricelist[shopitem]
@@ -1102,9 +570,11 @@ class MCShopSelect(discord.ui.Select):
                     ephemeral=True,
                 )
                 inventory["swordchoice"] = shopitem.split(" ")[0]
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(
-                    f"UPDATE mceconomy VALUES SET inventory = '{json.dumps(inventory)}' WHERE memberid = {self.author.id}"
+                    "UPDATE mceconomy SET inventory = $1 WHERE memberid = $2",
+                    json.dumps(inventory),
+                    self.author.id,
                 )
             await addmoney(interaction.channel, self.author.id, (-1 * price))
 
@@ -1125,44 +595,29 @@ class MCShop(discord.ui.View):
 
 
 async def get_prefix(client, _message):
-    if not onlystaffaccess:
-        if _message.guild:
-            try:
-                async with pool.acquire() as con:
-                    prefixeslist = await con.fetchrow(
-                        f"SELECT * FROM prefixes WHERE guildid = {_message.guild.id}"
+    chars = SETTINGS.default_prefix
+    if _message.guild and client.database.connected:
+        try:
+            async with client.database.pool.acquire() as connection:
+                prefix_row = await connection.fetchrow(
+                    "SELECT prefix FROM prefixes WHERE guildid = $1",
+                    _message.guild.id,
+                )
+                if prefix_row is None:
+                    await connection.execute(
+                        "INSERT INTO prefixes (guildid, prefix) VALUES($1, $2)",
+                        _message.guild.id,
+                        chars,
                     )
-                if prefixeslist is None:
-                    statement = """INSERT INTO prefixes (guildid,
-                                        prefix) VALUES($1, $2);"""
-                    async with pool.acquire() as con:
-                        await con.execute(statement, _message.guild.id, "a!")
-                    async with pool.acquire() as con:
-                        await con.execute(
-                            f"INSERT INTO prefixes VALUES (%s,%s)",
-                            (_message.guild.id, "a!"),
-                        )
-                    chars = "a!"
                 else:
-                    chars = prefixeslist["prefix"]
-                results = list(
-                    map("".join, itertools.product(*zip(chars.upper(), chars.lower())))
-                )
-                return commands.when_mentioned_or(*results)(client, _message)
-            except:
-                chars = "a!"
-                results = list(
-                    map("".join, itertools.product(*zip(chars.upper(), chars.lower())))
-                )
-                return commands.when_mentioned_or(*results)(client, _message)
-        else:
-            chars = "a!"
-            results = list(
-                map("".join, itertools.product(*zip(chars.upper(), chars.lower())))
+                    chars = prefix_row["prefix"]
+        except Exception:
+            LOGGER.exception(
+                "Could not load prefix guild_id=%s; using configured default",
+                _message.guild.id,
             )
-            return commands.when_mentioned_or(*results)(client, _message)
-    else:
-        return "sa!"
+    variants = map("".join, itertools.product(*zip(chars.upper(), chars.lower())))
+    return commands.when_mentioned_or(*variants)(client, _message)
 
 
 intents = discord.Intents.all()
@@ -1171,135 +626,254 @@ Dactivity = discord.Activity(
 )
 
 
-async def runBot():
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    ch.setFormatter(CustomFormatter())
+def get_cog_types():
+    """Return the cogs registered by the production startup path."""
+    return (
+        AestronInfo,
+        AntiRaid,
+        ModernModeration,
+        Logging,
+        AutoMod,
+        Templates,
+        SupportTicket,
+        Captcha,
+        MinecraftFun,
+        Leveling,
+        ModernValorant,
+        Misc,
+        Call,
+        Fun,
+        Social,
+        Giveaways,
+        Support,
+        ModernFeedback,
+        ModernMusic,
+        YoutubeTogether,
+        CustomCommands,
+    )
+
+
+async def run_bot():
     logging.log(logging.DEBUG, "Starting the bot...")
     client.start_status = BotStartStatus.PROCESSING
-    client.launch_time = datetime.utcnow()
-    global botVersion, conn, pool, DATABASE_URL, guildids, token, togetherControl, browser
-    togetherControl = await DiscordTogether(token)
-    token = ""
-    logging.log(logging.DEBUG, f"Trying to connect to {DATABASE_URL}")
-    conn = await asyncpg.connect(DATABASE_URL)
-    pool = await asyncpg.create_pool(
-        DATABASE_URL, max_size=max(20, len(client.guilds)), min_size=1
+    client.launch_time = discord.utils.utcnow()
+    await asyncio.to_thread(Path("resources/temp").mkdir, parents=True, exist_ok=True)
+    database_settings = DatabaseSettings.from_environment()
+    await client.database.connect(
+        database_settings.dsn,
+        max_size=max(20, len(client.guilds)),
+        min_size=1,
     )
-    client.pool = pool
-    logging.log(logging.DEBUG, f"The database sql has been set to {conn}")
+    await client.statistics.start(client.database.pool)
     client.session = aiohttp.ClientSession()
     logging.log(logging.DEBUG, f"The session has been set to {client.session}")
-    client.github_session = aiohttp.ClientSession()
-    nodes = [
-        wavelink.Node(uri="http://192.168.29.64:27000/", password="youshallnotpass")
-    ]
-    await wavelink.Pool.connect(nodes=nodes, client=client)
-    valorantMatchSave.start()
-    valorantSeasonCheck.start()
-    await client.add_cog(AestronInfo(client))
-    await client.add_cog(AntiRaid(client))
-    await client.add_cog(Moderation(client))
-    await client.add_cog(Logging(client))
-    await client.add_cog(AutoMod(client))
-    await client.add_cog(Templates(client))
-    await client.add_cog(SupportTicket(client))
-    await client.add_cog(Captcha(client))
-    await client.add_cog(MinecraftFun(client))
-    await client.add_cog(Leveling(client))
-    await client.add_cog(Valorant(client))
-    await client.add_cog(Misc(client))
-    await client.add_cog(Call(client))
-    await client.add_cog(Fun(client))
-    await client.add_cog(Social(client))
-    await client.add_cog(Giveaways(client))
-    await client.add_cog(Support(client))
-    await client.add_cog(Music(client))
-    await client.add_cog(YoutubeTogether(client))
-    await client.add_cog(CustomCommands(client))
+    perspective_api_key = os.getenv("GCOM_TOKEN")
+    if perspective_api_key:
+        try:
+            client.perspective_service = await asyncio.to_thread(
+                discovery.build,
+                "commentanalyzer",
+                "v1alpha1",
+                developerKey=perspective_api_key,
+                cache_discovery=False,
+            )
+        except Exception as ex:
+            logging.log(
+                logging.WARNING,
+                f"Perspective API initialization failed: {ex}",
+            )
+    await client.lavalink.start()
+    for cog_type in get_cog_types():
+        await client.add_cog(cog_type(client))
+    await client.add_cog(Statistics(client, client.statistics))
     await client.load_extension("jishaku")
-    for guild in client.guilds:
-        guildids.append(guild.id)
-    gitcommitcheck.start()
+    normalize_command_metadata(client)
+    documentation_issues = audit_command_metadata(client)
+    if documentation_issues:
+        details = "; ".join(
+            f"{issue.command}.{issue.field}: {issue.detail}"
+            for issue in documentation_issues
+        )
+        raise RuntimeError(f"Invalid command documentation: {details}")
+    LOGGER.info(
+        "Validated command metadata commands=%s application_commands=%s",
+        len(list(client.walk_commands())),
+        len(client.tree.get_commands()),
+    )
     client.start_status = BotStartStatus.COMPLETED
-    logging.log(logging.DEBUG, f"Bot has started in {datetime.utcnow()-client.launch_time}s!")
+    logging.log(
+        logging.DEBUG,
+        f"Bot has started in {discord.utils.utcnow() - client.launch_time}s!",
+    )
     if len(sys.argv) > 1 and sys.argv[1] == "restart":
-        if len(sys.argv) > 2:
-            channelid = int(sys.argv[2])
-            while client.get_channel(channelid) is None:
-                await asyncio.sleep(2)
-            channelmsg = client.get_channel(channelid)
-        else:
-            while client.get_channel(CHANNEL_DEV_ID) is None:
-                await asyncio.sleep(2)
-            channelmsg = client.get_channel(CHANNEL_DEV_ID)
-        await channelmsg.send("Successfully Restarted!")
+        channel_id = int(sys.argv[2]) if len(sys.argv) > 2 else CHANNEL_DEV_ID
+        client.create_background_task(notify_restart(channel_id), name="notify-restart")
+
+
+async def notify_restart(channel_id):
+    await client.wait_until_ready()
+    channel = client.get_channel(channel_id)
+    if channel is not None:
+        await channel.send("Successfully restarted!")
+
+
+async def restart_process(channel_id=None):
+    args = [sys.executable, SCRIPT_PATH, "restart"]
+    if channel_id is not None:
+        args.append(str(channel_id))
+    await client.close()
+    await asyncio.create_subprocess_exec(*args)
+
+
+def render_level_rank_image(top_members, destination):
+    """Render a level leaderboard off the Discord event loop."""
+    coordinates = [(52, 5), (290, 5), (512, 5), (729, 5), (962, 5)]
+    level_coordinates = [(86, 158), (339, 157), (555, 158), (783, 158), (1014, 157)]
+    rank_coordinates = [(86, 196), (339, 192), (555, 196), (783, 196), (1014, 194)]
+    name_coordinates = [(25, 234), (283, 237), (500, 236), (723, 241), (954, 237)]
+    with Image.open("./resources/levelrank/background.jpg") as source:
+        background = source.copy()
+    draw = ImageDraw.Draw(background)
+    font = ImageFont.truetype("./resources/common/consolasbold.ttf", 20)
+    for index, member in enumerate(top_members):
+        draw.text(
+            level_coordinates[index],
+            str(member["level"]),
+            (0, 125, 232),
+            font=font,
+        )
+        draw.text(rank_coordinates[index], str(index + 1), (255, 255, 255), font=font)
+        draw.text(name_coordinates[index], member["name"], (255, 255, 255), font=font)
+        with Image.open(BytesIO(member["avatar_bytes"])) as avatar_source:
+            avatar = avatar_source.convert("RGB").resize(
+                (100, 100), Image.Resampling.LANCZOS
+            )
+        background.paste(avatar, coordinates[index])
+    background.save(destination)
+
+
+def render_level_image(
+    avatar_bytes, member_name, rank, message_count, messages_per_level, destination
+):
+    """Render one member's level card off the Discord event loop."""
+    with Image.open("./resources/level/background.jpg") as source:
+        background = source.copy()
+    with Image.open(BytesIO(avatar_bytes)) as avatar_source:
+        avatar = avatar_source.convert("RGB").resize(
+            (239, 222), Image.Resampling.LANCZOS
+        )
+    background.paste(avatar, (71, 43))
+    draw = ImageDraw.Draw(background)
+    font = ImageFont.truetype("./resources/common/consolasbold.ttf", 30)
+    draw.text((402, 123), member_name, (255, 255, 255), font=font)
+    draw.text((796, 29), str(rank), (255, 255, 255), font=font)
+    level = message_count // messages_per_level
+    draw.text((1067, 25), str(level), (0, 125, 232), font=font)
+    total_level = (level // 20 + 1) * 20
+    current_level = level % 20
+    draw.text(
+        (1027, 122),
+        f"{current_level}/{total_level}",
+        (240, 240, 240),
+        font=font,
+    )
+    draw_progress_bar(draw, 401, 161, 737, 50, current_level / total_level)
+    background.save(destination)
+
+
+def render_welcome_image(
+    avatar_bytes, member_name, member_count, guild_name, destination
+):
+    """Render a welcome card off the Discord event loop."""
+    with Image.open("./resources/welcomeuser/background.jpg") as source:
+        background = source.copy()
+    with Image.open(BytesIO(avatar_bytes)) as avatar_source:
+        avatar = avatar_source.convert("RGB").resize(
+            (170, 170), Image.Resampling.LANCZOS
+        )
+    background.paste(avatar, (388, 195))
+    draw = ImageDraw.Draw(background)
+    font = ImageFont.truetype("./resources/common/consolasbold.ttf", 18)
+    draw.text(
+        (8, 465),
+        f"Welcome {member_name}, you are member {member_count} of {guild_name}.",
+        (255, 255, 255),
+        font=font,
+    )
+    background.save(destination)
+
+
+def render_wanted_image(avatar_bytes, destination):
+    """Render a wanted poster off the Discord event loop."""
+    with Image.open("./resources/wanteduser/background.jpg") as source:
+        background = source.copy()
+    with Image.open(BytesIO(avatar_bytes)) as avatar_source:
+        avatar = avatar_source.convert("RGB").resize(
+            (139, 172), Image.Resampling.LANCZOS
+        )
+    background.paste(avatar, (114, 153))
+    background.save(destination)
 
 
 class MyBot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.database = DatabaseService()
+        self.statistics = BotStatistics()
+        self.lavalink = LavalinkService(self)
+        self.perspective_service = None
+        self.runtime_state = RuntimeState()
+        self.rate_limits = RateLimits()
+        self.background_tasks = set()
+        self.runtime_settings = SETTINGS
+        self.aestron_site_base_url = SETTINGS.site_base_url
+        self.aestron_service_token = SETTINGS.aestron_service_token
+        self.valorant_api_key = os.getenv("VAL_API_TOKEN")
 
+    def create_background_task(self, coroutine, *, name):
+        """Track a fire-and-forget task and log any unhandled failure."""
+        task = asyncio.create_task(coroutine, name=name)
+        self.background_tasks.add(task)
 
+        def task_done(completed_task):
+            self.background_tasks.discard(completed_task)
+            if completed_task.cancelled():
+                return
+            error = completed_task.exception()
+            if error is not None:
+                LOGGER.error(
+                    "Background task %s failed",
+                    completed_task.get_name(),
+                    exc_info=error,
+                )
+
+        task.add_done_callback(task_done)
+        return task
 
     async def is_owner(self, user: discord.User):
-        return checkstaff(user)
+        if user.id in SETTINGS.owner_ids:
+            return True
+        return await super().is_owner(user)
 
     async def setup_hook(self):
-        await self.load_extension("cogs.listeners")
-        await self.load_extension("cogs.moderation")
         self.add_view(Verification())
-        self.loop.create_task(runBot())
+        await run_bot()
 
-    async def on_wavelink_track_start(
-        self, payload: wavelink.TrackStartEventPayload
-    ) -> None:
-        try:
-            player: wavelink.Player | None = payload.player
-            if not player:
-                logging.log(logging.ERROR, f"No player found while trying to start {payload.track}!")
-                return
+    async def close(self):
+        for task in self.background_tasks:
+            task.cancel()
+        if self.background_tasks:
+            await asyncio.gather(*self.background_tasks, return_exceptions=True)
+        self.background_tasks.clear()
+        await self.statistics.close()
+        await self.lavalink.close()
+        for session_name in ("session",):
+            session = getattr(self, session_name, None)
+            if session and not session.closed:
+                await session.close()
+        await self.database.close()
+        await super().close()
 
-            original: wavelink.Playable | None = payload.original
-            track: wavelink.Playable = payload.track
-            if track.artist.url is None:
-                embed = discord.Embed(
-                    title="",
-                    description=f"Feat {track.author}",
-                    color=0x00FF00,
-                )
-            else:
-                embed = discord.Embed(
-                    title="",
-                    description=f"Feat [{track.author}]({track.artist.url})",
-                    color=0x00FF00,
-                )
-            if track.source == "youtube":
-                embed.set_author(
-                    name=track.title,
-                    icon_url="https://cdn.discordapp.com/avatars/812967359312297994/2c234518e4889657d01fe7001cd52422.webp?size=128",
-                )
-            elif track.source == "spotify":
-                embed.set_author(
-                    name=track.title,
-                    icon_url="https://cdn.discordapp.com/avatars/841279857879154689/0d77aa58a3f0a937f6c45b0305030562.png?size=128",
-                )
-            else:
-                embed.set_author(
-                    name=track.title,
-                    icon_url="https://cdn.discordapp.com/avatars/879269940853612544/3b32d0d2b8eafc0d32cdeac99f9ece6f.png?size=128",
-                )
-
-            if track.artwork:
-                embed.set_image(url=track.artwork)
-
-            if original and original.recommended:
-                embed.description += f"(Recommended)"
-
-            panel = Songpanel(player.home.guild, player.home, player)
-            panel.set_message(await player.home.send(embed=embed, view=panel))
-        except Exception as ex:
-            logging.log(logging.ERROR, f"Error while starting track: {get_traceback(ex)}")
 
 class BotStartStatus(enum.Enum):
     WAITING = 1
@@ -1315,594 +889,9 @@ client = MyBot(
     help_command=MyHelp(),
     strip_after_prefix=True,
 )
-client.service = service
 
 
-class CustomFormatter(logging.Formatter):
-    grey = "\x1b[38;20m"
-    yellow = "\x1b[33;20m"
-    red = "\x1b[31;20m"
-    bold_red = "\x1b[31;1m"
-    reset = "\x1b[0m"
-    format = (
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
-    )
-
-    FORMATS = {
-        logging.DEBUG: grey + format + reset,
-        logging.INFO: grey + format + reset,
-        logging.WARNING: yellow + format + reset,
-        logging.ERROR: red + format + reset,
-        logging.CRITICAL: bold_red + format + reset,
-    }
-
-    def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
-        formatter = logging.Formatter(log_fmt)
-        return formatter.format(record)
-
-
-def get_traceback(error):
-    etype = type(error)
-    trace = error.__traceback__
-    lines = traceback.format_exception(etype, error, trace)
-    traceback_text = "".join(lines)
-    return traceback_text
-
-
-client._BotBase__cogs = commands.core._CaseInsensitiveDict()
 client.start_status = BotStartStatus.WAITING
-# ignore TOKEN FOR DASHBOARD webhooks.
-togetherControl = None
-API_KEY = os.getenv("GCOM_TOKEN")
-service = discovery.build("commentanalyzer", "v1alpha1", developerKey=API_KEY)
-# REQUIRES API KEY
-# Moderation message check!
-# https://developers.perspectiveapi.com/s/docs
-randomjava = [
-    "The original name for Java was Oak. It was eventually changed to Java by Sun's marketing department when Sun lawyers found that there was already a computer company registered as Oak. But a legend has it that Gosling and his gang of programmers went out to the local cafe to discuss names and ended up naming it Java. ",
-    'James Gosling was working at Sun Labs, around 1992. Gosling and his team was building a set-top box and started by "cleaning up"C++ and wound up with a new language and runtime. Thus, Java or Oak came into being.',
-    "Though many would argue that Java is all time favourite among developers, it is the second most popular programming language after C. Java is ranked second in popularity among programming languages.",
-    "Currently, about 3 billion mobile phones are working in Java, as well as 125 million TV sets and each Blu-Ray player. This language is continually ranked first in the rankings of software developers as the best choice of programming languages.",
-    "Java is free from the concept of Pointer as adding pointers to Java language would compromise security and the robustness, making this language more complex.",
-    "In Java, The meaning of Final keyword is not final. It has different meanings in java. It can be Final class, Final method, Final field or Final variable.",
-    "Java is used by 95% of the enterprises as their primary language. It is much more than C and the other languages.",
-    "A Java developer’s median salary is $83, 975.00. It pays to be a Java developer.",
-    "Today, Java rationally runs on more than 1 billion as the Android operating system of Google uses Java APIs.",
-    "In one year Java gets downloaded one billion times.",
-]
-randompython = [
-    "This name ‘Python’ is extracted from a British comedy series, “Monty Python’s Flying Circus”. It is not named a snake. It is said that this was the favorite series of its inventor Guido Van Rossum. He named it Python because it is short, mysterious and unique.",
-    "Tim Peters wrote an interesting poem about Python which highlights some of the python facts. It is popular as “The Zen of Python”. This poem is beautifully composed. You can get this poem if you write import this in your python compiler.",
-    "In Python, there can be multiple comparisons at once. It is able to check multiple conditions at the same time. While in other programming languages, you can not program a chain of comparison operators. The comparison operators can be chained randomly. It does not have to follow a particular order of operators.",
-    "Python offers a feature to return multiple values using function. It returns the value as a tuple. While it is not possible with other languages such as Java, C, etc.",
-    "Python relies on an interpreter. Unlike other programming languages, it does not need a compiler. The code is stored in a.pyc file. This file acts as a dynamic engine for Python eliminating the need of any compiler.",
-    "In Python, every program is done by reference. It does not support pointer.",
-    "Python has incorporated the variants of C and Java such as CPython, Jython, etc. The C variant is CPython, to give Python the glimpse benefits of C language. It is because CPython is beneficial in terms of performance, as it has both a compiler and an interpreter. The Java variant of Python is Jython. It drops the highlighting feature of Java such as productivity.",
-    "It another interesting fact about Python. It allows you to easily unpack a list or dictionary of all the functions you have used in your program. You can unpack a list by using * and dictionary by using **.",
-    "Unlike other languages, Python is the only language that can use else within for a loop. This will be true only when the loop exists naturally and do not break in between.",
-    "One can use an “else” clause with a “for” loop in Python. It’s a special type of syntax that executes only if the for loop exits naturally, without any break statements.",
-    "Function Argument Unpacking is another awesome feature of Python. One can unpack a list or a dictionary as function arguments using * and ** respectively. This is commonly known as the Splat operator. ",
-    " Want to find the index inside a for loop? Wrap an iterable with ‘enumerate’ and it will yield the item along with its index",
-    "One can chain comparison operators in Python answer= 1<x<10 is executable in Python.",
-    "We can’t define Infinities right? But wait! Not for Python.. E.g : p_infinity  , n_infinity",
-    "Instead of building a list with a loop, one can build it more concisely with a list comprehension. See this code for more understanding.",
-    "Finally, Python’s special Slice Operator. It is a way to get items from lists, as well as change them",
-    "Python vs java is a common comparsion. Python is dynamically coded and Java is staticly coded. So Java is much faster than python. Java can't do everything that python can , its vice-versa too.",
-]
-currentlymuting = []
-currentlyunmuting = []
-currentlyblacklisting = []
-currentlyunblacklisting = []
-randomlist = randomjava + randompython
-afkrecent = {}
-# BOT OWNER IDS
-tempbotowners = []
-guildids = []
-timer = 0.005
-devtimer = 2
-botVersion = "2.1: Added cmdusage command, use it to check a command's usage."
-botGitVersion = "1675258361.8610396"
-bot.cooldownself = commands.CooldownMapping.from_cooldown(
-    1.0, 1.0, commands.BucketType.member
-)
-bot.cmdcooldownvar = commands.CooldownMapping.from_cooldown(
-    5.0, 8.0, commands.BucketType.member
-)
-bot.triviacooldownvar = commands.CooldownMapping.from_cooldown(
-    5.0, 8.0, commands.BucketType.member
-)
-bot.cooldownvar = commands.CooldownMapping.from_cooldown(
-    5.0, 8.0, commands.BucketType.member
-)
-bot.member_bancooldown = commands.CooldownMapping.from_cooldown(
-    2.0, 60.0, commands.BucketType.member
-)
-bot.member_unbancooldown = commands.CooldownMapping.from_cooldown(
-    2.0, 30.0, commands.BucketType.member
-)
-bot.channel_createcooldown = commands.CooldownMapping.from_cooldown(
-    2.0, 120.0, commands.BucketType.member
-)
-bot.channel_deletecooldown = commands.CooldownMapping.from_cooldown(
-    2.0, 30.0, commands.BucketType.member
-)
-bot.channel_updatecooldown = commands.CooldownMapping.from_cooldown(
-    3.0, 10.0, commands.BucketType.member
-)
-bot.role_createcooldown = commands.CooldownMapping.from_cooldown(
-    2.0, 120.0, commands.BucketType.member
-)
-bot.role_deletecooldown = commands.CooldownMapping.from_cooldown(
-    2.0, 30.0, commands.BucketType.member
-)
-bot.role_updatecooldown = commands.CooldownMapping.from_cooldown(
-    4.0, 20.0, commands.BucketType.member
-)
-bot.guild_updatecooldown = commands.CooldownMapping.from_cooldown(
-    2.0, 240.0, commands.BucketType.member
-)
-bot.cooldowntwo = commands.CooldownMapping.from_cooldown(
-    1.0, 30.0, commands.BucketType.member
-)
-debugPrint = False
-debugCode = False
-retryDebug = None
-yourCode = ""
-listOfUrls = []
-disabledChannels = []
-
-
-async def playmusic(ctx, songname):
-    """Play a song with the given query."""
-    if not ctx.guild:
-        return
-
-    player: wavelink.Player
-    player = cast(wavelink.Player, ctx.voice_client)  # type: ignore
-
-    if not player:
-        try:
-            player = await ctx.author.voice.channel.connect(cls=wavelink.Player)  # type: ignore
-        except AttributeError:
-            await ctx.send(
-                "Please join a voice channel first before using this command."
-            )
-            return
-        except discord.ClientException:
-            await ctx.send("I was unable to join this voice channel. Please try again.")
-            return
-        
-    player.autoplay = wavelink.AutoPlayMode.partial
-    if not hasattr(player, "home"):
-        player.home = ctx.channel
-    elif player.home != ctx.channel:
-        await ctx.send(
-            f"You can only play songs in {player.home.mention}, as the player has already started there."
-        )
-        return
-    tracks: wavelink.Search = await wavelink.Playable.search(songname)
-    if not tracks:
-        await ctx.send(
-            f"{ctx.author.mention} - Could not find any tracks with that query. Please try again."
-        )
-        return
-
-    if isinstance(tracks, wavelink.Playlist):
-        for track in tracks:
-            track.extras = {
-                "requester_id": ctx.author.id,
-                "type_emoji": (
-                    "<:youtube:947131039418052658>"
-                    if track.source == "youtube"
-                    else (
-                        "<:spotify:947128614179205131>"
-                        if track.source == "spotify"
-                        else ":warning:"
-                    )
-                ),
-            }
-        added: int = await player.queue.put_wait(tracks)
-        embedVar = discord.Embed(
-            title=f"Added **{tracks.name}**({added} songs) to the queue.",
-            description=" ",
-            color=0x00FF00,
-        )
-        embedVar.set_author(name=ctx.author.name, icon_url=ctx.author.display_avatar)
-        await ctx.send(embed=embedVar)
-    else:
-        track: wavelink.Playable = tracks[0]
-        track.extras = {
-            "requester_id": ctx.author.id,
-            "type_emoji": (
-                "<:youtube:947131039418052658>"
-                if track.source == "youtube"
-                else (
-                    "<:spotify:947128614179205131>"
-                    if track.source == "spotify"
-                    else ":warning:"
-                )
-            ),
-        }
-        await player.queue.put_wait(track)
-        embedVar = discord.Embed(
-            title=f"Added **{track}** to the queue.",
-            description=" ",
-            color=0x00FF00,
-        )
-        embedVar.set_author(name=ctx.author.name, icon_url=ctx.author.display_avatar)
-        await ctx.send(embed=embedVar)
-
-    if not player.playing:
-        await player.play(player.queue.get())
-
-
-def songcheckperm(channel, member):
-    if channel is None:
-        return
-    return channel.permissions_for(member).manage_channels
-
-
-class Songpanel(discord.ui.View):
-    def __init__(self, guild, channel, player):
-        super().__init__(timeout=((player.current.length) // 1000) + 5)
-        self.player = player
-        self.channel = channel
-        self.guild = guild
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
-
-    @discord.ui.button(
-        label="⏸️", style=discord.ButtonStyle.green, custom_id="songpanel:playpause"
-    )
-    async def playpause(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        member = self.player.guild.get_member(self.player.current.extras.requester_id)
-        if not interaction.user.id == member.id and not songcheckperm(
-            self.channel, interaction.user
-        ):
-            await interaction.response.send_message(
-                "You have not invoked this song.", ephemeral=True
-            )
-            return
-
-        guild = self.guild
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.send_message(
-                "You didn't request a song to be played that can be paused.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            if player.paused:
-                button.label = "⏸️"
-                await player.pause(not player.paused)
-                try:
-                    await interaction.response.send_message(
-                        f"The audio has been resumed by {interaction.user.mention}",
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    await self._message.edit(view=self)
-                except:
-                    await interaction.followup.send(
-                        f"The audio has been resumed by {interaction.user.mention}",
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-            else:
-                button.label = "▶️"
-                await player.pause(not player.paused)
-                try:
-                    await interaction.response.send_message(
-                        f"The audio has been paused by {interaction.user.mention}",
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    await self._message.edit(view=self)
-                except:
-                    await interaction.followup.send(
-                        f"The audio has been paused by {interaction.user.mention}",
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-        except:
-            await interaction.response.send_message(
-                "I cannot find any voice channels.", ephemeral=True
-            )
-
-    @discord.ui.button(
-        label="⬆️", style=discord.ButtonStyle.green, custom_id="songpanel:volumeup"
-    )
-    async def volumeup(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        member = self.player.guild.get_member(self.player.current.extras.requester_id)
-        if not interaction.user.id == member.id and not songcheckperm(
-            self.channel, interaction.user
-        ):
-            await interaction.response.send_message(
-                "You have not invoked this song.", ephemeral=True
-            )
-            return
-
-        guild = self.guild
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.send_message(
-                "No music is being played currently.", ephemeral=True
-            )
-            return
-
-        try:
-            await player.set_volume(min(player.volume + 5, 100))
-            await interaction.response.send_message(
-                f"{interaction.user.mention} has changed 🔉 to {player.volume}.",
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except:
-            await interaction.followup.send(
-                f"{interaction.user.mention} has changed 🔉 to {player.volume}.",
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-
-    @discord.ui.button(
-        label="⬇️", style=discord.ButtonStyle.green, custom_id="songpanel:volumedown"
-    )
-    async def volumedown(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        member = self.player.guild.get_member(self.player.current.extras.requester_id)
-        if not interaction.user.id == member.id and not songcheckperm(
-            self.channel, interaction.user
-        ):
-            await interaction.response.send_message(
-                "You have not invoked this song.", ephemeral=True
-            )
-            return
-
-        guild = self.guild
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.send_message(
-                "No music is being played currently.", ephemeral=True
-            )
-            return
-
-        try:
-            await player.set_volume(max(player.volume - 5, 0))
-            await interaction.response.send_message(
-                f"{interaction.user.mention} has changed 🔉 to {player.volume}.",
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except:
-            await interaction.followup.send(
-                f"{interaction.user.mention} has changed 🔉 to {player.volume}.",
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-
-    @discord.ui.button(
-        label="📖", style=discord.ButtonStyle.green, custom_id="songpanel:queue"
-    )
-    async def queue(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = self.guild
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.send_message(
-                "No songs are playing in this guild.", ephemeral=True
-            )
-            return
-
-        length = player.queue.count
-        embedVar = discord.Embed(
-            title=f"{guild} tracks", description="", color=0x00FF00
-        )
-        listOfEmbeds = []
-        count = 0
-        for i in range(length):
-            count = count + 1
-            song = player.queue.get_at(i)
-            embedVar.description = (
-                embedVar.description
-                + f"{i + 1}. {song.extras.type_emoji} [`{timedelta(milliseconds=song.length)}`] [{song.title}]({song.uri}) : <@{song.extras.requester_id}>\n"
-            )
-            if count == 10:
-                listOfEmbeds.append(embedVar)
-                embedVar = discord.Embed(
-                    title=f"{guild} tracks", description="", color=0x00FF00
-                )
-                count = 0
-        if length < 10:
-            listOfEmbeds.append(embedVar)
-        pagview = PaginateEmbed(listOfEmbeds)
-        pagview.set_message(
-            await interaction.response.send_message(
-                view=pagview, embed=listOfEmbeds[0], ephemeral=True
-            )
-        )
-
-    @discord.ui.button(
-        label="🎶", style=discord.ButtonStyle.green, custom_id="songpanel:lyrics"
-    )
-    async def lyrics(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if button.label == "🔙":
-            button.label = "🎶"
-            await interaction.response.defer(ephemeral=True)
-            await interaction.edit_original_response(
-                embed=self._message.embeds[0], view=self
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-        guild = self.guild
-        player = self.player
-        if not player or not player.current:
-            return
-
-        song = player.current
-        try:
-            songname = song.title
-        except:
-            await interaction.followup.send(
-                "I could not find any playing song.",
-                ephemeral=True,
-            )
-            return
-        try:
-            output = extract_lyrics.get_lyrics(songname)
-        except:
-            await interaction.followup.send(
-                "No lyrics found for that song.",
-                ephemeral=True,
-            )
-            return
-        if output.get("error"):
-            await interaction.followup.send(
-                "No lyrics found for that song.",
-                ephemeral=True,
-            )
-            return
-        try:
-            embedtitle = output["title"]
-        except:
-            embedtitle = songname
-        embedlyrics = output["lyrics"]
-        embed = discord.Embed(title=embedtitle, description=embedlyrics)
-        try:
-            embed.set_thumbnail(url=output["image"])
-        except:
-            pass
-        button.label = "🔙"
-        await interaction.edit_original_response(embed=embed, view=self)
-
-
-    @discord.ui.button(
-        label="🛑", style=discord.ButtonStyle.red, custom_id="songpanel:stop"
-    )
-    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
-        member = self.player.guild.get_member(self.player.current.extras.requester_id)
-        channel = self.channel
-        guild = self.guild
-
-        if not (
-            channel.permissions_for(interaction.user).manage_channels
-            or checkstaff(member)
-        ):
-            await interaction.response.send_message(
-                f"I am already playing music in a channel , you must have `manage_channels` permissions to stop music.",
-                ephemeral=True,
-            )
-            return
-        try:
-            player = self.player
-            if not player or not player.current:
-                return
-
-            await player.disconnect()
-            await interaction.response.send_message(
-                    f"The audio has been stopped by {interaction.user.mention}",
-                )
-        except:
-            await interaction.response.send_message(
-                "I am not connected to any voice channel.", ephemeral=True
-            )
-
-    @discord.ui.button(
-        label="🔁", style=discord.ButtonStyle.red, custom_id="songpanel:loop"
-    )
-    async def loop(self, interaction: discord.Interaction, button: discord.ui.Button):
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.send_message(
-                "No songs are queued in this guild.", ephemeral=True
-            )
-            return
-        if player.queue.mode == wavelink.QueueMode.normal:
-            player.queue.mode = wavelink.QueueMode.loop
-            await interaction.response.send_message(
-                f"{interaction.user.mention} enabled loop for the last song in queue."
-            )
-            button.label = "🔁"
-            button.style = discord.ButtonStyle.green
-            await self._message.edit(view=self)
-        elif player.queue.mode == wavelink.QueueMode.loop:
-            player.queue.mode = wavelink.QueueMode.loop_all
-            await interaction.response.send_message(
-                f"{interaction.user.mention} enabled loop for all songs in queue."
-            )
-            button.label = "🔁1️⃣"
-            button.style = discord.ButtonStyle.green
-            await self._message.edit(view=self)
-        else:
-            player.queue.mode = wavelink.QueueMode.normal
-            await interaction.response.send_message(
-                f"{interaction.user.mention} has disabled loop mode."
-            )
-            button.label = "🔁"
-            button.style = discord.ButtonStyle.red
-            await self._message.edit(view=self)
-
-    @discord.ui.button(
-        label="🔀", style=discord.ButtonStyle.green, custom_id="songpanel:shuffle"
-    )
-    async def shuffle(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.send_message(
-                "No songs are queued in this guild.", ephemeral=True
-            )
-            return
-        player.queue.shuffle()
-        await interaction.response.send_message(
-            f"{interaction.user.mention} has shuffled the songs in queue!"
-        )
-
-    @discord.ui.button(
-        label="⏪", style=discord.ButtonStyle.green, custom_id="songpanel:backward"
-    )
-    async def backward(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.send_message(
-                "No songs are queued in this guild.", ephemeral=True
-            )
-            return
-        if player.queue.history.count <= 1:
-            await interaction.response.send_message(
-                f"{interaction.user.mention} has played the previous song."
-            )
-            return
-        await player.play(player.queue.history[-2])
-        await interaction.response.send_message(
-            f"{interaction.user.mention} has played the previous song."
-        )
-
-    @discord.ui.button(
-        label="⏩", style=discord.ButtonStyle.green, custom_id="songpanel:forward"
-    )
-    async def forward(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        player = self.player
-        if not player or not player.current:
-            await interaction.response.send_message(
-                "No songs are queued in this guild.", ephemeral=True
-            )
-            return
-        await player.skip(force=True)
-        await interaction.response.send_message(
-            f"{interaction.user.mention} has played the next song."
-        )
 
 
 class Confirmpvp(discord.ui.View):
@@ -1955,63 +944,29 @@ class Confirmpvp(discord.ui.View):
         self.stop()
 
 
-
-
-
-class Confirm(discord.ui.View):
+class ConfirmDecline(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=60)
+        super().__init__(timeout=299)
         self.value = None
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
+        self.authorcancel = None
 
     # When the confirm button is pressed, set the inner value to `True` and
     # stop the View from listening to more input.
     # We also send the user an ephemeral message that we're confirming their choice.
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red)
     async def confirm(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         # await interaction.response.send_message('Confirming', ephemeral=True)
-        if not checkstaff(interaction.user):
+        if not interaction.channel.permissions_for(interaction.user).manage_guild:
             await interaction.response.send_message(
                 "You do not have permissions to do so!", ephemeral=True
             )
             return
+        self.authorcancel = interaction.user.mention
         self.value = True
         self.stop()
-
-    # This one is similar to the confirmation button except sets the inner value to `False`
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.grey)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # await interaction.response.send_message('Cancelling', ephemeral=True)
-        if not checkstaff(interaction.user):
-            await interaction.response.send_message(
-                "You do not have permissions to do so!", ephemeral=True
-            )
-            return
-        self.value = False
-        self.stop()
-
-async def exception_catching_callback(task):
-    if task.exception():
-        task.print_stack()
-        error = task.exception()
-        embederror = discord.Embed(
-            title=f"❌ Error occured ({type(error)}) : **{error}**",
-            description=f"Python Code",
-            color=Color.dark_red(),
-        )
-        traceback_text = get_traceback(error)
-        embederror.add_field(name="Traceback: ", value=traceback_text)
-        client.get_channel(CHANNEL_ERROR_LOGGING_ID).send(embed=embederror)
 
 
 @client.event
@@ -2019,34 +974,8 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
 
-    if isinstance(error, commands.CheckAnyFailure) or isinstance(
-        error, commands.CheckFailure
-    ):
-        error_data = error.errors[0]
-        copyError = error
-        error = copyError.errors[0]
-        if str(ctx.author.id) in tempbotowners:
-            view = Confirm()
-            embed = discord.Embed(title="Command sent", description=ctx.message.content)
-            view.set_message(
-                statmsg := await client.get_channel(CHANNEL_DEV_ID).send(
-                    f"(Missing perms) TS-({ctx.author.id}): {ctx.author.mention} wrote *MESSAGE BELOW* ({ctx.command}) in {ctx.guild}.",
-                    view=view,
-                    embed=embed,
-                )
-            )
-
-            await view.wait()
-            if view.value is None:
-                await statmsg.reply(f"Timed out({view.timeout}s)! :octagonal_sign:")
-            elif view.value:
-                await statmsg.reply("Confirmed <a:yes:872664918736928858>")
-                await ctx.reinvoke()
-                return
-            else:
-                await statmsg.reply("Cancelled :octagonal_sign:")
-        else:
-            error_data = "You do not have permission to run this command."
+    if isinstance(error, commands.CheckAnyFailure):
+        error_data = "You do not have permission to run this command."
     elif isinstance(error, commands.MissingPermissions):
         missingperms = error.missing_permissions[0]
         missingperms = missingperms.replace("_", " ")
@@ -2054,103 +983,103 @@ async def on_command_error(ctx, error):
         error_data = (
             f"You are lacking the {missingperms} permission to execute that command."
         )
-        if str(ctx.author.id) in tempbotowners:
-            view = Confirm()
-            embed = discord.Embed(title="Command sent", description=ctx.message.content)
-            view.set_message(
-                statmsg := await client.get_channel(CHANNEL_DEV_ID).send(
-                    f"(Missing perms) TS-({ctx.author.id}): {ctx.author.mention} wrote *MESSAGE BELOW* ({ctx.command}) in {ctx.guild}.",
-                    view=view,
-                    embed=embed,
-                )
-            )
-
-            await view.wait()
-            if view.value is None:
-                await statmsg.reply(f"Timed out({view.timeout}s)! :octagonal_sign:")
-            elif view.value:
-                await statmsg.reply("Confirmed <a:yes:872664918736928858>")
-                await ctx.reinvoke()
-                return
-            else:
-                await statmsg.reply("Cancelled :octagonal_sign:")
+    elif isinstance(error, commands.CheckFailure) and not isinstance(
+        error, commands.BotMissingPermissions
+    ):
+        error_data = "You do not have permission to run this command."
     elif isinstance(error, commands.CommandOnCooldown):
-        sendTimer = error.retry_after
-        if sendTimer < 1:
-            sendTimer = 1
+        send_timer = error.retry_after
+        if send_timer < 1:
+            send_timer = 1
         else:
-            sendTimer = int(sendTimer)
+            send_timer = int(send_timer)
         if (
             commands.BucketType.user == error.type
             or commands.BucketType.member == error.type
         ):
-            error_data = f"You tried doing {ctx.command} , you can use this command in {sendTimer}s."
+            error_data = f"You tried doing {ctx.command} , you can use this command in {send_timer}s."
         elif commands.BucketType.guild == error.type:
             error_data = (
-                f"The command {ctx.command} can be used in {sendTimer}s in this guild."
+                f"The command {ctx.command} can be used in {send_timer}s in this guild."
             )
         elif commands.BucketType.channel == error.type:
-            error_data = f"The command {ctx.command} can be used in {sendTimer}s in this channel."
+            error_data = f"The command {ctx.command} can be used in {send_timer}s in this channel."
         elif commands.BucketType.category == error.type:
-            error_data = f"The command {ctx.command} can be used in {sendTimer}s in this category."
+            error_data = f"The command {ctx.command} can be used in {send_timer}s in this category."
         elif commands.BucketType.role == error.type:
             error_data = (
-                f"The command {ctx.command} can be used in {sendTimer}s in this role."
+                f"The command {ctx.command} can be used in {send_timer}s in this role."
             )
         if checkstaff(ctx.author):
             await ctx.reinvoke()
             return
     elif isinstance(error, commands.DisabledCommand):
-        error_data = f'The command you tried to do is disabled due to a reported issue, contact [support server]({SUPPORT_SERVER_INVITE} "Join the bot support server for reporting bugs or suggesting commands!.") for more information.'
+        error_data = "This command is currently disabled."
+        if SETTINGS.support_server_invite:
+            error_data += f" Report the issue at {SETTINGS.support_server_invite}."
     elif isinstance(error, commands.BotMissingPermissions):
         missingperms = error.missing_permissions[0]
         missingperms = missingperms.replace("_", " ")
         missingperms = missingperms.replace("-", " ")
         error_data = f"I do not have the `{missingperms}` permissions for that command."
     elif isinstance(error, commands.MissingRequiredArgument):
-        error_data = f"Oops looks like you forgot to put the {error.param.name} in the {ctx.command} command.\n"
-        example = get_example(ctx.command, ctx.guild)
-        exampleLine = example[0]
-        if example[1]:
-            exampleLine = (
-                exampleLine
-                + "\n\nNote: (OPT.) means that argument in the command is optional."
-            )
         error_data = (
-            error_data
-            + f"Example  {ctx.prefix}{ctx.command.qualified_name} {exampleLine}"
+            f"The `{error.param.name}` argument is required.\n"
+            f"Usage: `{command_invocation(ctx.command, ctx.clean_prefix)}`"
         )
     elif isinstance(error, commands.BadArgument):
-        error_data = f"Oops looks like provided the wrong arguments in the {ctx.command} command.\n"
-        example = get_example(ctx.command, ctx.guild)
-        exampleLine = example[0]
-        if example[1]:
-            exampleLine = (
-                exampleLine
-                + "\n\nNote: (OPT.) means that argument in the command is optional."
-            )
         error_data = (
-            error_data
-            + f"Example: {ctx.prefix}{ctx.command.qualified_name} {exampleLine}"
+            f"One or more arguments for `{ctx.command}` are invalid.\n"
+            f"Usage: `{command_invocation(ctx.command, ctx.clean_prefix)}`\n"
+            f"Details: {error}"
         )
     else:
         await send_error_log_embed(ctx, error)
-        error_data = f'Some unexpected error occured while trying to do the command, report this bug in the [support server]({SUPPORT_SERVER_INVITE} "Join the bot support server for reporting bugs or suggesting commands!.")'
-        
+        error_data = "An unexpected error occurred while running this command."
+        if SETTINGS.support_server_invite:
+            error_data += f" Report the issue at {SETTINGS.support_server_invite}."
+
     await send_generic_error_embed(ctx, error_data)
 
 
+async def send_generic_error_embed(ctx, error_data):
+    embed = discord.Embed(
+        title="🚫 Command Error ", description=error_data, color=Color.dark_red()
+    )
+    await ctx.send(embed=embed)
+
 
 async def send_error_log_embed(ctx, error):
+    """Log a command exception locally and mirror it to Discord when configured."""
+    original_error = getattr(error, "original", error)
+    LOGGER.error(
+        "Command failed command=%s author=%s guild=%s channel=%s",
+        ctx.command,
+        getattr(ctx.author, "id", None),
+        getattr(ctx.guild, "id", None),
+        getattr(ctx.channel, "id", None),
+        exc_info=(
+            type(original_error),
+            original_error,
+            original_error.__traceback__,
+        ),
+    )
     embederror = discord.Embed(
-        title=f"🚫 {type(error)}: **{error}**",
+        title=f"🚫 {type(original_error).__name__}: **{original_error}**",
         description=f"Command: {ctx.command}.",
         color=Color.dark_red(),
     )
-    file = mystbin.File(filename=f"AE-{genrandomstr(10)}", content=get_traceback(error))
-    pastecode = await mystbin_client.create_paste(files=[file])
-    embederror.add_field(name="Traceback: ", value=pastecode.url)
-    await client.get_channel(CHANNEL_ERROR_LOGGING_ID).send(embed=embederror)
+    try:
+        file = mystbin.File(
+            filename=f"AE-{genrandomstr(10)}.txt",
+            content=format_exception(original_error),
+        )
+        pastecode = await mystbin_client.create_paste(files=[file])
+        embederror.add_field(name="Traceback", value=pastecode.url)
+        await send_to_configured_channel(CHANNEL_ERROR_LOGGING_ID, embed=embederror)
+    except Exception:
+        LOGGER.exception("Could not publish the command exception to Discord")
+
 
 def newaccount(member):
     now_datetime = datetime.now()
@@ -2200,25 +1129,45 @@ def getcodeblock(code):
     return (lang, code)
 
 
+async def loginfo(logguild, title, description, changes):
+    logchannel = None
+    async with client.database.pool.acquire() as con:
+        logchannellist = await con.fetchrow(
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
+        )
+    if logchannellist:
+        channelid = logchannellist["channelid"]
+        logchannel = logguild.get_channel(channelid)
+    msgsent = None
+    if logchannel:
+        embed = discord.Embed(title=title, description=description, color=Color.blue())
+        embed.add_field(name="** **", value=changes)
+        msgsent = await logchannel.send(embed=embed)
+    return msgsent
 
 
-
-
+def convertwords(lst):
+    return " ".join(lst).split()
 
 
 async def uservoted(member: discord.Member):
-    url = f"https://top.gg/api/bots/1061480715172200498/check?userId={member.id}"
+    if not dbltoken or client.user is None:
+        return False
+    url = f"https://top.gg/api/bots/{client.user.id}/check?userId={member.id}"
     try:
         headers = {"authorization": dbltoken}
         session = client.session
-        respjson = await fetch_json(session, url, headers)
-        assert respjson[0] == 200, f"{respjson[0]}"
-        return respjson[1]["voted"] >= 1
-    except:
+        response_json = await fetch_json(session, url, headers)
+        return response_json["voted"] >= 1
+    except (aiohttp.ClientError, TimeoutError, KeyError, TypeError):
         return False
 
 
+def is_bot_staff():
+    async def predicate(ctx):
+        return await ctx.bot.is_owner(ctx.author)
 
+    return commands.check(predicate)
 
 
 def is_guild_owner():
@@ -2228,22 +1177,23 @@ def is_guild_owner():
     return commands.check(predicate)
 
 
+def checkstaff(member):
+    return member.id in SETTINGS.owner_ids
 
 
-
-def checkCapsNum(sentence):
-    origLength = len(sentence)
+def check_caps_num(sentence):
+    orig_length = len(sentence)
     count = 0
     for element in sentence:
         if element == "":
             count += 1
         if element.isupper():
             count += 1
-    return (count / origLength) * 100
+    return (count / orig_length) * 100
 
 
-def checkCaps(sentence):
-    origLength = len(sentence)
+def check_caps(sentence):
+    orig_length = len(sentence)
     count = 0
     for element in sentence:
         if element == "":
@@ -2251,29 +1201,29 @@ def checkCaps(sentence):
         if element.isupper():
             count += 1
     try:
-        return ((count / origLength) * 100) >= 90
-    except:
+        return ((count / orig_length) * 100) >= 90
+    except Exception:
         return False
 
 
-def checkEmoji(value):
-    if value == None:
+def check_emoji(value):
+    if value is None:
         return "⚪"
     if value:
-        return "<:online:886434154831552572>"
+        return "🟢"
     elif not value:
-        return "<:offline:886434154412113961>"
+        return "⚫"
 
 
-def getProgress(value, divisions=10):
+def get_progress(value, divisions=10):
     value = int(value)
     progressstr = ""
-    firstemojiload = "<a:leftload:889139762856886283>"
-    middleemojiload = "<a:middleload:889139761992843336>"
-    lastemojiload = "<a:rightload:889139762789752873>"
-    firstemojiunload = "<:leftunload:889141668350148608>"
-    middleemojiunload = "<:middleunload:889141447356461066>"
-    lastemojiunload = "<:rightunload:889141447373238282>"
+    firstemojiload = "▰"
+    middleemojiload = "▰"
+    lastemojiload = "▰"
+    firstemojiunload = "▱"
+    middleemojiunload = "▱"
+    lastemojiunload = "▱"
     if value < divisions:
         value = divisions
     emojiscount = value // divisions
@@ -2301,32 +1251,54 @@ def getProgress(value, divisions=10):
     return progressstr
 
 
+async def analyze_message(_message, attributes):
+    analyze_request = {
+        "comment": {"text": _message},
+        "requestedAttributes": {attribute: {} for attribute in attributes},
+    }
+    if client.perspective_service is None:
+        return None
+    try:
+        request = client.perspective_service.comments().analyze(body=analyze_request)
+        return await asyncio.to_thread(request.execute)
+    except Exception as ex:
+        logging.log(logging.ERROR, f"Perspective API error: {format_exception(ex)}")
+        return None
 
 
+async def check_profane(_message):
+    response = await analyze_message(_message, ["PROFANITY"])
+    if response is None:
+        return False
+    attribute_dict = response["attributeScores"]["PROFANITY"]
+    score_value = attribute_dict["spanScores"][0]["score"]["value"]
+    logging.log(logging.INFO, f"Message evaluated with a score of {score_value}")
+    return score_value >= 0.45
 
-def minimumPrice(items):
-    minCost = 0
+
+def minimum_price(items):
+    min_cost = 0
     for item in items:
-        if item.cost > 0 and item.cost > minCost:
-            minCost = item.cost
-    return minCost
+        if item.cost > 0 and item.cost > min_cost:
+            min_cost = item.cost
+    return min_cost
 
 
-def buySequence(items, bal, result):
-    if minimumPrice(items) > bal:
+def buy_sequence(items, bal, result):
+    if minimum_price(items) > bal:
         logging.log(logging.DEBUG, result)
     else:
-        for itemA in items:
-            if itemA.cost <= bal:
-                if isinstance(itemA, Armor) and (
+        for item_a in items:
+            if item_a.cost <= bal:
+                if isinstance(item_a, Armor) and (
                     Armor("No shields", 0) in items
                     or Armor("Heavy shields", 1000) in items
                     or Armor("Light shields", 400) in items
                 ):
                     continue
-                result = result + itemA.name + ","
-                bal = bal - itemA.cost
-                buySequence(items, bal, result)
+                result = result + item_a.name + ","
+                bal = bal - item_a.cost
+                buy_sequence(items, bal, result)
 
 
 class Armor:
@@ -2350,113 +1322,125 @@ class Armor:
         return self.name == other.name and self.cost == other.cost
 
 
-def getLoadoutPermutation(abilities, weapons, spenteco):
+def get_loadout_permutation(abilities, weapons, spenteco):
     shields = Armor.getarmor()
     items = abilities + weapons + shields
     for item in items:
         spenteco = spenteco - item.cost
         if item.cost <= spenteco:
-            buySequence(items, spenteco, item.name + ",")
+            buy_sequence(items, spenteco, item.name + ",")
 
 
-def checkSpam(_message):
-    analyze_request = {
-        "comment": {"text": _message},
-        "requestedAttributes": {"SPAM": {}},
-    }
-    attributes = ["SPAM"]
-    try:
-        response = service.comments().analyze(body=analyze_request).execute()
-        for attribute in attributes:
-            attribute_dict = response["attributeScores"][attribute]
-            score_value = attribute_dict["spanScores"][0]["score"]["value"]
-            return score_value >= 0.9
-    except:
-        return True
+async def check_spam(_message):
+    response = await analyze_message(_message, ["SPAM"])
+    if response is None:
+        return False
+    attribute_dict = response["attributeScores"]["SPAM"]
+    return attribute_dict["spanScores"][0]["score"]["value"] >= 0.9
 
 
-def checkIncoherent(_message):
-    analyze_request = {
-        "comment": {"text": _message},
-        "requestedAttributes": {"INCOHERENT": {}},
-    }
-    attributes = ["INCOHERENT"]
-    try:
-        response = service.comments().analyze(body=analyze_request).execute()
-        for attribute in attributes:
-            attribute_dict = response["attributeScores"][attribute]
-            score_value = attribute_dict["spanScores"][0]["score"]["value"]
-            return score_value >= 0.9
-    except:
-        return True
+async def check_incoherent(_message):
+    response = await analyze_message(_message, ["INCOHERENT"])
+    if response is None:
+        return False
+    attribute_dict = response["attributeScores"]["INCOHERENT"]
+    return attribute_dict["spanScores"][0]["score"]["value"] >= 0.9
 
 
-async def dangPerm(ctx, author, theChannel=None):
-    if theChannel == None:
-        theChannel = ctx.channel
-    theGuild = theChannel.guild
-    if isinstance(theChannel, int):
-        theChannel = theGuild.get_channel(theChannel)
-    if author == None:
-        author = theGuild.me
+async def dang_perm(ctx, author, the_channel=None):
+    if the_channel is None:
+        the_channel = ctx.channel
+    the_guild = the_channel.guild
+    if isinstance(the_channel, int):
+        the_channel = the_guild.get_channel(the_channel)
+    if author is None:
+        author = the_guild.me
     if isinstance(author, int):
-        author = theGuild.get_member(int(author))
-    myPermsValue = theChannel.permissions_for(author)
-    if isinstance(myPermsValue, int):
-        myPerms = discord.Permissions(myPermsValue)
+        author = the_guild.get_member(int(author))
+    my_perms_value = the_channel.permissions_for(author)
+    if isinstance(my_perms_value, int):
+        my_perms = discord.Permissions(my_perms_value)
     else:
-        myPerms = myPermsValue
+        my_perms = my_perms_value
     dangerousperms = ""
-    if myPerms.administrator:
+    if my_perms.administrator:
         dangerousperms += "Admistrator  \n"
-    if myPerms.kick_members:
+    if my_perms.kick_members:
         dangerousperms += "Kick members  \n"
-    if myPerms.ban_members:
+    if my_perms.ban_members:
         dangerousperms += "Ban members  \n"
-    if myPerms.manage_guild:
+    if my_perms.manage_guild:
         dangerousperms += "Change server name/regions and add bots  \n"
-    if myPerms.manage_webhooks:
+    if my_perms.manage_webhooks:
         dangerousperms += "Create/Edit/Delete webhooks  \n"
-    if myPerms.manage_messages:
+    if my_perms.manage_messages:
         dangerousperms += "Delete/pin messages from other users  \n"
-    if myPerms.manage_roles:
+    if my_perms.manage_roles:
         toprole = "top role"
         try:
             toprole = author.top_role.mention
-        except:
+        except Exception:
             pass
         dangerousperms += f"Create/Edit/Delete roles below {toprole}  \n"
-    if myPerms.manage_channels:
+    if my_perms.manage_channels:
         dangerousperms += "Edit Channels  \n"
-    if myPerms.manage_emojis:
+    if my_perms.manage_emojis:
         dangerousperms += "Edit emojis  \n"
-    if myPerms.move_members:
+    if my_perms.move_members:
         accessiblechannels = "no visible channels"
-        for vc in theGuild.voice_channels:
+        for vc in the_guild.voice_channels:
             if vc.permissions_for(author).view_channel:
                 if accessiblechannels == "no visible channels":
                     accessiblechannels = f"{vc.mention} "
                 else:
                     accessiblechannels += f"| {vc.mention} "
         dangerousperms += f"Move members between {accessiblechannels}  \n"
-    if myPerms.manage_nicknames:
+    if my_perms.manage_nicknames:
         dangerousperms += "Change nicknames of other users  \n"
     if dangerousperms == "":
         dangerousperms = "No dangerous permissions"
     return dangerousperms
 
 
+def convert(timesen):
+    totaltime = 0
+    if timesen is None:
+        return None
+    for i in timesen.split():
+        convtime = convertword(i)
+        if convtime == -1:
+            return -1
+        elif convtime == -2:
+            return -2
+        elif convtime == -3:
+            return -3
+        totaltime = totaltime + convtime
+    return totaltime
 
 
+def convertword(time):
+    pos = ["s", "m", "h", "d"]
 
+    time_dict = {"s": 1, "m": 60, "h": 3600, "d": 3600 * 24}
 
+    unit = time[-1]
+
+    if unit not in pos:
+        return -1
+    try:
+        val = int(time[:-1])
+    except Exception:
+        return -2
+    if val <= 0:
+        return -3
+    return val * time_dict[unit]
 
 
 def validurl(theurl):
     isvalid = False
     try:
         isvalid = validators.url(theurl)
-    except:
+    except Exception:
         pass
     return isvalid
 
@@ -2466,9 +1450,9 @@ async def get_url_image(url):
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36"
     }
-    timeout = ClientTimeout(total=0)
+    timeout = ClientTimeout(total=15)
     async with session.get(url, headers=headers, timeout=timeout) as resp:
-        assert resp.status == 200, f"{resp.status}"
+        resp.raise_for_status()
         html = await resp.text()
     soup = BeautifulSoup(html, "html.parser")
     meta_og_image = soup.find("meta", property="og:image")
@@ -2477,300 +1461,32 @@ async def get_url_image(url):
 
 async def removeguildcaution(guildid):
     await asyncio.sleep(300)
-    async with pool.acquire() as con:
-        await con.execute(f"DELETE FROM cautionraid WHERE guildid = {guildid}")
+    async with client.database.pool.acquire() as con:
+        await con.execute("DELETE FROM cautionraid WHERE guildid = $1", guildid)
 
 
 async def removeguildantiraidlog(guildid):
     await asyncio.sleep(300)
-    async with pool.acquire() as con:
-        await con.execute(f"DELETE FROM antiraid WHERE guildid = {guildid}")
+    async with client.database.pool.acquire() as con:
+        await con.execute("DELETE FROM antiraid WHERE guildid = $1", guildid)
 
 
-class valoMatchJson:
-    def __init__(self, mid, mjson):
-        self.id = mid
-        self.mjson = mjson
+def check_ensure_permissions(ctx, member, perms):
+    for perm in perms:
+        if not getattr(ctx.channel.permissions_for(member), perm):
+            raise discord.ext.commands.errors.BotMissingPermissions([perm])
 
 
-async def getFormattedOutput(url, authheader=None):
-    try:
-        session = client.session
-        async with session.get(url, headers=authheader) as resp:
-            if resp.status == 200:
-                respjson = await resp.json()
-    except:
-        return None
-    formattedjson = respjson
-    try:
-        formattedjson = json.loads(respjson)
-    except:
-        pass
-    return formattedjson
-
-
-@tasks.loop(hours=4)
-async def valorantSeasonCheck():
-    url = "https://ap.api.riotgames.com/val/content/v1/contents?locale=en-US"
-    authheader = {"X-Riot-Token": valorant_api_key}
-    respjson = await getFormattedOutput(url, authheader)
-    async with pool.acquire() as con:
-        currentSeason = await con.fetchrow(f"SELECT * FROM riotseason")
-    oldAct = currentSeason["act"]
-    oldEpisode = currentSeason["episode"]
-    currentAct = None
-    currentEpisode = None
-    for season in respjson["acts"]:
-        if season["type"] == "act" and season["isActive"]:
-            currentAct = season["id"]
-        elif season["type"] == "episode" and season["isActive"]:
-            currentEpisode = season["id"]
-    if currentAct != oldAct or currentEpisode != oldEpisode:
-        async with pool.acquire() as con:
-            results = f"UPDATE riotseason SET act = $1 , episode = $2 WHERE act = $3 AND episode = $4"
-            await con.execute(results, currentAct, currentEpisode, oldAct, oldEpisode)
-        client.get_channel(CHANNEL_DEV_ID).send(
-            "Season update detected, resetting data!"
-        )
-        async with pool.acquire() as con:
-            await con.execute(f"DELETE FROM riotmatches")
-
-
-@tasks.loop(minutes=15)
-async def valorantMatchSave():
-    logging.log(logging.INFO, f"Match save started.")
-    async with pool.acquire() as con:
-        puuidlist = await con.fetch(f"SELECT * FROM riotaccount")
-    for puuid in puuidlist:
-        puuidstr = puuid["accountpuuid"]
-        logging.log(logging.DEBUG, f"\rGetting match history for {puuidstr}(0% complete)", end="")
-        url = (
-            f"https://ap.api.riotgames.com/val/match/v1/matchlists/by-puuid/{puuidstr}"
-        )
-        authheader = {"X-Riot-Token": valorant_api_key}
-        respjson = await getFormattedOutput(url, authheader)
-        numberofmatches = len(respjson["history"])
-        count = 1
-        for matchdetails in respjson["history"]:
-            matchid = matchdetails["matchId"]
-            logging.log(logging.DEBUG, 
-                f"\rGetting match history for {puuidstr}({((count / numberofmatches) * 100):.2f}% complete)",
-                end="",
-            )
-            count += 1
-            start = time.time()
-            url = f"https://ap.api.riotgames.com/val/match/v1/matches/{matchid}"
-            respjson = await getFormattedOutput(url, authheader)
-            try:
-                matchInfo = Match(respjson)
-            except Exception as ex:
-                logging.log(logging.ERROR, f"Match parsing error: {get_traceback(ex)}")
-                continue
-            end = time.time()
-            async with pool.acquire() as con:
-                results = f"INSERT INTO riotparsedmatches (id, data) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING"
-                await con.execute(results, matchid, pickle.dumps(matchInfo))
-
-            async with pool.acquire() as con:
-                results = f"SELECT * FROM riotmatches WHERE discorduserid = {puuid['discorduserid']}"
-                matchids = await con.fetchrow(results)
-            if matchids is None:
-                matchid = [matchid]
-                async with pool.acquire() as con:
-                    results = "INSERT INTO riotmatches (discorduserid, accountpuuid, matchids) VALUES ($1, $2, $3)"
-                    await con.execute(
-                        results, puuid["discorduserid"], puuidstr, matchid
-                    )
-            elif matchid not in matchids["matchids"]:
-                async with pool.acquire() as con:
-                    results = f"UPDATE riotmatches SET matchids = array_append(matchids, $1) WHERE discorduserid = $2"
-                    await con.execute(results, matchid, puuid["discorduserid"])
-        logging.log(logging.DEBUG, f"\rGetting match history for {puuidstr}(100% complete)", end="")
-
-
-
-
-
-@tasks.loop(seconds=15)
-async def gitcommitcheck():
-    global firstgithubcheck
-    if firstgithubcheck:
-        await asyncio.sleep(15)
-        firstgithubcheck = False
-        logging.log(logging.INFO, f"Github checks started!")
-    GITHUB_OWNER = os.getenv("GITHUB_OWNER")
-    GITHUB_REPO = os.getenv("GITHUB_REPO")
-
-    session = client.github_session
-    async with session.get(
-        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits",
-        headers={
-            "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    ) as response:
-        if response.status == 200:
-            response_json = await response.json()
-            commitsha = response_json[0]["sha"]
-            commiturl = response_json[0]["url"]
-            async with pool.acquire() as con:
-                githubcommitinfo = await con.fetchrow(
-                    f"SELECT * FROM githubcommits WHERE userid = '{client.user.id}'"
-                )
-            if (
-                githubcommitinfo is None
-                or githubcommitinfo["latestcommitsha"] != commitsha
-            ):
-                results = f"INSERT INTO githubcommits (userid, latestcommitsha) VALUES($1, $2) ON CONFLICT (userid) DO UPDATE SET latestcommitsha = EXCLUDED.latestcommitsha;"
-                async with pool.acquire() as con:
-                    await con.execute(results, str(client.user.id), commitsha)
-                client.get_channel(CHANNEL_DEV_ID).send(
-                    f"New commit detected! {commiturl}, restarting..."
-                )
-                files = [
-                    "main.py",
-                    "requirements.txt",
-                    "cookies.txt",
-                    ".env",
-                    "github.env",
-                    "database.env",
-                ]
-                changed_files = compare_local_remote_git_repo(files)
-                if len(changed_files) == 0:
-                    client.get_channel(CHANNEL_DEV_ID).send("No file changes detected.")
-                else:
-                    client.get_channel(CHANNEL_DEV_ID).send(
-                        f"Files changed: {', '.join(map(lambda x: x[0], changed_files))}"
-                    )
-                    for filedetails in changed_files:
-                        with open(filedetails[0], "wb") as f:
-                            f.write(base64.b64decode(filedetails[1]))
-                        client.get_channel(CHANNEL_DEV_ID).send(
-                            f"({filedetails[3]})File {filedetails[0]} updated to size {filedetails[2]} in latest commit."
-                        )
-                sync_views = client._connection._view_store._synced_message_views
-                tasks = []
-                for view in sync_views.values():
-                    if hasattr(view, "_message") and view.timeout != None:
-                        tasks.append(view.on_timeout())
-                await asyncio.gather(*tasks)
-
-                subprocess.run(
-                    f"python main.py restart {CHANNEL_DEV_ID}",
-                    shell=True,
-                )
-                await asyncio.sleep(3)
-                await client.close()
-
-
-def convertSec(seconds):
+def convert_sec(seconds):
     min, sec = divmod(seconds, 60)
     hour, min = divmod(min, 60)
-    return "%dh %02dm %02ds" % (hour, min, sec)
+    return f"{hour:d}h {min:02d}m {sec:02d}s"
 
 
 @client.command()
 @is_bot_staff()
 async def shutdown(ctx):
     await ctx.send("Shutting down...")
-    sync_views = client._connection._view_store._synced_message_views
-    for view in sync_views:
-        viewobj = sync_views[view]
-        if viewobj._message:
-            await viewobj.on_timeout()
-            try:
-                await viewobj._message.edit(view=viewobj)
-            except:
-                pass
-    await client.close()
-
-
-def compare_local_remote_git_repo(files):
-    GITHUB_OWNER = os.getenv("GITHUB_OWNER")
-    GITHUB_REPO = os.getenv("GITHUB_REPO")
-    changed_files = []
-    for filename in files:
-        file_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{filename}"
-        file_response = requests.get(
-            file_url,
-            headers={
-                "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
-        if file_response.status_code == 404:
-            logging.log(logging.DEBUG, f"{filename} is not present in the remote repository.")
-            continue
-        parsed_file_response = file_response.json()
-        try:
-            remote_file_content = parsed_file_response["content"]
-        except KeyError:
-            logging.log(logging.DEBUG, f"{filename} doesn't have a content!?")
-            continue
-        # Get the content of the file from the local repository
-        with open(filename, "r", encoding="utf8") as file:
-            local_file_content = file.read()
-
-        # Compare the two file contents
-        if remote_file_content != local_file_content:
-            changed_files.append(
-                (
-                    filename,
-                    remote_file_content,
-                    parsed_file_response.get("size"),
-                    parsed_file_response.get("sha"),
-                )
-            )
-    return changed_files
-
-
-@client.command()
-@is_bot_staff()
-async def restartlatestcommit(ctx, *, files=None):
-    if files is None:
-        files = [
-            "main.py",
-            "requirements.txt",
-            "cookies.txt",
-            ".env",
-            "github.env",
-            "database.env",
-        ]
-    else:
-        files = files.split(",")
-    await ctx.send("Restarting to latest commit...")
-    changed_files = compare_local_remote_git_repo(files)
-    if len(changed_files) == 0:
-        await ctx.send("No file changes detected.")
-    else:
-        await ctx.send(
-            f"Files changed: {', '.join(map(lambda x: x[0], changed_files))}"
-        )
-        for filedetails in changed_files:
-            with open(filedetails[0], "wb") as f:
-                f.write(base64.b64decode(filedetails[1]))
-            await ctx.send(
-                f"({filedetails[3]})File {filedetails[0]} updated to size {filedetails[2]} in latest commit."
-            )
-    sync_views = client._connection._view_store._synced_message_views
-    for view in sync_views:
-        viewobj = sync_views[view]
-        if viewobj._message:
-            await viewobj.on_timeout()
-            try:
-                await viewobj._message.edit(view=viewobj)
-            except:
-                pass
-    await ctx.send(
-        subprocess.run(
-            f"python main.py restart {ctx.channel.id}",
-            shell=True,
-            stdout=subprocess.PIPE,
-        ).stdout
-    )
-    await asyncio.sleep(3)
     await client.close()
 
 
@@ -2778,24 +1494,7 @@ async def restartlatestcommit(ctx, *, files=None):
 @is_bot_staff()
 async def restart(ctx):
     await ctx.send("Restarting...")
-    sync_views = client._connection._view_store._synced_message_views
-    for view in sync_views:
-        viewobj = sync_views[view]
-        if viewobj._message:
-            await viewobj.on_timeout()
-            try:
-                await viewobj._message.edit(view=viewobj)
-            except:
-                pass
-    await ctx.send(
-        subprocess.run(
-            f"python main.py restart {ctx.channel.id}",
-            shell=True,
-            stdout=subprocess.PIPE,
-        ).stdout
-    )
-    await asyncio.sleep(3)
-    await client.close()
+    await restart_process(ctx.channel.id)
 
 
 class AestronInfo(commands.Cog):
@@ -2805,57 +1504,57 @@ class AestronInfo(commands.Cog):
         aliases=["tutorial", "usage"],
         brief="This command provides the bot command usage information.",
         description="This command provides the bot command usage information.",
-        usage="",
+        usage="<command>",
     )
     async def cmdusage(self, ctx, command: str):
-        reqCommand = client.get_command(command)
-        if reqCommand in customCog.__cog_commands__:
-            await send_generic_error_embed(ctx, error_data="Custom commands don't have listed usages.")
-            return
-        if reqCommand:
-            commandUsages = []
-            for i in range(9):
-                if i != 0:
-                    currentPath = f"./resources/command_usages/{command}_{i}.gif"
-                else:
-                    currentPath = f"./resources/command_usages/{command}.gif"
-                if os.path.exists(currentPath):
-                    commandUsages.append(currentPath)
-            embeds = []
-            files = []
-            for commandUsage in commandUsages:
-                embedVar = discord.Embed(
-                    title=f"{command} Usage", description="", color=0x00FF00
-                )
-                example = get_example(reqCommand, ctx.guild)
-                exampleLine = example[0]
-                if example[1]:
-                    exampleLine = (
-                        exampleLine
-                        + "\n\nNote: (OPT.) means that argument in the command is optional."
-                    )
-                try:
-                    prefix = ctx.prefix
-                except:
-                    prefix = "/"
-                embedVar.add_field(
-                    name="Usage", value=f"{prefix}{command} {exampleLine}"
-                )
-                embedVar.set_image(url=f"attachment://{commandUsage}")
-                embeds.append(embedVar)
-                files.append(discord.File(commandUsage, filename=f"{commandUsage}.gif"))
-            pagview = PaginateFileEmbed(embeds, files)
-            pagview.set_message(
-                await ctx.send(
-                    embed=embeds[0], file=files[0], view=pagview, ephemeral=True
-                )
+        requested_command = client.get_command(command)
+        if requested_command is None:
+            await send_generic_error_embed(
+                ctx, error_data="The requested command with name was not found."
             )
+            return
 
-        else:
-            await send_generic_error_embed(ctx, error_data=
-                "The requested command with name was not found."
-            )
+        prefix = ctx.clean_prefix
+        invocation = command_invocation(requested_command, prefix)
+        aliases = (
+            ", ".join(f"`{alias}`" for alias in requested_command.aliases) or "None"
+        )
+        base_embed = discord.Embed(
+            title=f"{requested_command.qualified_name} usage",
+            description=requested_command.help or requested_command.description,
+            color=discord.Color.green(),
+        )
+        base_embed.add_field(name="Usage", value=f"`{invocation}`", inline=False)
+        base_embed.add_field(name="Aliases", value=aliases, inline=False)
+
+        usage_directory = Path("resources/command_usages")
+        command_name = requested_command.name
+        usage_paths = await asyncio.to_thread(
+            lambda: [
+                path
+                for path in (
+                    usage_directory / f"{command_name}.gif",
+                    *(
+                        usage_directory / f"{command_name}_{index}.gif"
+                        for index in range(1, 9)
+                    ),
+                )
+                if path.is_file()
+            ]
+        )
+        if not usage_paths:
+            await ctx.send(embed=base_embed, ephemeral=True)
             return
+
+        embeds = []
+        files = []
+        for index, usage_path in enumerate(usage_paths, start=1):
+            embed = base_embed.copy()
+            embed.set_footer(text=f"Example {index} of {len(usage_paths)}")
+            embed.set_image(url=f"attachment://{usage_path.name}")
+            embeds.append(embed)
+            files.append(discord.File(usage_path, filename=usage_path.name))
+        await ctx.send(embeds=embeds, files=files, ephemeral=True)
 
     @commands.hybrid_command(
         aliases=["info"],
@@ -2864,51 +1563,51 @@ class AestronInfo(commands.Cog):
         usage="",
     )
     async def botinfo(self, ctx):
-        global botVersion
-        embedVar = discord.Embed(title=f"{client.user}", description="", color=0x00FF00)
-        embedVar.add_field(
-            name="CPU usage ", value=f"{psutil.cpu_percent(1)}%", inline=False
+        embed_var = discord.Embed(
+            title=f"{client.user}", description="", color=0x00FF00
         )
-        embedVar.add_field(
-            name="RAM usage ", value=f"{psutil.virtual_memory()[2]}%", inline=False
-        )
-        embedVar.add_field(
-            name="Author",
-            value="This bot is made by <@625265223250608138> and <@488643992628494347>.",
+        embed_var.add_field(
+            name="CPU usage ",
+            value=f"{await asyncio.to_thread(psutil.cpu_percent, 0.1)}%",
             inline=False,
         )
-        embedVar.add_field(
+        embed_var.add_field(
+            name="RAM usage ", value=f"{psutil.virtual_memory()[2]}%", inline=False
+        )
+        if SETTINGS.owner_ids:
+            owners = ", ".join(f"<@{owner_id}>" for owner_id in SETTINGS.owner_ids)
+            embed_var.add_field(name="Configured owners", value=owners, inline=False)
+        embed_var.add_field(
             name="Information",
             value="""An all in one anti-raid , moderation , captcha , tickets and fun discord bot with customisable commands and more...""",
             inline=False,
         )
-        embedVar.add_field(
+        embed_var.add_field(
             name="Server count", value=round(len(client.guilds) / 10) * 10
         )
         totalmembercount = 0
         for guild in client.guilds:
             totalmembercount += guild.member_count
-        embedVar.add_field(name="Member count", value=totalmembercount)
-        delta_uptime = datetime.utcnow() - client.launch_time
+        embed_var.add_field(name="Member count", value=totalmembercount)
+        delta_uptime = discord.utils.utcnow() - client.launch_time
         hours, remainder = divmod(int(delta_uptime.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
         days, hours = divmod(hours, 24)
-        embedVar.add_field(
+        embed_var.add_field(
             name="Uptime",
             value=f"I have been online for {days}:{hours}:{minutes}:{seconds}.",
         )
-        embedVar.add_field(
-            name="Websites",
-            value="https://top.gg/bot/1061480715172200498",
-            inline=False,
+        if dbltoken:
+            embed_var.add_field(
+                name="Top.gg",
+                value=f"https://top.gg/bot/{client.user.id}",
+                inline=False,
+            )
+        embed_var.add_field(
+            name="Bot version and info.", value=f"v{SETTINGS.version}", inline=False
         )
-        embedVar.add_field(
-            name="Bot version and info.", value=f"v{botVersion}", inline=False
-        )
-        embedVar.set_thumbnail(
-            url="https://cdn.discordapp.com/avatars/805030662183845919/70fee8581891e9a810da60944dc486ba.webp?size=128"
-        )
-        await ctx.send(embed=embedVar, ephemeral=True)
+        embed_var.set_thumbnail(url=client.user.display_avatar.url)
+        await ctx.send(embed=embed_var, ephemeral=True)
 
 
 def ismuted(ctx, member):
@@ -2922,15 +1621,18 @@ def ismuted(ctx, member):
     return False
 
 
-
+# Compatibility export for integrations that imported ``main.Moderation``.
+Moderation = ModernModeration
 
 
 class Logging(commands.Cog):
     """Logs guild events such as channel/guild/role creation , deletion , edit ."""
 
     async def cog_load(self):
-        async with pool.acquire() as con:
-            guilds = await con.fetch(f"SELECT * FROM cautionraid")
+        if not client.database.connected:
+            return
+        async with client.database.pool.acquire() as con:
+            guilds = await con.fetch("SELECT * FROM cautionraid")
         for guild in guilds:
             await removeguildcaution(guild["guildid"])
 
@@ -2943,8 +1645,10 @@ class Logging(commands.Cog):
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def removeloggingchannel(self, ctx):
-        async with pool.acquire() as con:
-            await con.execute(f"DELETE FROM logchannels WHERE guildid = {ctx.guild.id}")
+        async with client.database.pool.acquire() as con:
+            await con.execute(
+                "DELETE FROM logchannels WHERE guildid = $1", ctx.guild.id
+            )
         await ctx.send(
             "Successfully removed the logging channels in this guild.", ephemeral=True
         )
@@ -2968,7 +1672,9 @@ class Logging(commands.Cog):
         if channel is None:
             channel = ctx.channel
         if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
             return
         if not channel.permissions_for(ctx.guild.me).send_messages:
             raise commands.BotMissingPermissions(["send_messages"])
@@ -2978,20 +1684,22 @@ class Logging(commands.Cog):
             raise commands.BotMissingPermissions(["embed_links"])
         if not channel.permissions_for(ctx.guild.me).view_audit_log:
             raise commands.BotMissingPermissions(["view_audit_log"])
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             logchannellist = await con.fetchrow(
-                f"SELECT * FROM logchannels WHERE guildid = {ctx.guild.id}"
+                "SELECT * FROM logchannels WHERE guildid = $1", ctx.guild.id
             )
         if logchannellist is None:
             statement = (
                 """INSERT INTO logchannels (guildid,channelid) VALUES($1, $2);"""
             )
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.guild.id, channel.id)
         else:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(
-                    f"UPDATE logchannels VALUES SET channelid = {channel.id} WHERE guildid = {ctx.guild.id}"
+                    "UPDATE logchannels SET channelid = $1 WHERE guildid = $2",
+                    channel.id,
+                    ctx.guild.id,
                 )
         await ctx.send(
             f"Successfully set logging channel of {ctx.guild} to {channel.mention}.",
@@ -2999,7 +1707,90 @@ class Logging(commands.Cog):
         )
 
 
+class AntiRaid(commands.Cog):
+    @commands.hybrid_command(
+        brief="This command disables the anti-raid in a guild and sets the anti-raid log to the channel.",
+        description="This command disables the anti-raid in a guild(requires manage guild).",
+        usage="",
+        aliases=["disableantiraid"],
+    )
+    @commands.guild_only()
+    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
+    async def deactivateantiraid(self, ctx):
+        async with client.database.pool.acquire() as con:
+            cautionlist = await con.fetchrow(
+                "SELECT * FROM cautionraid WHERE guildid = $1", ctx.guild.id
+            )
+        is_raided = cautionlist is not None
+        if is_raided:
+            await ctx.send(
+                f"{ctx.author.mention} tried to disable anti-raid while a suspicious activity was detected , anti-raid was not disabled!",
+                ephemeral=True,
+            )
+            return
+        view = ConfirmDecline()
+        msg = await ctx.send(
+            ":no_entry_sign: Due to security reasons , this command will take `5 minutes` to successfully disable! (Click decline to cancel disabling anti raid)",
+            view=view,
+            ephemeral=True,
+        )
+        await view.wait()
+        if view.value:
+            await ctx.send(
+                f"anti-raid couldn't be disabled due to request by {view.authorcancel}.",
+                ephemeral=True,
+            )
+            return
+        try:
+            await msg.edit(
+                content=":no_entry_sign: anti-raid has been successfully disabled in this guild."
+            )
+        except Exception:
+            pass
 
+    @commands.hybrid_command(
+        brief="This command enables the antiraid in a guild and sets the antiraid log to the channel.",
+        description="This command enables the antiraid in a guild(requires manage guild).",
+        usage="#channel",
+        aliases=["enableantiraid"],
+    )
+    @commands.guild_only()
+    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
+    async def activateantiraid(self, ctx, channel: discord.TextChannel = None):
+        if channel is None:
+            channel = ctx.channel
+        if channel.guild != ctx.guild:
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
+            return
+        if not channel.permissions_for(ctx.guild.me).send_messages:
+            raise commands.BotMissingPermissions(["send_messages"])
+        if not channel.permissions_for(ctx.guild.me).view_channel:
+            raise commands.BotMissingPermissions(["view_channel"])
+        if not channel.permissions_for(ctx.guild.me).embed_links:
+            raise commands.BotMissingPermissions(["embed_links"])
+        if not channel.permissions_for(ctx.guild.me).view_audit_log:
+            raise commands.BotMissingPermissions(["view_audit_log"])
+        async with client.database.pool.acquire() as con:
+            logchannellist = await con.fetchrow(
+                "SELECT * FROM antiraid WHERE guildid = $1", ctx.guild.id
+            )
+        if logchannellist is None:
+            statement = """INSERT INTO antiraid (guildid,channelid) VALUES($1, $2);"""
+            async with client.database.pool.acquire() as con:
+                await con.execute(statement, ctx.guild.id, channel.id)
+        else:
+            async with client.database.pool.acquire() as con:
+                await con.execute(
+                    "UPDATE antiraid SET channelid = $1 WHERE guildid = $2",
+                    channel.id,
+                    ctx.guild.id,
+                )
+        await ctx.send(
+            f"Successfully enabled anti-raid and set the anti-raid logging channel to {channel.mention}.",
+            ephemeral=True,
+        )
 
 
 class AutoMod(commands.Cog):
@@ -3014,44 +1805,46 @@ class AutoMod(commands.Cog):
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def allowspam(self, ctx, channel: discord.TextChannel = None):
-        givenTitle = ""
+        given_title = ""
         if channel is None:
             channel = ctx.channel
 
         if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
             return
-        givenTitle = channel.name
+        given_title = channel.name
         channel = [channel]
-        embed = discord.Embed(title=f"{givenTitle}")
+        embed = discord.Embed(title=f"{given_title}")
         count = 0
         loopexited = False
         for chn in channel:
             loopexited = False
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 spamlist = await con.fetchrow(
-                    f"SELECT * FROM spamchannels WHERE channelid = {chn.id}"
+                    "SELECT * FROM spamchannels WHERE channelid = $1", chn.id
                 )
             if spamlist is not None:
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(
-                        f"DELETE FROM spamchannels WHERE channelid = {chn.id}"
+                        "DELETE FROM spamchannels WHERE channelid = $1", chn.id
                     )
                 embed.add_field(
-                    value=f"Message spam is now allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Message spam is now allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             else:
                 embed.add_field(
-                    value=f"Message spam is already allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Message spam is already allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             if count >= 12:
                 await ctx.send(embed=embed, ephemeral=True)
                 count = 0
-                embed = discord.Embed(title=f"** **")
+                embed = discord.Embed(title="** **")
                 loopexited = True
         if not loopexited:
             await ctx.send(embed=embed, ephemeral=True)
@@ -3065,43 +1858,45 @@ class AutoMod(commands.Cog):
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def disallowspam(self, ctx, channel: discord.TextChannel = None):
-        givenTitle = ""
+        given_title = ""
         if channel is None:
             channel = ctx.channel
 
         if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
             return
-        givenTitle = channel.name
+        given_title = channel.name
         channel = [channel]
-        embed = discord.Embed(title=f"{givenTitle}")
+        embed = discord.Embed(title=f"{given_title}")
         count = 0
         loopexited = False
         for chn in channel:
             loopexited = False
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 spamlist = await con.fetchrow(
-                    f"SELECT * FROM spamchannels WHERE channelid = {chn.id}"
+                    "SELECT * FROM spamchannels WHERE channelid = $1", chn.id
                 )
             if spamlist is not None:
                 embed.add_field(
-                    value=f"Message spam is already not allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Message spam is already not allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             else:
                 statement = """INSERT INTO spamchannels (channelid) VALUES($1);"""
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(statement, chn.id)
                 embed.add_field(
-                    value=f"Message spam is now not allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Message spam is now not allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             if count >= 12:
                 await ctx.send(embed=embed, ephemeral=True)
                 count = 0
-                embed = discord.Embed(title=f"** **")
+                embed = discord.Embed(title="** **")
                 loopexited = True
         if not loopexited:
             await ctx.send(embed=embed, ephemeral=True)
@@ -3117,53 +1912,53 @@ class AutoMod(commands.Cog):
     async def modsettings(self, ctx, channel: discord.TextChannel = None):
         if channel is None:
             channel = ctx.channel
-        embedVar = discord.Embed(
+        embed_var = discord.Embed(
             title=f"{channel.name} moderation settings",
             description="",
             color=Color.blue(),
         )
         try:
             prefix = ctx.prefix
-        except:
+        except Exception:
             prefix = "/"
-        guildPrefix = prefix
-        spamEmoji = "<:nope:906421140157780008>"
-        async with pool.acquire() as con:
+        guild_prefix = prefix
+        spam_emoji = "❌"
+        async with client.database.pool.acquire() as con:
             spamlist = await con.fetchrow(
-                f"SELECT * FROM spamchannels WHERE channelid = {channel.id}"
+                "SELECT * FROM spamchannels WHERE channelid = $1", channel.id
             )
         if spamlist is not None:
-            spamEmoji = "<a:yes:872664918736928858>"
-        embedVar.add_field(
-            name=f"Message spamming checks : {spamEmoji}",
-            value=f"Do {guildPrefix}allowspam to disable spam message checks and {guildPrefix}disallowspam to enable spam message checks.",
+            spam_emoji = "✅"
+        embed_var.add_field(
+            name=f"Message spamming checks : {spam_emoji}",
+            value=f"Do {guild_prefix}allowspam to disable spam message checks and {guild_prefix}disallowspam to enable spam message checks.",
             inline=False,
         )
-        linkEmoji = "<:nope:906421140157780008>"
-        async with pool.acquire() as con:
+        link_emoji = "❌"
+        async with client.database.pool.acquire() as con:
             linklist = await con.fetchrow(
-                f"SELECT * FROM linkchannels WHERE channelid = {channel.id}"
+                "SELECT * FROM linkchannels WHERE channelid = $1", channel.id
             )
         if linklist is not None:
-            linkEmoji = "<a:yes:872664918736928858>"
-        embedVar.add_field(
-            name=f"Message link and server invite checks : {linkEmoji}",
-            value=f"Do {guildPrefix}allowlinks to disable link and server invite checks and {guildPrefix}disallowlinks to enable link and server invite checks.",
+            link_emoji = "✅"
+        embed_var.add_field(
+            name=f"Message link and server invite checks : {link_emoji}",
+            value=f"Do {guild_prefix}allowlinks to disable link and server invite checks and {guild_prefix}disallowlinks to enable link and server invite checks.",
             inline=False,
         )
-        profaneEmoji = "<:nope:906421140157780008>"
-        async with pool.acquire() as con:
+        profane_emoji = "❌"
+        async with client.database.pool.acquire() as con:
             profanelist = await con.fetchrow(
-                f"SELECT * FROM profanechannels WHERE channelid = {channel.id}"
+                "SELECT * FROM profanechannels WHERE channelid = $1", channel.id
             )
         if profanelist is not None:
-            profaneEmoji = "<a:yes:872664918736928858>"
-        embedVar.add_field(
-            name=f"Message profane checks : {profaneEmoji}",
-            value=f"Do {guildPrefix}allowprofane to disable profane text checks and {guildPrefix}disallowprofane to enable profane text checks.",
+            profane_emoji = "✅"
+        embed_var.add_field(
+            name=f"Message profane checks : {profane_emoji}",
+            value=f"Do {guild_prefix}allowprofane to disable profane text checks and {guild_prefix}disallowprofane to enable profane text checks.",
             inline=False,
         )
-        await ctx.send(embed=embedVar, ephemeral=True)
+        await ctx.send(embed=embed_var, ephemeral=True)
 
     @commands.hybrid_command(
         brief="This command checks for profanity(hurtful text) in a channel.",
@@ -3174,44 +1969,45 @@ class AutoMod(commands.Cog):
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def disallowprofane(self, ctx, channel: discord.TextChannel = None):
-        global antifilter
-        givenTitle = ""
+        given_title = ""
         if channel is None:
             channel = ctx.channel
 
         if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
             return
-        givenTitle = channel.name
+        given_title = channel.name
         channel = [channel]
-        embed = discord.Embed(title=f"{givenTitle}")
+        embed = discord.Embed(title=f"{given_title}")
         count = 0
         loopexited = False
         for chn in channel:
             loopexited = False
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 profanelist = await con.fetchrow(
-                    f"SELECT * FROM profanechannels WHERE channelid = {chn.id}"
+                    "SELECT * FROM profanechannels WHERE channelid = $1", chn.id
                 )
             if profanelist is not None:
                 embed.add_field(
-                    value=f"Profane text is already not allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Profane text is already not allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             else:
                 statement = """INSERT INTO profanechannels (channelid) VALUES($1);"""
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(statement, chn.id)
                 embed.add_field(
-                    value=f"Profane text is now not allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Profane text is now not allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             if count >= 12:
                 await ctx.send(embed=embed, ephemeral=True)
                 count = 0
-                embed = discord.Embed(title=f"** **")
+                embed = discord.Embed(title="** **")
                 loopexited = True
         if not loopexited:
             await ctx.send(embed=embed, ephemeral=True)
@@ -3225,45 +2021,46 @@ class AutoMod(commands.Cog):
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def allowprofane(self, ctx, channel: discord.TextChannel = None):
-        global antifilter
-        givenTitle = ""
+        given_title = ""
         if channel is None:
             channel = ctx.channel
 
         if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
             return
-        givenTitle = channel.name
+        given_title = channel.name
         channel = [channel]
-        embed = discord.Embed(title=f"{givenTitle}")
+        embed = discord.Embed(title=f"{given_title}")
         count = 0
         loopexited = False
         for chn in channel:
             loopexited = False
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 profanelist = await con.fetchrow(
-                    f"SELECT * FROM profanechannels WHERE channelid = {chn.id}"
+                    "SELECT * FROM profanechannels WHERE channelid = $1", chn.id
                 )
             if profanelist is not None:
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(
-                        f"DELETE FROM profanechannels WHERE channelid = {chn.id}"
+                        "DELETE FROM profanechannels WHERE channelid = $1", chn.id
                     )
                 embed.add_field(
-                    value=f"Profane text is now allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Profane text is now allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             else:
                 embed.add_field(
-                    value=f"Profane text is already allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Profane text is already allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             if count >= 12:
                 await ctx.send(embed=embed, ephemeral=True)
                 count = 0
-                embed = discord.Embed(title=f"** **")
+                embed = discord.Embed(title="** **")
                 loopexited = True
         if not loopexited:
             await ctx.send(embed=embed, ephemeral=True)
@@ -3277,43 +2074,44 @@ class AutoMod(commands.Cog):
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def disallowlinks(self, ctx, channel: discord.TextChannel = None):
-        global antilink
-        givenTitle = ""
+        given_title = ""
         if channel is None:
             channel = ctx.channel
         if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
             return
-        givenTitle = channel.name
+        given_title = channel.name
         channel = [channel]
-        embed = discord.Embed(title=f"{givenTitle}")
+        embed = discord.Embed(title=f"{given_title}")
         count = 0
         loopexited = False
         for chn in channel:
             loopexited = False
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 linklist = await con.fetchrow(
-                    f"SELECT * FROM linkchannels WHERE channelid = {chn.id}"
+                    "SELECT * FROM linkchannels WHERE channelid = $1", chn.id
                 )
             if linklist is not None:
                 embed.add_field(
-                    value=f"Links and server invites are already not allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Links and server invites are already not allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             else:
                 statement = """INSERT INTO linkchannels (channelid) VALUES($1);"""
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(statement, chn.id)
                 embed.add_field(
-                    value=f"Links and server invites are now not allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Links and server invites are now not allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             if count >= 12:
                 await ctx.send(embed=embed, ephemeral=True)
                 count = 0
-                embed = discord.Embed(title=f"** **")
+                embed = discord.Embed(title="** **")
                 loopexited = True
         if not loopexited:
             await ctx.send(embed=embed, ephemeral=True)
@@ -3327,53 +2125,54 @@ class AutoMod(commands.Cog):
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def allowlinks(self, ctx, channel: discord.TextChannel = None):
-        global antilink
-        givenTitle = ""
+        given_title = ""
         if channel is None:
             channel = ctx.channel
 
         if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
             return
-        givenTitle = channel.name
+        given_title = channel.name
         channel = [channel]
-        embed = discord.Embed(title=f"{givenTitle}")
+        embed = discord.Embed(title=f"{given_title}")
         count = 0
         loopexited = False
         for chn in channel:
             loopexited = False
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 linklist = await con.fetchrow(
-                    f"SELECT * FROM linkchannels WHERE channelid = {chn.id}"
+                    "SELECT * FROM linkchannels WHERE channelid = $1", chn.id
                 )
             if linklist is not None:
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(
-                        f"DELETE FROM linkchannels WHERE channelid = {chn.id}"
+                        "DELETE FROM linkchannels WHERE channelid = $1", chn.id
                     )
                 embed.add_field(
-                    value=f"Links and server invites are now allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Links and server invites are now allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             else:
                 embed.add_field(
-                    value=f"Links and server invites are already allowed <a:yes:872664918736928858> in {chn.mention}",
+                    value=f"Links and server invites are already allowed ✅ in {chn.mention}",
                     name="** **",
                 )
                 count = count + 1
             if count >= 12:
                 await ctx.send(embed=embed, ephemeral=True)
                 count = 0
-                embed = discord.Embed(title=f"** **")
+                embed = discord.Embed(title="** **")
                 loopexited = True
         if not loopexited:
             await ctx.send(embed=embed, ephemeral=True)
 
 
-def gencharstr(N, ch):
+def gencharstr(n, ch):
     res = ""
-    for i in range(N):
+    for i in range(n):
         res = res + ch
     return res
 
@@ -3387,8 +2186,8 @@ def genvalidatecode(code):
     return random.random()
 
 
-def genrandomstr(N):
-    res = "".join(random.choices(string.ascii_uppercase + string.digits + ".", k=N))
+def genrandomstr(n):
+    res = "".join(random.choices(string.ascii_uppercase + string.digits + ".", k=n))
     return res
 
 
@@ -3409,42 +2208,43 @@ class Templates(commands.Cog):
             ctx, ctx.guild.me, ["manage_roles", "manage_channels", "manage_guild"]
         )
         try:
-            existTemp = await ctx.guild.templates()
-            existTemp = existTemp[0]
-            await existTemp.delete()
-        except:
+            exist_temp = await ctx.guild.templates()
+            exist_temp = exist_temp[0]
+            await exist_temp.delete()
+        except Exception:
             pass
         try:
-            backupTemplate = await ctx.guild.create_template(
+            backup_template = await ctx.guild.create_template(
                 name=f"Backup template V{genrandomstr(5)}"
             )
-            backupTemplate = backupTemplate.code
-        except:
-            backupTemplate = "<:offline:886434154412113961> No permissions"
-            await send_generic_error_embed(ctx, error_data=
-                " I don't have manage guild permissions to create a backup template."
+            backup_template = backup_template.code
+        except Exception:
+            backup_template = "⚫ No permissions"
+            await send_generic_error_embed(
+                ctx,
+                error_data=" I don't have manage guild permissions to create a backup template.",
             )
             return
         embed = discord.Embed(
             title=f"{ctx.guild}'s backup template",
-            description=f"https://discord.new/{backupTemplate}",
+            description=f"https://discord.new/{backup_template}",
             timestamp=discord.utils.utcnow(),
         )
         try:
             await ctx.author.send(embed=embed)
-        except:
+        except Exception:
             f = discord.File("./resources/common/dmEnable.jpg", filename="dmEnable.jpg")
             e = discord.Embed(
-                title=f"Dms disabled",
+                title="Dms disabled",
                 description="Kindly enable your dms for sending the template.",
             )
             e.add_field(
                 name="Command author", value=f"{ctx.author.mention}", inline=False
             )
             e.set_image(url="attachment://dmEnable.jpg")
-            mentionMes = await ctx.send(ctx.author.mention, ephemeral=True)
+            mention_mes = await ctx.send(ctx.author.mention, ephemeral=True)
             await asyncio.sleep(1)
-            await mentionMes.delete()
+            await mention_mes.delete()
             await ctx.send(file=f, embed=e, ephemeral=True)
             return
         await ctx.send(
@@ -3466,36 +2266,41 @@ class Templates(commands.Cog):
         )
         try:
             template = await client.fetch_template(copytemplate)
-        except:
+        except Exception:
             try:
                 lastindex = copytemplate.rindex("/")
                 thecode = copytemplate[lastindex + 1 :]
-            except:
+            except Exception:
                 thecode = copytemplate
             if thecode is None:
-                await send_generic_error_embed(ctx, error_data=f"Unknown template with id `{thecode}`")
+                await send_generic_error_embed(
+                    ctx, error_data=f"Unknown template with id `{thecode}`"
+                )
                 return
             copytemplate = "https://discord.new/" + thecode
             try:
                 template = await client.fetch_template(copytemplate)
-            except:
-                await send_generic_error_embed(ctx, error_data=f"Unknown template with id `{thecode}`")
+            except Exception:
+                await send_generic_error_embed(
+                    ctx, error_data=f"Unknown template with id `{thecode}`"
+                )
                 return
         try:
-            existTemp = await ctx.guild.templates()
-            existTemp = existTemp[0]
-            await existTemp.delete()
-        except:
+            exist_temp = await ctx.guild.templates()
+            exist_temp = exist_temp[0]
+            await exist_temp.delete()
+        except Exception:
             pass
         try:
-            backupTemplate = await ctx.guild.create_template(
+            backup_template = await ctx.guild.create_template(
                 name=f"Backup template V{genrandomstr(5)}"
             )
-            backupTemplate = backupTemplate.code
-        except:
-            backupTemplate = "<:offline:886434154412113961> No permissions"
-            await send_generic_error_embed(ctx, error_data=
-                "I don't have manage guild permissions to create a backup template."
+            backup_template = backup_template.code
+        except Exception:
+            backup_template = "⚫ No permissions"
+            await send_generic_error_embed(
+                ctx,
+                error_data="I don't have manage guild permissions to create a backup template.",
             )
             return
         roles = ctx.guild.me.roles
@@ -3505,60 +2310,62 @@ class Templates(commands.Cog):
 
         embed = discord.Embed(
             title=f"{ctx.guild}'s backup template",
-            description=f"https://discord.new/{backupTemplate}",
+            description=f"https://discord.new/{backup_template}",
             timestamp=discord.utils.utcnow(),
         )
-        embedStatusDel = discord.Embed(
+        embed_status_del = discord.Embed(
             title="Deleting old channels/roles",
-            description="Status <a:loadingone:877403280391696444>",
+            description="Status ⏳",
         )
-        messagesent = await ctx.send(embed=embedStatusDel, ephemeral=True)
-        changesstrDel = ""
+        messagesent = await ctx.send(embed=embed_status_del, ephemeral=True)
+        changesstr_del = ""
         for channel in ctx.guild.channels:
             if channel == ctx.channel:
                 continue
             try:
                 await channel.delete()
-                changesstrDel = changesstrDel + (f"(Channel) {channel.name} deleted.\n")
-            except:
-                changesstrDel = changesstrDel + (
+                changesstr_del = changesstr_del + (
+                    f"(Channel) {channel.name} deleted.\n"
+                )
+            except Exception:
+                changesstr_del = changesstr_del + (
                     f"(Channel) {channel.name} was not deleted.\n"
                 )
 
         for role in ctx.guild.roles:
             try:
                 if role.name == "muted" or role.name == "blacklisted":
-                    changesstrDel = changesstrDel + (
+                    changesstr_del = changesstr_del + (
                         f"(Role) {role.name} was not deleted as its punishment role.\n"
                     )
-                elif (not role in ctx.guild.me.roles) and (
+                elif (role not in ctx.guild.me.roles) and (
                     not ctx.guild.default_role == role
                 ):
                     await role.delete()
-                    changesstrDel = changesstrDel + (f"(Role) {role.name} deleted.\n")
+                    changesstr_del = changesstr_del + (f"(Role) {role.name} deleted.\n")
                 else:
-                    changesstrDel = changesstrDel + (
+                    changesstr_del = changesstr_del + (
                         f"(Role) {role.name} was not deleted as its my role.\n"
                     )
-            except:
-                changesstrDel = changesstrDel + (
+            except Exception:
+                changesstr_del = changesstr_del + (
                     f"(Role) {role.name} was not deleted.\n"
                 )
-        myFileDel = discord.File(
-            io.StringIO(str(changesstrDel)), filename="DELETEDchanges.text"
+        my_file_del = discord.File(
+            io.StringIO(str(changesstr_del)), filename="DELETEDchanges.text"
         )
-        await ctx.send(file=myFileDel)
-        for embedLoop in messagesent.embeds:
-            embedLoop.description = "Status <a:yes:872664918736928858>"
-            embedLoop.color = Color.green()
-            await messagesent.edit(embed=embedLoop)
+        await ctx.send(file=my_file_del)
+        for embed_loop in messagesent.embeds:
+            embed_loop.description = "Status ✅"
+            embed_loop.color = Color.green()
+            await messagesent.edit(embed=embed_loop)
         try:
             await ctx.author.send(embed=embed)
-        except:
+        except Exception:
             pass
-        embedStatus = discord.Embed(
+        embed_status = discord.Embed(
             title="Creating channels/roles",
-            description="Status <a:loadingone:877403280391696444>",
+            description="Status ⏳",
         )
         messagesent = None
         changesstr = ""
@@ -3573,7 +2380,7 @@ class Templates(commands.Cog):
                     hoist=recoveryrole.hoist,
                 )
                 changesstr = changesstr + (f"(Role) {createdrole.name} created.\n")
-            except:
+            except Exception:
                 try:
                     createdrole = await ctx.guild.create_role(
                         name=recoveryrole.name,
@@ -3583,7 +2390,7 @@ class Templates(commands.Cog):
                         hoist=recoveryrole.hoist,
                     )
                     changesstr = changesstr + (f"(Role) {createdrole.name} created.\n")
-                except:
+                except Exception:
                     changesstr = changesstr + (
                         f"I couldn't create {recoveryrole.name} with {recoveryrole.permissions} and {recoveryrole.colour} colour.\n"
                     )
@@ -3592,7 +2399,7 @@ class Templates(commands.Cog):
         for recoverycategory in template.source_guild.by_category():
             try:
                 copyname = recoverycategory[0].name
-            except:
+            except Exception:
                 copyname = "General"
             copycategory = await ctx.guild.create_category(copyname)
             for copychannel in recoverycategory[1]:
@@ -3607,12 +2414,12 @@ class Templates(commands.Cog):
                         if firsttxtchnl is None:
                             firsttxtchnl = txtchannel
                             messagesent = await firsttxtchnl.send(
-                                embed=embedStatus, message=ctx.author.mention
+                                embed=embed_status, message=ctx.author.mention
                             )
                         changesstr = changesstr + (
                             f"(Text-Channel) {txtchannel.name} created.\n"
                         )
-                    except:
+                    except Exception:
                         changesstr = changesstr + (
                             f"I couldn't create text channel named {copychannel.name}\n"
                         )
@@ -3625,7 +2432,7 @@ class Templates(commands.Cog):
                         changesstr = changesstr + (
                             f"(Voice-Channel) {txtchannel.name} created.\n"
                         )
-                    except:
+                    except Exception:
                         changesstr = changesstr + (
                             f"I couldn't create voice channel named {copychannel.name}\n"
                         )
@@ -3637,27 +2444,27 @@ class Templates(commands.Cog):
                         changesstr = changesstr + (
                             f"(Stage-Channel) {txtchannel.name} created.\n"
                         )
-                    except:
+                    except Exception:
                         changesstr = changesstr + (
                             f"I couldn't create stage channel named {copychannel.name}\n"
                         )
         if messagesent:
-            for embedLoop in messagesent.embeds:
-                embedLoop.description = "<a:yes:872664918736928858> Created."
-                embedLoop.color = Color.green()
-                await messagesent.edit(embed=embedLoop)
+            for embed_loop in messagesent.embeds:
+                embed_loop.description = "✅ Created."
+                embed_loop.color = Color.green()
+                await messagesent.edit(embed=embed_loop)
         if firsttxtchnl:
-            myFile = discord.File(
+            my_file = discord.File(
                 io.StringIO(str(changesstr)), filename="CREATEDchanges.text"
             )
-            myFileDel = discord.File(
-                io.StringIO(str(changesstrDel)), filename="DELETEDchanges.text"
+            my_file_del = discord.File(
+                io.StringIO(str(changesstr_del)), filename="DELETEDchanges.text"
             )
-            await firsttxtchnl.send(file=myFileDel)
-            embedStatusDel.description = "Status <a:yes:872664918736928858>"
-            embedStatusDel.color = Color.green()
-            await firsttxtchnl.send(embed=embedStatusDel)
-            await firsttxtchnl.send(file=myFile)
+            await firsttxtchnl.send(file=my_file_del)
+            embed_status_del.description = "Status ✅"
+            embed_status_del.color = Color.green()
+            await firsttxtchnl.send(embed=embed_status_del)
+            await firsttxtchnl.send(file=my_file)
         await ctx.channel.delete()
         guild = ctx.guild
         muterole = discord.utils.get(guild.roles, name="muted")
@@ -3670,7 +2477,7 @@ class Templates(commands.Cog):
             )
             try:
                 await guild.create_role(name="muted", permissions=perms)
-            except:
+            except Exception:
                 raise commands.BotMissingPermissions(["manage_roles"])
             muterole = discord.utils.get(guild.roles, name="muted")
             for channelloop in guild.channels:
@@ -3694,7 +2501,7 @@ class Templates(commands.Cog):
             )
             try:
                 await muterole.edit(permissions=perms)
-            except:
+            except Exception:
                 raise commands.BotMissingPermissions(["manage_roles"])
             for channelloop in guild.channels:
                 if channelloop.type == discord.ChannelType.text:
@@ -3713,7 +2520,7 @@ class Templates(commands.Cog):
             perms = discord.Permissions(send_messages=False, read_messages=False)
             try:
                 await guild.create_role(name="blacklisted", permissions=perms)
-            except:
+            except Exception:
                 raise commands.BotMissingPermissions(["manage_roles"])
             blacklistrole = discord.utils.get(guild.roles, name="blacklisted")
             for channelloop in guild.channels:
@@ -3722,7 +2529,7 @@ class Templates(commands.Cog):
             perms = discord.Permissions(send_messages=False, read_messages=False)
             try:
                 await blacklistrole.edit(permissions=perms)
-            except:
+            except Exception:
                 raise commands.BotMissingPermissions(["manage_roles"])
             for channelloop in guild.channels:
                 await channelloop.set_permissions(blacklistrole, view_channel=False)
@@ -3760,7 +2567,9 @@ class SupportTicket(commands.Cog):
             ],
         )
         if channelname.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data="The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data="The channel provided was not in this guild."
+            )
             return
         channel = channelname
 
@@ -3782,17 +2591,17 @@ class SupportTicket(commands.Cog):
         emojis = [reaction]
         for emoji in emojis:
             await messagesent.add_reaction(emoji)
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             ticketlist = await con.fetchrow(
-                f"SELECT * FROM ticketchannels WHERE channelid = {channel.id}"
+                "SELECT * FROM ticketchannels WHERE channelid = $1", channel.id
             )
         if ticketlist:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(
-                    f"DELETE FROM ticketchannels WHERE channelid = {channel.id}"
+                    "DELETE FROM ticketchannels WHERE channelid = $1", channel.id
                 )
         statement = """INSERT INTO ticketchannels (channelid,messageid,roleid,emoji) VALUES($1,$2,$3,$4);"""
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             await con.execute(
                 statement, channel.id, messagesent.id, supportrole.id, emoji
             )
@@ -3884,16 +2693,16 @@ async def createticket(user, guild, category, channelorig, role: discord.Role):
         color=Color.green(),
     )
     messagesent = await supportchannel.send(embed=embedtwo)
-    embedInfo = discord.Embed(
+    embed_info = discord.Embed(
         title="Ticket opened ",
         description=f"You claimed {supportchannel.mention}",
         color=Color.green(),
     )
-    channelJumpURL = f'[Jump to message!]({messagesent.jump_url} "Click this link to go to support message!") '
-    embedInfo.add_field(name="Conversation", value=channelJumpURL, inline=False)
+    channel_jump_url = f'[Jump to message!]({messagesent.jump_url} "Click this link to go to support message!") '
+    embed_info.add_field(name="Conversation", value=channel_jump_url, inline=False)
     try:
-        await user.send(embed=embedInfo)
-    except:
+        await user.send(embed=embed_info)
+    except Exception:
         pass
     ghostping = await supportchannel.send(user.mention)
     await ghostping.delete()
@@ -3908,23 +2717,31 @@ async def createticket(user, guild, category, channelorig, role: discord.Role):
             return False
         if not reaction.message == messagesent:
             return False
-        asyncio.create_task(messagesent.remove_reaction(reaction, userone))
+        client.create_background_task(
+            messagesent.remove_reaction(reaction, userone),
+            name="ticket-remove-reaction",
+        )
         if str(reaction) == "🟥":
-            asyncio.create_task(
-                deleteticket(user, userone, supportchannel, channelorig, guild)
+            client.create_background_task(
+                deleteticket(user, userone, supportchannel, channelorig, guild),
+                name="ticket-delete",
             )
             return False
         if str(reaction) == "🔒":
-            asyncio.create_task(lockticket(user, userone, supportchannel))
+            client.create_background_task(
+                lockticket(user, userone, supportchannel), name="ticket-lock"
+            )
             return False
         if str(reaction) == "🔓":
-            asyncio.create_task(unlockticket(user, userone, supportchannel))
+            client.create_background_task(
+                unlockticket(user, userone, supportchannel), name="ticket-unlock"
+            )
             return False
         return False
 
     try:
         reaction, user = await client.wait_for("reaction_add", check=check)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         await supportchannel.send(
             " Please run the command again , this command has timed out."
         )
@@ -3932,8 +2749,8 @@ async def createticket(user, guild, category, channelorig, role: discord.Role):
         pass
 
 
-def randStr(chars=string.ascii_uppercase + string.digits, N=4):
-    return "".join(random.choice(chars) for _ in range(N))
+def rand_str(chars=string.ascii_uppercase + string.digits, n=4):
+    return "".join(random.choice(chars) for _ in range(n))
 
 
 class Verification(discord.ui.View):
@@ -3955,10 +2772,11 @@ class Verification(discord.ui.View):
                 content="You are already verified.", ephemeral=True
             )
             return
-        captchaMessage = randStr()
+        captcha_message = rand_str()
         image = ImageCaptcha()
-        image.write(
-            captchaMessage,
+        await asyncio.to_thread(
+            image.write,
+            captcha_message,
             f"./resources/temp/captcha_{interaction.user.id}_{interaction.guild.id}.jpg",
         )
         f = discord.File(
@@ -3980,16 +2798,14 @@ targeted attacks using automated user accounts.""",
         )
         try:
             await interaction.user.send(file=f, embed=e)
-        except:
+        except Exception:
             f = discord.File("./resources/common/dmEnable.jpg", filename="dmEnable.jpg")
-            e = discord.Embed(title=f"Dms disabled")
+            e = discord.Embed(title="Dms disabled")
             e.add_field(
                 name="Command author", value=f"{interaction.user.mention}", inline=False
             )
             e.set_image(url="attachment://dmEnable.jpg")
-            dmWarnings = await interaction.response.send_message(
-                file=f, embed=e, ephemeral=True
-            )
+            await interaction.response.send_message(file=f, embed=e, ephemeral=True)
             return
         await interaction.response.send_message(
             content="Check your dms for verification!.", ephemeral=True
@@ -3999,47 +2815,12 @@ targeted attacks using automated user accounts.""",
             return interaction.user.id == m.author.id and not m.guild
 
         msg = await client.wait_for("message", check=check)
-        if msg.content == captchaMessage:
+        if msg.content == captcha_message:
             ea = discord.Embed(
                 title="Thank you for verifying!",
                 description=f"You have gained access to channels by getting verified in {interaction.guild}",
             )
-            ea.set_footer(
-                text="Want to invite this bot in your server? Checkout this link : https://discord.com/oauth2/authorize?client_id=1061480715172200498&permissions=2416012310&scope=bot."
-            )
-            async with pool.acquire() as con:
-                mutedlist = await con.fetchrow(
-                    f"SELECT * FROM mutedusers where userid = {interaction.user.id} AND guildid = {interaction.user.guild.id}"
-                )
-            async with pool.acquire() as con:
-                blacklistedlist = await con.fetchrow(
-                    f"SELECT * FROM blacklistedusers where userid = {interaction.user.id} AND guildid = {interaction.user.guild.id}"
-                )
             warning = ""
-            if mutedlist is not None:
-                warning = "due to active punishments : `mute`"
-                await interaction.user.send(
-                    "I couldn't verify you as you have active punishments : `mute`"
-                )
-                await loginfo(
-                    interaction.guild,
-                    "Verification logging",
-                    "** **",
-                    f"{interaction.user.mention} couldn't complete captcha verification at <t:{int(time.time())}:R> {warning}.",
-                )
-                return
-            if blacklistedlist is not None:
-                warning = "due to active punishments : `blacklist`"
-                await interaction.user.send(
-                    "I couldn't verify you as you have active punishments : `blacklist`"
-                )
-                await loginfo(
-                    interaction.guild,
-                    "Verification logging",
-                    "** **",
-                    f"{interaction.user.mention} couldn't complete captcha verification at <t:{int(time.time())}:R> {warning}.",
-                )
-                return
             if newaccount(interaction.user):
                 warning = "(:octagonal_sign: New account)"
             await loginfo(
@@ -4051,18 +2832,19 @@ targeted attacks using automated user accounts.""",
             await interaction.user.send(embed=ea)
             try:
                 await interaction.user.add_roles(verifyrole)
-            except:
-                await send_generic_error_embed(interaction.channel, error_data=
-                    f"I don't have permissions to add the verify role ({verifyrole.mention}) to {interaction.user.mention}."
+            except Exception:
+                await send_generic_error_embed(
+                    interaction.channel,
+                    error_data=f"I don't have permissions to add the verify role ({verifyrole.mention}) to {interaction.user.mention}.",
                 )
                 return
         else:
             await interaction.user.send(
-                f"The captcha entered is invalid , regenerate a new captcha for verification."
+                "The captcha entered is invalid , regenerate a new captcha for verification."
             )
             if checkstaff(interaction.user):
                 await interaction.user.send(
-                    f"Debug: The captcha was **'{captchaMessage}'**."
+                    f"Debug: The captcha was **'{captcha_message}'**."
                 )
 
 
@@ -4079,9 +2861,10 @@ class Captcha(commands.Cog):
     async def verifyreadadd(self, ctx, *, list_textstagevoicechannels: str):
         check_ensure_permissions(ctx, ctx.guild.me, ["manage_channels"])
         verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole == None:
-            await send_generic_error_embed(ctx, error_data=
-                " The verification role was not found , run the setupverification command for setting this up ."
+        if verifyrole is None:
+            await send_generic_error_embed(
+                ctx,
+                error_data=" The verification role was not found , run the setupverification command for setting this up .",
             )
             return
         embed = discord.Embed(title="Added channels", description=verifyrole.mention)
@@ -4093,35 +2876,35 @@ class Captcha(commands.Cog):
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
             try:
                 channel = await commands.StageChannelConverter().convert(
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
             try:
                 channel = await commands.VoiceChannelConverter().convert(
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
         if len(channels) == 0:
             raise commands.BadArgument("Nothing")
         for channel in channels:
-            isDone = "<a:yes:872664918736928858> Successfully added"
+            is_done = "✅ Successfully added"
             try:
                 overwrite = discord.PermissionOverwrite()
                 overwrite.view_channel = True
                 overwrite.send_messages = False
                 overwrite.read_message_history = True
                 await channel.set_permissions(verifyrole, overwrite=overwrite)
-            except:
-                isDone = "🚫 Error"
-            embed.add_field(name=isDone, value=channel.mention)
+            except Exception:
+                is_done = "🚫 Error"
+            embed.add_field(name=is_done, value=channel.mention)
         await ctx.send(embed=embed, ephemeral=True)
 
     @commands.hybrid_command(
@@ -4134,9 +2917,10 @@ class Captcha(commands.Cog):
     async def verifyreadremove(self, ctx, *, list_textstagevoicechannels: str):
         check_ensure_permissions(ctx, ctx.guild.me, ["manage_channels"])
         verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole == None:
-            await send_generic_error_embed(ctx, error_data=
-                " The verification role was not found , run the setupverification command for setting this up ."
+        if verifyrole is None:
+            await send_generic_error_embed(
+                ctx,
+                error_data=" The verification role was not found , run the setupverification command for setting this up .",
             )
             return
         embed = discord.Embed(title="Removed channels", description=verifyrole.mention)
@@ -4148,37 +2932,37 @@ class Captcha(commands.Cog):
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
             try:
                 channel = await commands.StageChannelConverter().convert(
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
             try:
                 channel = await commands.VoiceChannelConverter().convert(
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
 
         if len(channels) == 0:
             raise commands.BadArgument("Nothing")
         for channel in channels:
-            isDone = "<a:yes:872664918736928858> Successfully removed"
+            is_done = "✅ Successfully removed"
             try:
                 overwrite = discord.PermissionOverwrite()
                 overwrite.view_channel = False
                 overwrite.send_messages = False
                 overwrite.read_message_history = False
                 await channel.set_permissions(verifyrole, overwrite=overwrite)
-            except:
-                isDone = "🚫 Error"
+            except Exception:
+                is_done = "🚫 Error"
 
-            embed.add_field(name=isDone, value=channel.mention)
+            embed.add_field(name=is_done, value=channel.mention)
         await ctx.send(embed=embed, ephemeral=True)
 
     @commands.hybrid_command(
@@ -4192,9 +2976,10 @@ class Captcha(commands.Cog):
     async def verifyfulladd(self, ctx, *, list_textstagevoicechannels: str):
         check_ensure_permissions(ctx, ctx.guild.me, ["manage_channels"])
         verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole == None:
-            await send_generic_error_embed(ctx, error_data=
-                " The verification role was not found , run the setupverification command for setting this up ."
+        if verifyrole is None:
+            await send_generic_error_embed(
+                ctx,
+                error_data=" The verification role was not found , run the setupverification command for setting this up .",
             )
             return
         embed = discord.Embed(title="Added channels", description=verifyrole.mention)
@@ -4206,36 +2991,36 @@ class Captcha(commands.Cog):
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
             try:
                 channel = await commands.StageChannelConverter().convert(
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
             try:
                 channel = await commands.VoiceChannelConverter().convert(
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
 
         if len(channels) == 0:
             raise commands.BadArgument("Nothing")
         for channel in channels:
-            isDone = "<a:yes:872664918736928858> Successfully added"
+            is_done = "✅ Successfully added"
             try:
                 overwrite = discord.PermissionOverwrite()
                 overwrite.view_channel = True
                 overwrite.send_messages = True
                 overwrite.read_message_history = True
                 await channel.set_permissions(verifyrole, overwrite=overwrite)
-            except:
-                isDone = "🚫 Error"
-            embed.add_field(name=isDone, value=channel.mention)
+            except Exception:
+                is_done = "🚫 Error"
+            embed.add_field(name=is_done, value=channel.mention)
         await ctx.send(embed=embed, ephemeral=True)
 
     @commands.hybrid_command(
@@ -4249,9 +3034,10 @@ class Captcha(commands.Cog):
     async def verifyfullremove(self, ctx, *, list_textstagevoicechannels: str):
         check_ensure_permissions(ctx, ctx.guild.me, ["manage_channels"])
         verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole == None:
-            await send_generic_error_embed(ctx, error_data=
-                " The verification role was not found , run the setupverification command for setting this up ."
+        if verifyrole is None:
+            await send_generic_error_embed(
+                ctx,
+                error_data=" The verification role was not found , run the setupverification command for setting this up .",
             )
             return
         embed = discord.Embed(title="Removed channels", description=verifyrole.mention)
@@ -4263,37 +3049,37 @@ class Captcha(commands.Cog):
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
             try:
                 channel = await commands.StageChannelConverter().convert(
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
             try:
                 channel = await commands.VoiceChannelConverter().convert(
                     ctx, channelname
                 )
                 channels.append(channel)
-            except:
+            except Exception:
                 pass
 
         if len(channels) == 0:
             raise commands.BadArgument("Nothing")
         for channel in channels:
-            isDone = "<a:yes:872664918736928858> Successfully removed"
+            is_done = "✅ Successfully removed"
             try:
                 overwrite = discord.PermissionOverwrite()
                 overwrite.view_channel = False
                 overwrite.send_messages = False
                 overwrite.read_message_history = False
                 await channel.set_permissions(verifyrole, overwrite=overwrite)
-            except:
-                isDone = "🚫 Error"
+            except Exception:
+                is_done = "🚫 Error"
 
-            embed.add_field(name=isDone, value=channel.mention)
+            embed.add_field(name=is_done, value=channel.mention)
         await ctx.send(embed=embed, ephemeral=True)
 
     @commands.hybrid_command(
@@ -4306,9 +3092,10 @@ class Captcha(commands.Cog):
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def verificationchannels(self, ctx):
         verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole == None:
-            await send_generic_error_embed(ctx, error_data=
-                " The verification role was not found , run the setupverification command for setting this up ."
+        if verifyrole is None:
+            await send_generic_error_embed(
+                ctx,
+                error_data=" The verification role was not found , run the setupverification command for setting this up .",
             )
             return
         embed = discord.Embed(
@@ -4320,7 +3107,7 @@ class Captcha(commands.Cog):
             if count >= maxcount:
                 count = 0
                 await ctx.send(embed=embed, ephemeral=True)
-                embed = discord.Embed(title="", description=f"** **")
+                embed = discord.Embed(title="", description="** **")
             if channelloop.type == discord.ChannelType.category:
                 continue
             permission = channelloop.overwrites_for(verifyrole)
@@ -4363,10 +3150,10 @@ class Captcha(commands.Cog):
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def removeverification(self, ctx):
         statement = """DELETE FROM verifychannels WHERE guildid = $1"""
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             await con.execute(statement, ctx.guild.id)
         statement = """SELECT * FROM verifymsg WHERE guildid = $1"""
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             row = await con.fetchrow(statement, ctx.guild.id)
         if row:
             guild = ctx.guild
@@ -4374,10 +3161,10 @@ class Captcha(commands.Cog):
             verifymessage = await verifychannel.fetch_message(row["messageid"])
             try:
                 await verifymessage.delete()
-            except:
+            except Exception:
                 pass
         statement = """DELETE FROM verifymsg WHERE guildid = $1"""
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             await con.execute(statement, ctx.guild.id)
         await ctx.send("Successfully removed the verification channel.", ephemeral=True)
 
@@ -4405,59 +3192,73 @@ class Captcha(commands.Cog):
             ],
         )
         if verifychannel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
             return
-        global prefixlist, verifyonly
-
         verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
         if verifyrole is None:
             perms = discord.Permissions(view_channel=True)
             verifyrole = await ctx.guild.create_role(name="Verified", permissions=perms)
         for channelloop in ctx.guild.channels:
-            permission = channelloop.overwrites_for(ctx.guild.default_role)
-            over = {
-                verifyrole: permission,
-                ctx.guild.default_role: discord.PermissionOverwrite(
-                    view_channel=False,
-                    read_messages=False,
-                    send_messages=False,
-                ),
-                ctx.guild.me: discord.PermissionOverwrite(
-                    view_channel=True,
-                    read_messages=True,
-                    send_messages=True,
-                    read_message_history=True,
-                ),
-            }
+            original_default = channelloop.overwrites_for(ctx.guild.default_role)
+            locked_default = channelloop.overwrites_for(ctx.guild.default_role)
+            locked_default.update(
+                view_channel=False,
+                read_messages=False,
+                send_messages=False,
+            )
+            bot_overwrite = channelloop.overwrites_for(ctx.guild.me)
+            bot_overwrite.update(
+                view_channel=True,
+                read_messages=True,
+                send_messages=True,
+                read_message_history=True,
+            )
             try:
-                await channelloop.edit(overwrites=over)
-            except:
-                pass
+                await channelloop.set_permissions(
+                    verifyrole, overwrite=original_default
+                )
+                await channelloop.set_permissions(
+                    ctx.guild.default_role, overwrite=locked_default
+                )
+                await channelloop.set_permissions(ctx.guild.me, overwrite=bot_overwrite)
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "Could not configure verification permissions guild_id=%s "
+                    "channel_id=%s",
+                    ctx.guild.id,
+                    channelloop.id,
+                )
         statement = """DELETE FROM verifychannels WHERE guildid = $1"""
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             await con.execute(statement, ctx.guild.id)
         statement = """INSERT INTO verifychannels (channelid,guildid) VALUES($1,$2);"""
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             await con.execute(statement, verifychannel.id, ctx.guild.id)
-        over = {
-            ctx.guild.default_role: discord.PermissionOverwrite(
-                view_channel=True,
-                read_messages=True,
-                send_messages=True,
-                read_message_history=True,
-            ),
-            ctx.guild.me: discord.PermissionOverwrite(
-                view_channel=True,
-                read_messages=True,
-                send_messages=True,
-                read_message_history=True,
-            ),
-        }
+        public_overwrite = verifychannel.overwrites_for(ctx.guild.default_role)
+        public_overwrite.update(
+            view_channel=True,
+            read_messages=True,
+            send_messages=True,
+            read_message_history=True,
+        )
+        bot_overwrite = verifychannel.overwrites_for(ctx.guild.me)
+        bot_overwrite.update(
+            view_channel=True,
+            read_messages=True,
+            send_messages=True,
+            read_message_history=True,
+        )
         try:
-            await verifychannel.edit(overwrites=over)
-        except:
-            await send_generic_error_embed(ctx, error_data=
-                f"I don't have permissions to edit {verifychannel.mention}."
+            await verifychannel.set_permissions(
+                ctx.guild.default_role, overwrite=public_overwrite
+            )
+            await verifychannel.set_permissions(ctx.guild.me, overwrite=bot_overwrite)
+        except discord.HTTPException:
+            await send_generic_error_embed(
+                ctx,
+                error_data=f"I don't have permissions to edit {verifychannel.mention}.",
             )
             return
         historyexists = False
@@ -4481,7 +3282,7 @@ class Captcha(commands.Cog):
                 reaction, user = await client.wait_for(
                     "reaction_add", timeout=10.0, check=check
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 messageone = await verifychannel.send(
                     "Ok I am not purging the channel."
                 )
@@ -4495,18 +3296,18 @@ class Captcha(commands.Cog):
                     f"Hey go to {clonedchannel} for a new purged channel ."
                 )
                 statement = """DELETE FROM verifychannels WHERE guildid = $1"""
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(statement, ctx.guild.id)
                 await verifychannel.delete()
                 verifychannel = clonedchannel
                 statement = (
                     """INSERT INTO verifychannels (channelid,guildid) VALUES($1,$2);"""
                 )
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(statement, verifychannel.id, ctx.guild.id)
         e = discord.Embed(
             title=f"{ctx.guild} Verification",
-            description="""Hello! You are required to complete a captcha <:captcha:879225291136991292> before entering the server.
+            description="""Hello! You are required to complete a captcha 🔐 before entering the server.
 NOTE: This is Case Sensitive.
 
 Why?
@@ -4515,16 +3316,16 @@ targeted attacks using automated user accounts.""",
         )
         try:
             prefix = ctx.prefix
-        except:
+        except Exception:
             prefix = "/"
         e.add_field(
             name=f"Type {prefix}verify to get verified and gain access to channels.",
             value="** **",
         )
         msg = await verifychannel.send(embed=e, view=Verification())
-        if not msg is None:
+        if msg is not None:
             statement = """INSERT INTO verifymsg (guildid,channelid,messageid) VALUES($1,$2,$3);"""
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.guild.id, verifychannel.id, msg.id)
         try:
             messageone = await ctx.send(
@@ -4533,7 +3334,7 @@ targeted attacks using automated user accounts.""",
             )
             await asyncio.sleep(60)
             await messageone.delete()
-        except:
+        except Exception:
             pass
 
     @commands.cooldown(1, 30, BucketType.member)
@@ -4547,7 +3348,7 @@ targeted attacks using automated user accounts.""",
         check_ensure_permissions(ctx, ctx.guild.me, ["attach_files"])
         try:
             await ctx.message.delete()
-        except:
+        except Exception:
             pass
         verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
         if verifyrole is None:
@@ -4559,10 +3360,11 @@ targeted attacks using automated user accounts.""",
         if verifyrole in ctx.author.roles:
             await ctx.author.send(content="You are already verified.", delete_after=4)
             return
-        captchaMessage = randStr()
+        captcha_message = rand_str()
         image = ImageCaptcha()
-        image.write(
-            captchaMessage,
+        await asyncio.to_thread(
+            image.write,
+            captcha_message,
             f"./resources/temp/captcha_{ctx.author.id}_{ctx.guild.id}.jpg",
         )
         f = discord.File(
@@ -4582,66 +3384,31 @@ targeted attacks using automated user accounts.""",
         e.set_image(url="attachment://captcha.png")
         try:
             await ctx.author.send(file=f, embed=e)
-        except:
+        except Exception:
             f = discord.File("./resources/common/dmEnable.jpg", filename="dmEnable.jpg")
-            e = discord.Embed(title=f"Dms disabled")
+            e = discord.Embed(title="Dms disabled")
             e.add_field(
                 name="Command author", value=f"{ctx.author.mention}", inline=False
             )
             e.set_image(url="attachment://dmEnable.jpg")
-            mentionMes = await ctx.send(ctx.author.mention, ephemeral=True)
+            mention_mes = await ctx.send(ctx.author.mention, ephemeral=True)
             await asyncio.sleep(1)
-            await mentionMes.delete()
-            dmWarnings = await ctx.send(file=f, embed=e, ephemeral=True)
+            await mention_mes.delete()
+            dm_warnings = await ctx.send(file=f, embed=e, ephemeral=True)
             await asyncio.sleep(5)
-            await dmWarnings.delete()
+            await dm_warnings.delete()
             return
 
         def check(m):
             return ctx.author == m.author and not m.guild
 
         msg = await client.wait_for("message", check=check)
-        if msg.content == captchaMessage:
+        if msg.content == captcha_message:
             ea = discord.Embed(
                 title="Thank you for verifying!",
                 description=f"You have gained access to channels by getting verified in {ctx.guild}",
             )
-            ea.set_footer(
-                text="Want to invite this bot in your server? Checkout this link : https://discord.com/oauth2/authorize?client_id=1061480715172200498&permissions=2416012310&scope=bot."
-            )
-            async with pool.acquire() as con:
-                mutedlist = await con.fetchrow(
-                    f"SELECT * FROM mutedusers where userid = {ctx.author.id} AND guildid = {ctx.guild.id}"
-                )
-            async with pool.acquire() as con:
-                blacklistedlist = await con.fetchrow(
-                    f"SELECT * FROM blacklistedusers where userid = {ctx.author.id} AND guildid = {ctx.guild.id}"
-                )
             warning = ""
-            if mutedlist is not None:
-                await ctx.author.send(
-                    "I couldn't verify you as you have active punishments : `mute`"
-                )
-                warning = "due to active punishments : `mute`"
-                await loginfo(
-                    ctx.guild,
-                    "Verification logging",
-                    "** **",
-                    f"{ctx.author.mention} couldn't complete captcha verification at <t:{int(time.time())}:R> {warning}.",
-                )
-                return
-            if blacklistedlist is not None:
-                await ctx.author.send(
-                    "I couldn't verify you as you have active punishments : `blacklist`"
-                )
-                warning = "due to active punishments : `blacklist`"
-                await loginfo(
-                    ctx.guild,
-                    "Verification logging",
-                    "** **",
-                    f"{ctx.author.mention} couldn't complete captcha verification at <t:{int(time.time())}:R> {warning}.",
-                )
-                return
             if newaccount(ctx.author):
                 warning = "(:octagonal_sign: New account)"
             await loginfo(
@@ -4653,14 +3420,15 @@ targeted attacks using automated user accounts.""",
             await ctx.author.send(embed=ea)
             try:
                 await ctx.author.add_roles(verifyrole)
-            except:
-                await send_generic_error_embed(ctx, error_data=
-                    f"I don't have permissions to add the verify role ({verifyrole.mention}) to {ctx.author.mention}."
+            except Exception:
+                await send_generic_error_embed(
+                    ctx,
+                    error_data=f"I don't have permissions to add the verify role ({verifyrole.mention}) to {ctx.author.mention}.",
                 )
                 return
         else:
             await ctx.author.send(
-                f"The captcha entered is invalid , regenerate a new captcha for verification."
+                "The captcha entered is invalid , regenerate a new captcha for verification."
             )
 
 
@@ -4678,16 +3446,16 @@ class MinecraftFun(commands.Cog):
     async def balance(self, ctx, member: discord.Member = None):
         if member is None:
             member = ctx.author
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             memberoneeco = await con.fetchrow(
-                f"SELECT * FROM mceconomy WHERE memberid = {member.id}"
+                "SELECT * FROM mceconomy WHERE memberid = $1", member.id
             )
         if memberoneeco is not None:
             oldbalance = memberoneeco["balance"]
         else:
             statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
             newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, member.id, 1500, json.dumps(newjson))
             oldbalance = 1500
         embed = discord.Embed(
@@ -4704,18 +3472,18 @@ class MinecraftFun(commands.Cog):
     )
     @commands.guild_only()
     async def voterewardweekly(self, ctx):
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             memberoneeco = await con.fetchrow(
-                f"SELECT * FROM mceconomy WHERE memberid = {ctx.author.id}"
+                "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
             )
         if memberoneeco is None:
             statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
             newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.author.id, 1500, json.dumps(newjson))
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 memberoneeco = await con.fetchrow(
-                    f"SELECT * FROM mceconomy WHERE memberid = {ctx.author.id}"
+                    "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
                 )
         if await uservoted(ctx.author) or checkstaff(ctx.author):
             await ctx.send(
@@ -4725,7 +3493,9 @@ class MinecraftFun(commands.Cog):
             await addmoney(ctx, ctx.author.id, 1500)
         else:
             ctx.command.reset_cooldown(ctx)
-            await send_generic_error_embed(ctx, error_data="You have not voted for this bot on top.gg!")
+            await send_generic_error_embed(
+                ctx, error_data="You have not voted for this bot on top.gg!"
+            )
             return
 
     @commands.cooldown(1, 43200, BucketType.member)
@@ -4737,18 +3507,18 @@ class MinecraftFun(commands.Cog):
     )
     @commands.guild_only()
     async def votereward(self, ctx):
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             memberoneeco = await con.fetchrow(
-                f"SELECT * FROM mceconomy WHERE memberid = {ctx.author.id}"
+                "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
             )
         if memberoneeco is None:
             statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
             newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.author.id, 1500, json.dumps(newjson))
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 memberoneeco = await con.fetchrow(
-                    f"SELECT * FROM mceconomy WHERE memberid = {ctx.author.id}"
+                    "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
                 )
         if uservoted(ctx.author) or checkstaff(ctx.author):
             await ctx.send(
@@ -4757,8 +3527,12 @@ class MinecraftFun(commands.Cog):
             await addmoney(ctx, ctx.author.id, 150)
         else:
             ctx.command.reset_cooldown(ctx)
-            await send_generic_error_embed(ctx, error_data=
-                "You have not voted for this bot on top.gg!\nVoting sites:https://top.gg/bot/1061480715172200498/vote"
+            await send_generic_error_embed(
+                ctx,
+                error_data=(
+                    "You have not voted for this bot on top.gg.\n"
+                    f"Vote at https://top.gg/bot/{client.user.id}/vote"
+                ),
             )
             return
 
@@ -4773,11 +3547,15 @@ class MinecraftFun(commands.Cog):
     async def payment(self, ctx, price: int, member: discord.Member):
         try:
             price = int(price)
-        except:
-            await send_generic_error_embed(ctx, error_data="Enter a valid number to pay.")
+        except Exception:
+            await send_generic_error_embed(
+                ctx, error_data="Enter a valid number to pay."
+            )
             return
         if price <= 0:
-            await send_generic_error_embed(ctx, error_data=" You cannot pay a negative/zero amount.")
+            await send_generic_error_embed(
+                ctx, error_data=" You cannot pay a negative/zero amount."
+            )
             return
         await addmoney(ctx, ctx.author.id, (-1 * price))
         await addmoney(ctx, member.id, price)
@@ -4800,34 +3578,34 @@ class MinecraftFun(commands.Cog):
         embed = discord.Embed(
             title=f"{member.name}'s Minecraft inventory", description="** **"
         )
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             memberoneeco = await con.fetchrow(
-                f"SELECT * FROM mceconomy WHERE memberid = {member.id}"
+                "SELECT * FROM mceconomy WHERE memberid = $1", member.id
             )
         if memberoneeco is None:
             statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
             newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, member.id, 1500, json.dumps(newjson))
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 memberoneeco = await con.fetchrow(
-                    f"SELECT * FROM mceconomy WHERE memberid = {member.id}"
+                    "SELECT * FROM mceconomy WHERE memberid = $1", member.id
                 )
         orechoiceemoji = {
-            "Netherite": "<:NetheriteArmor:891651573464318032>",
-            "Diamond": "<:DiamondArmor:891651573569163345>",
-            "Iron": "<:IronArmor:891651573657251870>",
-            "Leather": "<:LeatherArmor:891651573481107506>",
-            "Chainmail": "<:ChainmailArmor:891651573787279380>",
-            "Golden": "<:GoldArmor:891651573535637584>",
+            "Netherite": "🛡️",
+            "Diamond": "🛡️",
+            "Iron": "🛡️",
+            "Leather": "🛡️",
+            "Chainmail": "🛡️",
+            "Golden": "🛡️",
         }
         swordchoiceemoji = {
-            "Netherite": "<:NetheriteSword:891651573325893683>",
-            "Diamond": "<:DiamondSword:891651573669855282>",
-            "Iron": "<:IronSword:891651573397200907>",
-            "Stone": "<:StoneSword:891651573858566174>",
-            "Golden": "<:GoldenSword:891651573627908126>",
-            "Wooden": "<:WoodenSword:891651573674041365>",
+            "Netherite": "⚔️",
+            "Diamond": "⚔️",
+            "Iron": "⚔️",
+            "Stone": "⚔️",
+            "Golden": "⚔️",
+            "Wooden": "⚔️",
         }
         inventory = json.loads(memberoneeco["inventory"])
         armorname = inventory["orechoice"]
@@ -4846,14 +3624,14 @@ class MinecraftFun(commands.Cog):
     )
     @commands.guild_only()
     async def shop(self, ctx):
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             memberoneeco = await con.fetchrow(
-                f"SELECT * FROM mceconomy WHERE memberid = {ctx.author.id}"
+                "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
             )
         if memberoneeco is None:
             statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
             newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.author.id, 1500, json.dumps(newjson))
         embed = discord.Embed(
             title="Minecraft shop",
@@ -4870,7 +3648,6 @@ class MinecraftFun(commands.Cog):
     )
     @commands.guild_only()
     async def pvp(self, ctx, member: discord.Member, vhc: discord.VoiceChannel = None):
-        global leaderBoard
         if member == ctx.author:
             await ctx.send(
                 "Trying to battle yourself will only have major consequences !",
@@ -4890,54 +3667,54 @@ class MinecraftFun(commands.Cog):
         elif ctx.voice_client.is_playing():
             ctx.voice_client.stop()
         vc = ctx.voice_client
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             memberoneeco = await con.fetchrow(
-                f"SELECT * FROM mceconomy WHERE memberid = {ctx.author.id}"
+                "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
             )
         if memberoneeco is None:
             statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
             newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.author.id, 1500, json.dumps(newjson))
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 memberoneeco = await con.fetchrow(
-                    f"SELECT * FROM mceconomy WHERE memberid = {ctx.author.id}"
+                    "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
                 )
         memberoneinv = json.loads(memberoneeco["inventory"])
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             membertwoeco = await con.fetchrow(
-                f"SELECT * FROM mceconomy WHERE memberid = {member.id}"
+                "SELECT * FROM mceconomy WHERE memberid = $1", member.id
             )
         if membertwoeco is None:
             statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
             newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, member.id, 1500, json.dumps(newjson))
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 membertwoeco = await con.fetchrow(
-                    f"SELECT * FROM mceconomy WHERE memberid = {member.id}"
+                    "SELECT * FROM mceconomy WHERE memberid = $1", member.id
                 )
         membertwoinv = json.loads(membertwoeco["inventory"])
-        selfCombat = False
+        self_combat = False
         if client.user.id == member.id:
-            selfCombat = True
+            self_combat = True
         orechoice = ["Netherite", "Diamond", "Iron", "Leather", "Chainmail", "Golden"]
         orechoiceemoji = {
-            "Netherite": "<:NetheriteArmor:891651573464318032>",
-            "Diamond": "<:DiamondArmor:891651573569163345>",
-            "Iron": "<:IronArmor:891651573657251870>",
-            "Leather": "<:LeatherArmor:891651573481107506>",
-            "Chainmail": "<:ChainmailArmor:891651573787279380>",
-            "Golden": "<:GoldArmor:891651573535637584>",
+            "Netherite": "🛡️",
+            "Diamond": "🛡️",
+            "Iron": "🛡️",
+            "Leather": "🛡️",
+            "Chainmail": "🛡️",
+            "Golden": "🛡️",
         }
         swordchoice = ["Netherite", "Diamond", "Iron", "Stone", "Golden", "Wooden"]
         swordchoiceemoji = {
-            "Netherite": "<:NetheriteSword:891651573325893683>",
-            "Diamond": "<:DiamondSword:891651573669855282>",
-            "Iron": "<:IronSword:891651573397200907>",
-            "Stone": "<:StoneSword:891651573858566174>",
-            "Golden": "<:GoldenSword:891651573627908126>",
-            "Wooden": "<:WoodenSword:891651573674041365>",
+            "Netherite": "⚔️",
+            "Diamond": "⚔️",
+            "Iron": "⚔️",
+            "Stone": "⚔️",
+            "Golden": "⚔️",
+            "Wooden": "⚔️",
         }
         armorresist = [85.0, 75.0, 55.0, 28.0, 45.0, 40.0]
         swordattack = [12.0, 10.0, 9.0, 8.0, 8.5, 5.0]
@@ -4952,14 +3729,12 @@ class MinecraftFun(commands.Cog):
             f"was too weak for battling {ctx.author.mention}.",
             f"was scared of fighting {ctx.author.mention}.",
         ]
-        if not selfCombat:
+        if not self_combat:
             embed = discord.Embed(
                 title="Pvp invitation",
                 description=f"{memberone.mention}(Challenger) vs {membertwo.mention}",
             )
-            embed.set_thumbnail(
-                url="https://cdn.discordapp.com/avatars/841268437824045096/2197577ab3bcee324b2e58bd3a1e3248.png?size=1024"
-            )
+            embed.set_thumbnail(url=memberone.display_avatar.url)
             view = Confirmpvp(member=membertwo.id)
             view.set_message(
                 statmsg := await ctx.send(embed=embed, view=view, ephemeral=True)
@@ -4969,7 +3744,7 @@ class MinecraftFun(commands.Cog):
                 try:
                     await statmsg.reply(f"{membertwo.name} {random.choice(escapelist)}")
                     return
-                except:
+                except Exception:
                     pass
             elif view.value:
                 await statmsg.reply("Ok this fight has been accepted , lets start!")
@@ -4996,17 +3771,15 @@ class MinecraftFun(commands.Cog):
             title="Pvp challenge",
             description=f"`{memberone.name}(Challenger) vs {membertwo.name}`",
         )
-        embed.set_thumbnail(
-            url="https://cdn.discordapp.com/avatars/841268437824045096/2197577ab3bcee324b2e58bd3a1e3248.png?size=1024"
-        )
+        embed.set_thumbnail(url=memberone.display_avatar.url)
         embed.add_field(
             name=f"{memberone.name}'s health ({memberone_healthpoint} ❤️)",
-            value=getProgress(100),
+            value=get_progress(100),
             inline=False,
         )
         embed.add_field(
             name=f"{membertwo.name}'s health ({membertwo_healthpoint} ❤️)",
-            value=getProgress(100),
+            value=get_progress(100),
             inline=False,
         )
         embed.add_field(
@@ -5033,7 +3806,7 @@ class MinecraftFun(commands.Cog):
             if vc.is_playing():
                 vc.stop()
             vc.play(discord.FFmpegPCMAudio("./resources/pvp/Firework_twinkle_far.ogg"))
-        except:
+        except Exception:
             pass
         await ctx.send(
             content=f"{memberone.mention}'s turn to fight!",
@@ -5062,37 +3835,37 @@ class MinecraftFun(commands.Cog):
     )
     @commands.guild_only()
     async def pvpleaderboard(self, ctx):
-        async with pool.acquire() as con:
-            leaderBoard = await con.fetch(f"SELECT * FROM leaderboard")
-        countPoint = []
-        countNames = []
-        countDictionary = Counter(leaderBoard)
-        for member in leaderBoard:
-            if not member in countNames:
-                countNames.append(member)
-                countPoint.append(int(countDictionary[member]))
-        sortedPoint = sorted(countPoint, reverse=True)
-        sortedNames = []
-        for point in sortedPoint:
-            indexName = countPoint.index(point)
-            countPoint[indexName] = -1
-            sortedNames.append(countNames[indexName])
+        async with client.database.pool.acquire() as con:
+            leader_board = await con.fetch("SELECT * FROM leaderboard")
+        count_point = []
+        count_names = []
+        count_dictionary = Counter(leader_board)
+        for member in leader_board:
+            if member not in count_names:
+                count_names.append(member)
+                count_point.append(int(count_dictionary[member]))
+        sorted_point = sorted(count_point, reverse=True)
+        sorted_names = []
+        for point in sorted_point:
+            index_name = count_point.index(point)
+            count_point[index_name] = -1
+            sorted_names.append(count_names[index_name])
 
-        embedOne = discord.Embed(
-            title="Battle leaderboard", description=f"Season one", color=Color.green()
+        embed_one = discord.Embed(
+            title="Battle leaderboard", description="Season one", color=Color.green()
         )
         postfix = ["st", "nd", "rd", "th", "th", "th", "th", "th", "th", "th"]
         for i in range(10):
             try:
-                name = sortedNames[i]["mention"]
-            except:
+                name = sorted_names[i]["mention"]
+            except Exception:
                 name = "- - -"
-            embedOne.add_field(
+            embed_one.add_field(
                 name=str(i + 1) + f"{postfix[i]} member",
                 value=f"<@{name}>",
                 inline=False,
             )
-        await ctx.send(embed=embedOne, ephemeral=True)
+        await ctx.send(embed=embed_one, ephemeral=True)
 
     @commands.cooldown(1, 120, BucketType.member)
     @commands.hybrid_command(
@@ -5102,41 +3875,30 @@ class MinecraftFun(commands.Cog):
     )
     @commands.guild_only()
     async def mcservercheck(self, ctx, ip: str):
-        server = JavaServer.lookup(ip)
         try:
-            status = server.status()
-        except:
-            embedOne = discord.Embed(title=ip, description="** **", color=Color.red())
-            embedOne.add_field(name="Server Status ", value=" Offline ", inline=True)
-            await ctx.send(embed=embedOne, ephemeral=True)
+            server = await JavaServer.async_lookup(ip)
+            status = await server.async_status()
+        except Exception:
+            embed_one = discord.Embed(title=ip, description="** **", color=Color.red())
+            embed_one.add_field(name="Server Status ", value=" Offline ", inline=True)
+            await ctx.send(embed=embed_one, ephemeral=True)
             return
-        limit = 50
-        try:
-            descriptiondict = status.description[0]
-        except:
-            try:
-                descriptiondict = status.description["extra"][0]["extra"][0]["text"]
-            except:
-                descriptiondict = ""
-        data = descriptiondict
-        info = data[:limit] + ".."
-        embedOne = discord.Embed(title=f"{ip}", description=info, color=Color.green())
+        description = status.motd.to_plain()
+        info = description[:50] + (".." if len(description) > 50 else "")
+        embed_one = discord.Embed(title=f"{ip}", description=info, color=Color.green())
 
-        embedOne.add_field(
+        embed_one.add_field(
             name="Server Version ", value=f"{status.version.name}", inline=True
         )
-        try:
-            latency = server.ping()
-        except:
-            latency = "Unknown ping"
-        embedOne.add_field(name="Server Latency ", value=latency, inline=True)
-        embedOne.add_field(
+        latency = f"{status.latency:.1f} ms"
+        embed_one.add_field(name="Server Latency ", value=latency, inline=True)
+        embed_one.add_field(
             name="Players Online ", value=status.players.online, inline=True
         )
-        ipmessagesent = await ctx.send(embed=embedOne, ephemeral=True)
+        await ctx.send(embed=embed_one, ephemeral=True)
 
 
-def listToString(s):
+def list_to_string(s):
     # initialize an empty string
     str1 = ""
 
@@ -5148,134 +3910,7 @@ def listToString(s):
     return str2
 
 
-tokens = (
-    "NAME",
-    "NUMBER",
-    "PLUS",
-    "MINUS",
-    "TIMES",
-    "DIVIDE",
-    "EQUALS",
-    "LPAREN",
-    "RPAREN",
-)
-
-# Tokens
-
-t_PLUS = r"\+"
-t_MINUS = r"-"
-t_TIMES = r"\*"
-t_DIVIDE = r"/"
-t_EQUALS = r"="
-t_LPAREN = r"\("
-t_RPAREN = r"\)"
-t_NAME = r"[a-zA-Z_][a-zA-Z0-9_]*"
-
-
-def t_NUMBER(t):
-    r"\d+"
-    try:
-        t.value = int(t.value)
-    except ValueError:
-        logging.log(logging.ERROR, "T-Integer value too large %d", t.value)
-        t.value = 0
-
-    return t
-
-
-# Ignored characters
-t_ignore = " \t"
-
-
-def t_newline(t):
-    r"\n+"
-    t.lexer.lineno += t.value.count("\n")
-
-
-def t_error(t):
-    logging.log(logging.ERROR, "T-Illegal character '%s'" % t.value[0])
-    t.lexer.skip(1)
-    return
-
-
-# Build the lexer
-
-lexer = lex.lex()
-
-# Parsing rules
-
-precedence = (
-    ("left", "PLUS", "MINUS"),
-    ("left", "TIMES", "DIVIDE"),
-    ("right", "UMINUS"),
-)
-
-# dictionary of names
-names = {}
-
-
-def p_statement_assign(t):
-    "statement : NAME EQUALS expression"
-    names[t[1]] = t[3]
-
-
-def p_statement_expr(t):
-    "statement : expression"
-    print(t[1])
-
-
-def p_expression_binop(t):
-    """expression : expression PLUS expression
-    | expression MINUS expression
-    | expression TIMES expression
-    | expression DIVIDE expression"""
-    if t[2] == "+":
-        t[0] = t[1] + t[3]
-    elif t[2] == "-":
-        t[0] = t[1] - t[3]
-    elif t[2] == "*":
-        t[0] = t[1] * t[3]
-    elif t[2] == "/":
-        t[0] = t[1] / t[3]
-
-
-def p_expression_uminus(t):
-    "expression : MINUS expression %prec UMINUS"
-    t[0] = -t[2]
-
-
-def p_expression_group(t):
-    "expression : LPAREN expression RPAREN"
-    t[0] = t[2]
-
-
-def p_expression_number(t):
-    "expression : NUMBER"
-    t[0] = t[1]
-
-
-def p_expression_name(t):
-    "expression : NAME"
-    try:
-        t[0] = names[t[1]]
-    except LookupError:
-        logging.log(logging.ERROR, "Undefined name '%s'" % t[1])
-        t[0] = 0
-
-
-def p_error(t):
-    if t is None:
-        logging.log(logging.ERROR, "Something unexpected occured.")
-        return
-    logging.log(logging.ERROR, "Syntax error at '%s'" % t.value)
-    return
-
-
-parser = yacc.yacc()
-browser = None
-
-
-def drawProgressBar(d, x, y, w, h, progress, bg=(127, 127, 127), fg=(0, 125, 232)):
+def draw_progress_bar(d, x, y, w, h, progress, bg=(127, 127, 127), fg=(0, 125, 232)):
     # draw background
     d.ellipse((x + w, y, x + h + w, y + h), fill=bg)
     d.ellipse((x, y, x + h, y + h), fill=bg)
@@ -5290,137 +3925,17 @@ def drawProgressBar(d, x, y, w, h, progress, bg=(127, 127, 127), fg=(0, 125, 232
     return d
 
 
-def getCount(e):
+def get_count(e):
     return e["count"]
 
 
-async def api_take_screenshot(ctx, url, save_fn="capture.png"):
-    apiurl = f"https://screenshot.webdashboard.repl.co/screenshot?url={url}"
-    session = client.session
-    async with session.get(apiurl) as response:
-        if response.status != 200:
-            if response.status == 429:
-                await send_generic_error_embed(ctx, error_data=
-                    "The screenshot couldn't be taken due to rate-limiting!"
-                )
-                return
-            elif response.status == 400:
-                await send_generic_error_embed(ctx, error_data=
-                    "The screenshot couldn't be taken due to an invalid URL!"
-                )
-                return
-            elif response.status == 523:
-                await send_generic_error_embed(ctx, error_data=
-                    "The screenshot couldn't be taken due to connection refusal!"
-                )
-                return
-            elif response.status == 451:
-                await send_generic_error_embed(ctx, error_data=
-                    "The screenshot couldn't be taken due to unacceptable content!"
-                )
-                return
-            else:
-                await send_generic_error_embed(ctx, error_data=
-                    f"The screenshot couldn't be taken due to {response.reason}!"
-                )
-                return
-        bytesRead = await response.read()
-        with open(save_fn, "wb") as out_file:
-            out_file.write(bytesRead)
-        my_file = discord.File(save_fn)
-        return my_file
-
-
-async def take_quick_screenshot(ctx, url, save_fn="capture.png"):
-    apiurl = f"https://api.popcat.xyz/screenshot?url={url}"
-    session = client.session
-    async with session.get(apiurl) as response:
-        if response.status != 200:
-            if response.status == 429:
-                await send_generic_error_embed(ctx, error_data=
-                    "The screenshot couldn't be taken due to rate-limiting!"
-                )
-                return
-            elif response.status == 400:
-                await send_generic_error_embed(ctx, error_data=
-                    "The screenshot couldn't be taken due to an invalid URL!"
-                )
-                return
-            elif response.status == 523:
-                await send_generic_error_embed(ctx, error_data=
-                    "The screenshot couldn't be taken due to connection refusal!"
-                )
-                return
-            elif response.status == 451:
-                await send_generic_error_embed(ctx, error_data=
-                    "The screenshot couldn't be taken due to unacceptable content!"
-                )
-                return
-            else:
-                await send_generic_error_embed(ctx, error_data=
-                    f"The screenshot couldn't be taken due to {response.reason}!"
-                )
-                return
-        bytesRead = await response.read()
-        with open(save_fn, "wb") as out_file:
-            out_file.write(bytesRead)
-        my_file = discord.File(save_fn)
-        return my_file
-
-
-async def take_screenshot(ctx, url, save_fn="capture.png"):
-    global browser
-    if browser is None:
-        return await api_take_screenshot(ctx, url, save_fn)
-    if not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
-    try:
-        browser.get(url)
-    except Exception as ex:
-        if isinstance(ex, selenium.common.exceptions.WebDriverException):
-            await send_generic_error_embed(ctx, error_data=
-                "The url provided to take a screenshot was invalid!"
-            )
-            return
-        elif isinstance(ex, selenium.common.exceptions.InvalidSessionIdException):
-            options = webdriver.ChromeOptions()
-            options.add_argument("--headless")
-            options.add_argument("window-size=1400,1500")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--no-sandbox")
-            options.add_argument("start-maximized")
-            options.add_argument("enable-automation")
-            options.add_argument("--disable-infobars")
-            options.add_argument("--disable-dev-shm-usage")
-            browser = webdriver.Chrome(options=options)
-            await take_screenshot(ctx, url)
-            return
-        else:
-            raise ex
-            return
-    try:
-        browser.save_screenshot(save_fn)
-    except:
-        await send_generic_error_embed(ctx, error_data=
-            "The url requested didn't load up properly and crashed!"
-        )
-        return
-    my_file = discord.File(save_fn)
-    return my_file
-
-
-
-
-
-class PaginateFileEmbed(discord.ui.View):
-    def __init__(self, embeds, files):
+class PaginateEmbed(discord.ui.View):  # EMBED PAGINATOR
+    def __init__(self, embeds):
         super().__init__(timeout=120)
         self.count = 0
         self.embed = embeds[self.count]
         self.limit = len(embeds) - 1
         self.embeds = embeds
-        self.file = files[self.count]
-        self.files = files
         self._message = None
 
     def set_message(self, _message):
@@ -5431,6 +3946,23 @@ class PaginateFileEmbed(discord.ui.View):
             child.disabled = True
         await self._message.edit(view=self)
 
+    @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.green)
+    async def firstmove(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.defer()
+        self.count = 0
+        self.embed = self.embeds[self.count]
+        try:
+            if isinstance(self._message, discord.InteractionResponse):
+                await self._message.edit_message(embed=self.embed)
+            elif isinstance(self._message, discord.Interaction):
+                await self._message.edit_original_response(embed=self.embed)
+            else:
+                await self._message.edit(embed=self.embed)
+        except Exception:
+            pass
+
     @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.green)
     async def leftmove(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -5439,12 +3971,31 @@ class PaginateFileEmbed(discord.ui.View):
         if not self.count == 0:
             self.count = self.count - 1
         self.embed = self.embeds[self.count]
-        self.file = self.files[self.count]
         try:
-            await self._message.edit(embed=self.embed, attachments=[], file=self.file)
-        except:
+            if isinstance(self._message, discord.InteractionResponse):
+                await self._message.edit_message(embed=self.embed)
+            elif isinstance(self._message, discord.Interaction):
+                await self._message.edit_original_response(embed=self.embed)
+            else:
+                await self._message.edit(embed=self.embed)
+        except Exception:
             pass
-        self.files[self.count] = discord.File(self.files[self.count].filename)
+
+    @discord.ui.button(emoji="🛑", style=discord.ButtonStyle.green)
+    async def stopmove(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.defer()
+        if isinstance(self._message, discord.InteractionResponse):
+            try:
+                await self._message.edit_message(view=None)
+            except Exception:
+                pass
+        elif isinstance(self._message, discord.Interaction):
+            await self._message.delete_original_message()
+        else:
+            await self._message.edit(view=None)
+        self.stop()
 
     @discord.ui.button(emoji="➡️", style=discord.ButtonStyle.green)
     async def rightmove(
@@ -5454,12 +4005,32 @@ class PaginateFileEmbed(discord.ui.View):
         if not self.count == self.limit:
             self.count = self.count + 1
         self.embed = self.embeds[self.count]
-        self.file = self.files[self.count]
         try:
-            await self._message.edit(embed=self.embed, attachments=[], file=self.file)
-        except:
+            if isinstance(self._message, discord.InteractionResponse):
+                await self._message.edit_message(embed=self.embed)
+            elif isinstance(self._message, discord.Interaction):
+                await self._message.edit_original_response(embed=self.embed)
+            else:
+                await self._message.edit(embed=self.embed)
+        except Exception:
             pass
-        self.files[self.count] = discord.File(self.files[self.count].filename)
+
+    @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.green)
+    async def lastmove(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.defer()
+        self.count = self.limit
+        self.embed = self.embeds[self.count]
+        try:
+            if isinstance(self._message, discord.InteractionResponse):
+                await self._message.edit_message(embed=self.embed)
+            elif isinstance(self._message, discord.Interaction):
+                await self._message.edit_original_response(embed=self.embed)
+            else:
+                await self._message.edit(embed=self.embed)
+        except Exception:
+            pass
 
 
 class Leveling(commands.Cog):
@@ -5478,14 +4049,15 @@ class Leveling(commands.Cog):
     ):
         try:
             messagecount = int(messagecount)
-        except:
-            await send_generic_error_embed(ctx, error_data=
-                "Enter a valid number to set message per level count."
+        except Exception:
+            await send_generic_error_embed(
+                ctx, error_data="Enter a valid number to set message per level count."
             )
             return
         if messagecount < 20:
-            await send_generic_error_embed(ctx, error_data=
-                "You cannot set the message per level requirement to below 20 messages."
+            await send_generic_error_embed(
+                ctx,
+                error_data="You cannot set the message per level requirement to below 20 messages.",
             )
             return
         if channels is None:
@@ -5493,18 +4065,20 @@ class Leveling(commands.Cog):
         else:
             channels = [channels]
         for ch in channels:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 levelconfiglist = await con.fetchrow(
-                    f"SELECT * FROM levelconfig WHERE channelid = {ch.id}"
+                    "SELECT * FROM levelconfig WHERE channelid = $1", ch.id
                 )
             if levelconfiglist is None:
                 statement = """INSERT INTO levelconfig (channelid,messagecount) VALUES($1,$2);"""
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(statement, ch.id, messagecount)
             else:
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(
-                        f"UPDATE levelconfig VALUES SET messagecount = {messagecount} WHERE channelid = {ch.id}"
+                        "UPDATE levelconfig SET messagecount = $1 WHERE channelid = $2",
+                        messagecount,
+                        ch.id,
                     )
         await ctx.send(
             f"Successfully set {messagecount} per level for the provided channels.",
@@ -5522,36 +4096,37 @@ class Leveling(commands.Cog):
         check_ensure_permissions(ctx, ctx.guild.me, ["attach_files"])
         if member is None:
             member = ctx.author
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             warninglist = await con.fetchrow(
-                f"SELECT * FROM levelsettings WHERE channelid = {ctx.channel.id}"
+                "SELECT * FROM levelsettings WHERE channelid = $1", ctx.channel.id
             )
         try:
             prefix = ctx.prefix
-        except:
+        except Exception:
             prefix = "/"
         if warninglist is None:
             statement = (
                 """INSERT INTO levelsettings (channelid,setting) VALUES($1,$2);"""
             )
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.channel.id, True)
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 warninglist = await con.fetchrow(
-                    f"SELECT * FROM levelsettings WHERE channelid = {ctx.channel.id}"
+                    "SELECT * FROM levelsettings WHERE channelid = $1", ctx.channel.id
                 )
             await ctx.send(
                 f"Alert: leveling was automatically enabled in this channel, do {prefix}leveltoggle to turn off leveling!",
                 ephemeral=True,
             )
         if not warninglist["setting"]:
-            await send_generic_error_embed(ctx, error_data=
-                f"The leveling setting has been disabled in this channel , do {prefix}leveltoggle to turn on leveling."
+            await send_generic_error_embed(
+                ctx,
+                error_data=f"The leveling setting has been disabled in this channel , do {prefix}leveltoggle to turn on leveling.",
             )
             return
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             levellist = await con.fetch(
-                f"SELECT * FROM leveling WHERE guildid = {ctx.guild.id}"
+                "SELECT * FROM leveling WHERE guildid = $1", ctx.guild.id
             )
         memberlist = []
         for memberloop in levellist:
@@ -5559,23 +4134,23 @@ class Leveling(commands.Cog):
             jsonmember["name"] = memberloop["memberid"]
             jsonmember["count"] = memberloop["messagecount"]
             memberlist.append(jsonmember)
-        memberlist.sort(key=getCount, reverse=True)
+        memberlist.sort(key=get_count, reverse=True)
         count = 0
         topmember = []
         memberconv = commands.MemberConverter()
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             levelconfiglist = await con.fetchrow(
-                f"SELECT * FROM levelconfig WHERE channelid = {ctx.channel.id}"
+                "SELECT * FROM levelconfig WHERE channelid = $1", ctx.channel.id
             )
         if levelconfiglist is None:
             statement = (
                 """INSERT INTO levelconfig (channelid,messagecount) VALUES($1,$2);"""
             )
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.channel.id, 25)
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 levelconfiglist = await con.fetchrow(
-                    f"SELECT * FROM levelconfig WHERE channelid = {ctx.channel.id}"
+                    "SELECT * FROM levelconfig WHERE channelid = $1", ctx.channel.id
                 )
         levelmsgcount = levelconfiglist["messagecount"]
         for memberloop in memberlist:
@@ -5585,61 +4160,21 @@ class Leveling(commands.Cog):
                 jsonmember["name"] = tempobj.name
                 jsonmember["level"] = memberloop["count"] // levelmsgcount
                 asset = tempobj.display_avatar.with_size(128)
-                data = BytesIO(await asset.read())
-                pfp = Image.open(data)
-                pfp = pfp.resize((100, 100))
-                jsonmember["avatar"] = pfp
+                jsonmember["avatar_bytes"] = await asset.read()
                 topmember.append(jsonmember)
                 count = count + 1
-            except:
+            except Exception:
                 pass
             if count == 5:
                 break
         if len(topmember) < 5:
-            await send_generic_error_embed(ctx, error_data=f"Not enough members to show a leaderboard!")
+            await send_generic_error_embed(
+                ctx, error_data="Not enough members to show a leaderboard!"
+            )
             return
-        coords = {
-            0: (52, 5),
-            1: (290, 5),
-            2: (512, 5),
-            3: (729, 5),
-            4: (962, 5),
-        }
-        levelcoords = {
-            0: (86, 158),
-            1: (339, 157),
-            2: (555, 158),
-            3: (783, 158),
-            4: (1014, 157),
-        }
-        rankcoords = {
-            0: (86, 196),
-            1: (339, 192),
-            2: (555, 196),
-            3: (783, 196),
-            4: (1014, 194),
-        }
-        namecoords = {
-            0: (25, 234),
-            1: (283, 237),
-            2: (500, 236),
-            3: (723, 241),
-            4: (954, 237),
-        }
-        imgbackground = Image.open("./resources/levelrank/background.jpg")
-        draw = ImageDraw.Draw(imgbackground)
-        font = ImageFont.truetype("./resources/common/consolasbold.ttf", 20)
-        for i in range(5):
-            draw.text(
-                levelcoords[i], str(topmember[i]["level"]), (0, 125, 232), font=font
-            )
-            draw.text(rankcoords[i], str(i + 1), (255, 255, 255), font=font)
-            draw.text(
-                namecoords[i], str(topmember[i]["name"]), (255, 255, 255), font=font
-            )
-            imgbackground.paste(topmember[i]["avatar"], coords[i])
-        imgbackground.save(f"./resources/temp/levelrank_{ctx.guild.id}.jpg")
-        file = discord.File(f"./resources/temp/levelrank_{ctx.guild.id}.jpg")
+        destination = f"./resources/temp/levelrank_{ctx.guild.id}.jpg"
+        await asyncio.to_thread(render_level_rank_image, topmember, destination)
+        file = discord.File(destination)
         embed = discord.Embed()
         embed.set_image(url=f"attachment://levelrank_{ctx.guild.id}.jpg")
         await ctx.send(file=file, embed=embed, ephemeral=True)
@@ -5656,36 +4191,37 @@ class Leveling(commands.Cog):
         check_ensure_permissions(ctx, ctx.guild.me, ["attach_files"])
         if member is None:
             member = ctx.author
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             warninglist = await con.fetchrow(
-                f"SELECT * FROM levelsettings WHERE channelid = {ctx.channel.id}"
+                "SELECT * FROM levelsettings WHERE channelid = $1", ctx.channel.id
             )
         try:
             prefix = ctx.prefix
-        except:
+        except Exception:
             prefix = "/"
         if warninglist is None:
             statement = (
                 """INSERT INTO levelsettings (channelid,setting) VALUES($1,$2);"""
             )
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.channel.id, True)
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 warninglist = await con.fetchrow(
-                    f"SELECT * FROM levelsettings WHERE channelid = {ctx.channel.id}"
+                    "SELECT * FROM levelsettings WHERE channelid = $1", ctx.channel.id
                 )
             await ctx.send(
                 f"Alert: leveling was automatically enabled in this channel, do {prefix}leveltoggle to turn off leveling!",
                 ephemeral=True,
             )
         if not warninglist["setting"]:
-            await send_generic_error_embed(ctx, error_data=
-                f"The leveling setting has been disabled in this channel , do {prefix}leveltoggle to turn on leveling."
+            await send_generic_error_embed(
+                ctx,
+                error_data=f"The leveling setting has been disabled in this channel , do {prefix}leveltoggle to turn on leveling.",
             )
             return
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             levellist = await con.fetch(
-                f"SELECT * FROM leveling WHERE guildid = {ctx.guild.id}"
+                "SELECT * FROM leveling WHERE guildid = $1", ctx.guild.id
             )
         memberlist = []
         for memberloop in levellist:
@@ -5693,7 +4229,7 @@ class Leveling(commands.Cog):
             jsonmember["name"] = memberloop["memberid"]
             jsonmember["count"] = memberloop["messagecount"]
             memberlist.append(jsonmember)
-        memberlist.sort(key=getCount, reverse=True)
+        memberlist.sort(key=get_count, reverse=True)
         count = 1
         rank = None
         msgcount = None
@@ -5704,47 +4240,38 @@ class Leveling(commands.Cog):
                 break
             count = count + 1
         if msgcount is None or rank is None:
-            await send_generic_error_embed(ctx, error_data=
-                "The user you requested doesn't have any levels (no messages sent)."
+            await send_generic_error_embed(
+                ctx,
+                error_data="The user you requested doesn't have any levels (no messages sent).",
             )
             return
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             levelconfiglist = await con.fetchrow(
-                f"SELECT * FROM levelconfig WHERE channelid = {ctx.channel.id}"
+                "SELECT * FROM levelconfig WHERE channelid = $1", ctx.channel.id
             )
         if levelconfiglist is None:
             statement = (
                 """INSERT INTO levelconfig (channelid,messagecount) VALUES($1,$2);"""
             )
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.channel.id, 25)
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 levelconfiglist = await con.fetchrow(
-                    f"SELECT * FROM levelconfig WHERE channelid = {ctx.channel.id}"
+                    "SELECT * FROM levelconfig WHERE channelid = $1", ctx.channel.id
                 )
         levelmsgcount = levelconfiglist["messagecount"]
-        imgbackground = Image.open("./resources/level/background.jpg")
-        asset = member.display_avatar
-        data = BytesIO(await asset.read())
-        pfp = Image.open(data)
-        pfp = pfp.resize((239, 222))
-        imgbackground.paste(pfp, (71, 43))
-        draw = ImageDraw.Draw(imgbackground)
-        font = ImageFont.truetype("./resources/common/consolasbold.ttf", 30)
-        draw.text((402, 123), member.name, (255, 255, 255), font=font)
-        draw.text((796, 29), str(rank), (255, 255, 255), font=font)
-        draw.text((1067, 25), str(msgcount // levelmsgcount), (0, 125, 232), font=font)
-        totallevel = ((msgcount // levelmsgcount) // 20 + 1) * 20
-        currentlevel = (msgcount // levelmsgcount) % 20
-        draw.text(
-            (1027, 122), f"{currentlevel}/{totallevel}", (240, 240, 240), font=font
+        avatar_bytes = await member.display_avatar.read()
+        destination = f"./resources/temp/level_{ctx.author.id}_{ctx.guild.id}.jpg"
+        await asyncio.to_thread(
+            render_level_image,
+            avatar_bytes,
+            member.name,
+            rank,
+            msgcount,
+            levelmsgcount,
+            destination,
         )
-        percentcomplete = currentlevel / totallevel
-        draw = drawProgressBar(draw, 401, 161, 737, 50, percentcomplete)
-        imgbackground.save(f"./resources/temp/level_{ctx.author.id}_{ctx.guild.id}.jpg")
-        file = discord.File(
-            f"./resources/temp/level_{ctx.author.id}_{ctx.guild.id}.jpg"
-        )
+        file = discord.File(destination)
         embed = discord.Embed()
         embed.set_image(url=f"attachment://level_{ctx.author.id}_{ctx.guild.id}.jpg")
         await ctx.send(file=file, embed=embed, ephemeral=True)
@@ -5764,1141 +4291,56 @@ class Leveling(commands.Cog):
             channels = [channel]
         embed = discord.Embed(title="Leveling settings")
         for channel in channels:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 warninglist = await con.fetchrow(
-                    f"SELECT * FROM levelsettings WHERE channelid = {channel.id}"
+                    "SELECT * FROM levelsettings WHERE channelid = $1", channel.id
                 )
             if warninglist is None:
                 statement = (
                     """INSERT INTO levelsettings (channelid,setting) VALUES($1,$2);"""
                 )
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(statement, channel.id, True)
                 embed.add_field(
-                    value=f"The levels setting for {channel.mention} was successfully set to {checkEmoji(True)}.",
+                    value=f"The levels setting for {channel.mention} was successfully set to {check_emoji(True)}.",
                     name="** **",
                 )
             else:
-                currentSet = warninglist["setting"]
-                newSet = not currentSet
+                current_set = warninglist["setting"]
+                new_set = not current_set
                 embed.add_field(
-                    value=f"The levels setting for {channel.mention} was successfully set to {checkEmoji(newSet)}.",
+                    value=f"The levels setting for {channel.mention} was successfully set to {check_emoji(new_set)}.",
                     name="** **",
                 )
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(
-                        f"UPDATE levelsettings VALUES SET setting = {newSet} WHERE channelid = {channel.id}"
+                        "UPDATE levelsettings SET setting = $1 WHERE channelid = $2",
+                        new_set,
+                        channel.id,
                     )
         await ctx.send(embed=embed, ephemeral=True)
 
 
-class Agent:
-    def __init__(self, name):
-        self.name = name
-        self.abilities = []
-
-    def __str__(self):
-        return self.name + " with abilities " + str(self.abilities)
-
-    def __repr__(self):
-        return self.name + " with abilities " + str(self.abilities)
-
-
-class Ability:
-    def __init__(self, name, cost):
-        self.name = name
-        self.cost = cost
-
-    def __str__(self):
-        return self.name + " with price $" + str(self.cost)
-
-    def __repr__(self):
-        return self.name + " with price $" + str(self.cost)
-
-
-class Weapon:
-    def __init__(self, name, cost):
-        self.name = name
-        self.cost = cost
-
-    def __str__(self):
-        return self.name + " with price $" + str(self.cost)
-
-    def __repr__(self):
-        return self.name + " with price $" + str(self.cost)
-
-
-class ValorantAPI:
-    def get_card_icon(self, cardId):
-        with open("./resources/valorant/player_card_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if i["uuid"] == cardId:
-                    return i["displayIcon"]
-
-    def get_formatted_queue_name(self, queueId):
-        validQueueNames = {
-            "competitive": "Competitive",
-            "custom": "Custom",
-            "": "Custom",
-            "deathmatch": "Deathmatch",
-            "ggteam": "Escalation",
-            "newmap": "Pearl",  # changes every new map
-            "onefa": "Replication",
-            "snowball": "Snowball Fight",
-            "spikerush": "SpikeRush",
-            "unrated": "Unrated",
-            "swiftplay": "Swift Play",
-        }
-        return validQueueNames[queueId]
-
-    def get_map_name_from_url(self, mapurl):
-        with open("./resources/valorant/map_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if mapurl == i["mapUrl"]:
-                    return i["displayName"]
-        return None
-
-    def get_map_thumbnail(self, mapname):
-        with open("./resources/valorant/map_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if mapname == i["displayName"]:
-                    return i["splash"]
-        return None
-
-    def get_map_display_icon(self, mapname):
-        with open("./resources/valorant/map_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if mapname == i["displayName"]:
-                    return i["displayIcon"]
-        return None
-
-    def get_map_mini_icon(self, mapname):
-        with open("./resources/valorant/map_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if mapname == i["displayName"]:
-                    return i["miniIcon"]
-        return None
-
-    def get_name_from_id(self, id):
-        with open("./resources/valorant/valorant_ids.json") as data_file:
-            datajson = json.load(data_file)
-            for category in datajson.keys():
-                for item in datajson[category]:
-                    if item["id"] == id:
-                        return item["name"]
-            return None
-
-    def get_map_x_multiplier(self, mapname):
-        with open("./resources/valorant/map_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if mapname == i["displayName"]:
-                    return i["xMultiplier"]
-        return None
-
-    def get_map_y_multiplier(self, mapname):
-        with open("./resources/valorant/map_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if mapname == i["displayName"]:
-                    return i["yMultiplier"]
-        return None
-
-    def get_map_x_scalar(self, mapname):
-        with open("./resources/valorant/map_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if mapname == i["displayName"]:
-                    return i["xScalarToAdd"]
-        return None
-
-    def get_map_y_scalar(self, mapname):
-        with open("./resources/valorant/map_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if mapname == i["displayName"]:
-                    return i["yScalarToAdd"]
-        return None
-
-    def get_agent_abilities(self, agentname):
-        jsongot = []
-        with open("./resources/valorant/agent_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if agentname == i["displayName"]:
-                    jsongot = i["abilities"]
-        newjson = {}
-        for jsonl in jsongot:
-            if jsonl["slot"] == "Ability1":
-                newjson["Ability1"] = jsonl["displayName"]
-            if jsonl["slot"] == "Ability2":
-                newjson["Ability2"] = jsonl["displayName"]
-            if jsonl["slot"] == "Grenade":
-                newjson["Grenade"] = jsonl["displayName"]
-            if jsonl["slot"] == "Ultimate":
-                newjson["Ultimate"] = jsonl["displayName"]
-        return newjson
-
-    def get_agent_thumbnail(self, agentname):
-        with open("./resources/valorant/agent_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if agentname == i["displayName"]:
-                    return i["displayIconSmall"]
-
-    def get_agent_from_id(self, id):
-        with open("./resources/valorant/agent_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if id == i["uuid"]:
-                    return i["displayName"]
-
-    def get_agents_abilities(self):
-        agents = []
-        with open("./resources/valorant/agent_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                currentagent = Agent(i["displayName"])
-                for j in i["abilities"]:
-                    if j["slot"] == "Ultimate":
-                        continue
-                    currentagent.abilities.append(
-                        Ability(j["displayName"].capitalize(), j["price"])
-                    )
-                agents.append(currentagent)
-        return agents
-
-    def get_agent_ability(self, agentname):
-        with open("./resources/valorant/agent_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if i["displayName"] == agentname:
-                    currentagent = Agent(i["displayName"])
-                    for j in i["abilities"]:
-                        if j["slot"] == "Ultimate":
-                            continue
-                        if j["price"] == 0:
-                            continue
-                        currentagent.abilities.append(
-                            Ability(j["displayName"].capitalize(), j["price"])
-                        )
-                    return currentagent.abilities
-        return None
-
-    def get_weapon_prices(self):
-        weapons = []
-        with open("./resources/valorant/weapon_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if i["displayName"] == "Melee":
-                    continue
-                if i["shopData"]["cost"] == 0:
-                    continue
-                weapons.append(Weapon(i["displayName"], i["shopData"]["cost"]))
-        return weapons
-
-    def get_weapon_price(self, weaponname):
-        with open("./resources/valorant/weapon_info.json") as data_file:
-            datajson = json.load(data_file)
-            for i in datajson["data"]:
-                if i["displayName"] == weaponname:
-                    return Weapon(i["displayName"], i["shopData"]["cost"])
-        return None
-
-    def get_possible_weapons(self, pricelimit):
-        possibleweapons = []
-        weapons = self.get_weapon_prices()
-        for weapon in weapons:
-            if weapon.cost <= pricelimit:
-                possibleweapons.append(weapon)
-        return possibleweapons
-
-
-class Matches:
-    def __init__(self):
-        self.matchlist = []
-
-    def add_match(self, match):
-        self.matchlist.append(match)
-
-    def __str__(self):
-        matchnames = ""
-        for match in self.matchlist:
-            matchnames += match.__str__() + ","
-        return ".".join(matchnames.rsplit(",", 1))
-
-
-class Match:
-    def __init__(self, mdict):
-        self.raw = mdict
-        mapName = ValorantAPI().get_map_name_from_url(mdict["matchInfo"]["mapId"])
-        self.name = mapName
-        self.thumbnail = ValorantAPI().get_map_thumbnail(self.name)
-        self.id = mdict["matchInfo"]["matchId"]
-        self.mode = ValorantAPI().get_formatted_queue_name(
-            mdict["matchInfo"]["queueId"]
-        )
-        self.start_raw = mdict["matchInfo"]["gameStartMillis"]
-        self.start = datetime.fromtimestamp(self.start_raw // 1000)
-        self.rounds = Rounds(mdict, self.name, self)
-        self.winningteam = FormatData().get_rounds_won(self.rounds.roundlist)
-        self.players = Players(mdict["players"])
-
-    def __str__(self):
-        return f"{self.mode} on {self.name} resulting in {FormatData().get_rounds_stats(self.rounds.roundlist)}."
-
-
-class Players:
-    def __init__(self, mdict):
-        self.playerlist = []
-        self.raw = mdict
-        for playerm in self.raw:
-            playerdata = Player(playerm)
-            self.playerlist.append(playerdata)
-
-    def __str__(self):
-        playernames = ""
-        for player in self.playerlist:
-            playernames += player.display_name + f"({player.currenttier}),"
-        return ".".join(playernames.rsplit(",", 1))
-
-
-class Player:
-    def __init__(self, mdict):
-        self.raw = mdict
-        self.id = mdict["puuid"]
-        self.name = mdict["gameName"]
-        self.tag = mdict["tagLine"]
-        self.display_name = f"{self.name}#{self.tag}"
-        self.currenttier = mdict["competitiveTier"]
-        self.character = self.Character(mdict)
-        self.team_id = mdict.get("team")
-        self.party_id = mdict.get("party_id")
-        self.playtime = self.MatchTime(mdict["stats"]["playtimeMillis"])
-        self.cardId = mdict["playerCard"]
-        self.icon = ValorantAPI().get_card_icon(self.cardId)
-        self.iconId = mdict["playerTitle"]
-        self.stats = self.Stats(mdict["stats"])
-        self.ability_stats = self.AbilityStats(mdict["stats"]["abilityCasts"])
-
-    class AbilityStats:
-        def __init__(self, mdict):
-            self.raw = mdict
-            try:
-                self.c_casts = mdict["grenadeCasts"]
-            except Exception as ex:
-                self.c_casts = 0
-            try:
-                self.q_casts = mdict["ability1Casts"]
-            except Exception as ex:
-                self.q_casts = 0
-            try:
-                self.e_casts = mdict["ability2Casts"]
-            except Exception as ex:
-                self.e_casts = 0
-            try:
-                self.ultimate_casts = mdict["ultimateCasts"]
-            except Exception as ex:
-                self.ultimate_casts = 0
-            try:
-                self.x_casts = mdict["ultimateCasts"]
-            except Exception as ex:
-                self.x_casts = 0
-
-    class Stats:
-        def __init__(self, mdict):
-            self.raw = mdict
-            self.score = mdict["score"]
-            self.kills = mdict["kills"]
-            self.deaths = mdict["deaths"]
-            self.assists = mdict["assists"]
-
-    class Character:
-        def __init__(self, mdict):
-            self.raw = mdict
-            self.id = mdict["characterId"]
-            self.name = ValorantAPI().get_agent_from_id(self.id)
-            # self.icon = mdict["assets"]["agent"]["small"]
-            # self.full_icon = mdict["assets"]["agent"]["full"]
-            # self.kill_icon = mdict["assets"]["agent"]["killfeed"]
-
-    class MatchTime:
-        def __init__(self, mdict):
-            self.raw = mdict
-            try:
-                self.minutes = mdict["minutes"]
-            except:
-                pass
-            try:
-                self.seconds = mdict["seconds"]
-            except:
-                pass
-            try:
-                self.milliseconds = mdict["milliseconds"]
-            except:
-                pass
-
-
-class Rounds:
-    def __init__(self, mdict, mapname=None, match=None):
-        self.roundlist = []
-        self.match = match
-        try:
-            self.mapname = mapname
-        except:
-            pass
-        self.raw = mdict
-        self.list = mdict["roundResults"]
-        for roundm in self.list:
-            rounddata = Round(roundm, mapname)
-            self.roundlist.append(rounddata)
-
-
-class Round:
-    def __init__(self, mdict, mapname=None):
-        self.raw = mdict
-        self.winnerteam = self.WinnerTeam(mdict)
-        self.spike = self.SpikeInfo(mdict)
-        self.stats = self.RoundStats(mdict)
-        self.mapname = mapname
-
-    class RoundStats:
-        def __init__(self, mdict):
-            self.raw = mdict
-            self.playerlist = []
-            self.blueeco = 0
-            self.redeco = 0
-            for player in mdict["playerStats"]:
-                playerdata = self.RoundPlayer(player)
-                self.playerlist.append(playerdata)
-
-        class RoundPlayer:
-            def __init__(self, mdict):
-                self.raw = mdict
-                self.id = mdict["puuid"]
-                self.damagelist = []
-                self.killist = []
-                for damage in mdict["damage"]:
-                    damagedata = self.DamageEvent(damage)
-                    self.damagelist.append(damagedata)
-                for kill in mdict["kills"]:
-                    killdata = self.KillEvent(kill)
-                    self.killist.append(killdata)
-                self.ecospent = mdict["economy"]["spent"]
-                self.ecoremaining = mdict["economy"]["remaining"]
-                self.ecosteal = mdict["economy"]["loadoutValue"]
-                self.weapon = self.Weapon(mdict["economy"])
-                self.armor = self.Armor(mdict["economy"])
-                self.ability = self.Ability(mdict["ability"])
-
-            class Ability:
-                def __init__(self, mdict):
-                    self.raw = mdict
-                    try:
-                        self.c_casts = mdict["c_casts"]
-                    except:
-                        self.c_casts = 0
-                    try:
-                        self.q_casts = mdict["q_casts"]
-                    except:
-                        self.q_casts = 0
-                    try:
-                        self.e_casts = mdict["e_cast"]
-                    except:
-                        self.e_casts = 0
-                    try:
-                        self.ultimate_casts = mdict["x_cast"]
-                    except:
-                        self.ultimate_casts = 0
-                    try:
-                        self.x_casts = mdict["x_cast"]
-                    except:
-                        self.x_casts = 0
-
-            class Armor:
-                def __init__(self, mdict):
-                    self.raw = mdict
-                    self.id = mdict["armor"]
-                    self.name = ValorantAPI().get_name_from_id(self.id)
-                    # self.name = mdict["name"]
-
-            class Weapon:
-                def __init__(self, mdict):
-                    self.raw = mdict
-                    self.id = mdict["weapon"]
-                    self.name = ValorantAPI().get_name_from_id(self.id)
-                    # self.name = mdict["name"]
-
-            class DamageEvent:
-                def __init__(self, mdict):
-                    self.raw = mdict
-                    self.id = mdict["receiver"]
-                    # self.display_name = mdict["receiver_display_name"]
-                    # self.team = mdict["receiver_team"]
-                    self.damage = mdict["damage"]
-                    self.headshots = mdict["headshots"]
-                    self.bodyshots = mdict["bodyshots"]
-                    self.legshots = mdict["legshots"]
-
-            class KillEvent:
-                def __init__(self, mdict):
-                    self.raw = mdict
-                    self.kill_time_in_round = mdict["timeSinceRoundStartMillis"]
-                    self.kill_time_in_match = mdict["timeSinceGameStartMillis"]
-                    self.killer = self.Killer(mdict)
-                    self.victim = self.Victim(mdict)
-                    self.assistantlist = mdict["assistants"]
-
-                class Killer:
-                    def __init__(self, mdict):
-                        self.raw = mdict
-                        self.id = mdict["killer"]
-                        # self.display_name = mdict["killer_display_name"]
-
-                class Victim:
-                    def __init__(self, mdict):
-                        self.raw = mdict
-                        self.id = mdict["victim"]
-                        # self.display_name = mdict["victim_display_name"]
-                        self.death_location = self.DeathLocation(
-                            mdict["victimLocation"]
-                        )
-                        self.weapon = self.Weapon(mdict)
-
-                    class DeathLocation:
-                        def __init__(self, mdict):
-                            self.raw = mdict
-                            self.x = mdict["x"]
-                            self.y = mdict["y"]
-
-                    class Weapon:
-                        def __init__(self, mdict):
-                            self.raw = mdict
-                            self.type = mdict["finishingDamage"]["damageType"]
-                            self.id = mdict["finishingDamage"]["damageItem"]
-                            self.secondary_fire_mode = mdict["finishingDamage"][
-                                "isSecondaryFireMode"
-                            ]
-
-    class WinnerTeam:
-        def __init__(self, mdict):
-            self.raw = mdict
-            self.raw_name = mdict["winningTeam"]
-            self.name = FormatData().format_team(mdict["winningTeam"])
-            self.reason = mdict["roundResult"].lower()
-
-    class SpikeInfo:
-        def __init__(self, mdict):
-            self.raw = mdict
-            self.planted = mdict["bombPlanter"] is not None
-            self.defused = mdict["bombDefuser"] is not None
-            try:
-                self.x = mdict["plantLocation"]["x"]
-                self.y = mdict["plantLocation"]["y"]
-            except:
-                pass
-            try:
-                self.plant = self.PlantInfo(mdict)
-            except:
-                pass
-            try:
-                self.defuse = self.DefuseInfo(mdict)
-            except:
-                pass
-
-        class PlantInfo:
-            def __init__(self, mdict):
-                self.id = mdict["bombPlanter"]
-                # To be implemented yet #Name of the planter
-                self.site = mdict["plantSite"]
-                formatobj = FormatData().PlantTime()
-                formatobj.format_time_ms(mdict)
-                self.time = formatobj.display_time
-
-        class DefuseInfo:
-            def __init__(self, mdict):
-                self.id = mdict["bombDefuser"]
-                self.site = mdict["plantSite"]
-                formatobj = FormatData().DefuseTime()
-                formatobj.format_time_ms(mdict)
-                self.time = formatobj.display_time
-
-
-class FormatData:
-    class DefuseTime:
-        def format_time_ms(self, mdict: dict):
-            self.ms = mdict["defuseRoundTime"]
-            self.total_s = mdict["defuseRoundTime"] // 1000
-            self.m = mdict["defuseRoundTime"] // 1000
-            self.s = self.total_s - (60 * self.m)
-            self.display_time = f"{self.m}:{self.s}"
-
-    class PlantTime:
-        def format_time_ms(self, mdict: dict):
-            self.ms = mdict["plantRoundTime"]
-            self.total_s = mdict["plantRoundTime"] // 1000
-            self.m = mdict["plantRoundTime"] // 1000
-            self.s = self.total_s - (60 * self.m)
-            self.display_time = f"{self.m}:{self.s}"
-
-    def format_team(self, team: str) -> str:
-        if team == "Blue":
-            return "Defenders"
-        elif team == "Red":
-            return "Attackers"
-        else:
-            return "NA"
-
-    def format_side(self, team: str) -> str:
-        if team == "Blue":
-            return "Defending"
-        elif team == "Red":
-            return "Attacking"
-        else:
-            return "NA"
-
-    def get_rounds_won(self, rounds: list[Round]) -> str:
-        attcount = 0
-        defcount = 0
-        for round in rounds:
-            if round.winnerteam.name == "Defenders":
-                defcount += 1
-            elif round.winnerteam.name == "Attackers":
-                attcount += 1
-        if defcount == attcount:
-            return "Tie!"
-        return (
-            f"Defenders - {defcount}"
-            if defcount > attcount
-            else f"Attackers - {attcount}"
-        )
-
-    def get_rounds_stats(self, rounds: Rounds) -> str:
-        attcount = 0
-        defcount = 0
-        for round in rounds:
-            if round.winnerteam.name == "Defenders":
-                defcount += 1
-            elif round.winnerteam.name == "Attackers":
-                attcount += 1
-        return f"{defcount} Defenders/{attcount} Attackers"
-
-    def get_player_side(self, currentplayerid: str, mdict: dict) -> str:
-        players = mdict["players"]["all_players"]
-        for player in players:
-            playerdata = Player(player)
-            playerteam = playerdata.team_id
-            if playerdata.id == currentplayerid:
-                return playerteam
-        return None
-
-    def check_match_won(self, currentplayerid: str, mdict: dict) -> str:
-        rounds = mdict["rounds"]
-        currentplayerside = self.get_player_side(currentplayerid, mdict)
-        currentrounds = 0
-        enemyrounds = 0
-        for round in rounds:
-            rounddata = Round(round)
-            if rounddata.winnerteam == currentplayerside:
-                currentrounds += 1
-            else:
-                enemyrounds += 1
-        if currentrounds > enemyrounds:
-            return "Won"
-        elif enemyrounds > currentrounds:
-            return "Lost"
-        else:
-            return "Tie"
-
-    def get_average_kda(self, matches: Matches, currentplayerid: str) -> float:
-        totalkills = 0
-        totaldeaths = 0
-        totalassists = 0
-        for match in matches:
-            if match.mode == "Deathmatch":
-                continue
-            if match.mode == "Escalation":
-                continue
-            if match.mode == "Replication":
-                continue
-            for player in match.players.playerlist:
-                kills = player.stats.kills
-                deaths = player.stats.deaths
-                assists = player.stats.assists
-                if player.id == currentplayerid:
-                    totalkills += kills
-                    totaldeaths += deaths
-                    totalassists += assists
-        if totaldeaths == 0:
-            totaldeaths = 1
-        return (totalkills + (0.5 * totalassists)) / totaldeaths
-
-    def get_average_econ(self, matches: Matches, currentplayerid: str) -> int:
-        totaleco = 0
-        matchcount = 0
-        for match in matches:
-            if match.mode == "Spike Rush":
-                continue
-            if match.mode == "Deathmatch":
-                continue
-            if match.mode == "Escalation":
-                continue
-            if match.mode == "Replication":
-                continue
-            pass
-        if matchcount == 0:
-            matchcount = 1
-        return totaleco / matchcount
-
-    def get_freq_weapon(self, matches: Matches, currentplayerid: str) -> list:
-        weaponsused = {"data": []}
-
-        def get_duplicate_json(origjson, key):
-            for data in origjson["data"]:
-                if data["name"] == key:
-                    return data
-            return {}
-
-        def merge_dicts(*dicts):
-            d = {}
-            for dict in dicts:
-                for key in dict:
-                    try:
-                        if key == "uses":
-                            d[key] += dict[key]
-                        else:
-                            d[key] = dict[key]
-                    except KeyError:
-                        d[key] = dict[key]
-                    except TypeError:
-                        pass
-            return d
-
-        def remove_duplicate_json(origjson, key):
-            ad = {"data": []}
-            for data in origjson["data"]:
-                if data["name"] != key:
-                    ad["data"].append(data)
-            return ad
-
-        for match in matches:
-            if match.mode == "Deathmatch":
-                continue
-            if match.mode == "Escalation":
-                continue
-            if match.mode == "Replication":
-                continue
-            for round in match.rounds.roundlist:
-                for rplayer in round.stats.playerlist:
-                    if rplayer.id == currentplayerid:
-                        currentdata = {"name": rplayer.weapon.name, "uses": 1}
-                        if rplayer.weapon is None:
-                            continue
-                        dupdict = get_duplicate_json(weaponsused, currentdata["name"])
-                        weaponsused = remove_duplicate_json(
-                            weaponsused, currentdata["name"]
-                        )
-                        weaponsused["data"].append(merge_dicts(dupdict, currentdata))
-        return sorted(weaponsused["data"], key=lambda x: x["uses"], reverse=True)
-
-    def get_most_kills_weapon(self, matches, currentplayerid):
-        weaponsused = {"data": []}
-
-        def get_duplicate_json(origjson, key):
-            for data in origjson["data"]:
-                if data["name"] == key:
-                    return data
-            return {}
-
-        def merge_dicts(*dicts):
-            d = {}
-            for dict in dicts:
-                for key in dict:
-                    try:
-                        if key == "kills":
-                            d[key] += dict[key]
-                        else:
-                            d[key] = dict[key]
-                    except KeyError:
-                        d[key] = dict[key]
-                    except TypeError:
-                        pass
-            return d
-
-        def remove_duplicate_json(origjson, key):
-            ad = {"data": []}
-            for data in origjson["data"]:
-                if data["name"] != key:
-                    ad["data"].append(data)
-            return ad
-
-        for match in matches:
-            if match.mode == "Deathmatch":
-                continue
-            if match.mode == "Escalation":
-                continue
-            if match.mode == "Replication":
-                continue
-            for round in match.rounds.roundlist:
-                for rplayer in round.stats.playerlist:
-                    if rplayer.id == currentplayerid:
-                        currentdata = {
-                            "name": rplayer.weapon.name,
-                            "kills": len(rplayer.killist),
-                        }
-                        if rplayer.weapon is None or str(rplayer.weapon.name) == "None":
-                            continue
-                        dupdict = get_duplicate_json(weaponsused, currentdata["name"])
-                        weaponsused = remove_duplicate_json(
-                            weaponsused, currentdata["name"]
-                        )
-                        weaponsused["data"].append(merge_dicts(dupdict, currentdata))
-        return sorted(weaponsused["data"], key=lambda x: x["kills"], reverse=True)
-
-    def get_round_losing_reason(self, matches, currentplayerid):
-        roundlosingreasons = {"data": []}
-
-        def get_duplicate_json(origjson, key):
-            for data in origjson["data"]:
-                if data["name"] == key:
-                    return data
-            return {}
-
-        def merge_dicts(*dicts):
-            d = {}
-            for dict in dicts:
-                for key in dict:
-                    try:
-                        if key == "uses":
-                            d[key] += dict[key]
-                        else:
-                            d[key] = dict[key]
-                    except KeyError:
-                        d[key] = dict[key]
-                    except TypeError:
-                        pass
-            return d
-
-        def remove_duplicate_json(origjson, key):
-            ad = {"data": []}
-            for data in origjson["data"]:
-                if data["name"] != key:
-                    ad["data"].append(data)
-            return ad
-
-        for match in matches:
-            if match.mode == "Deathmatch":
-                continue
-            if match.mode == "Escalation":
-                continue
-            if match.mode == "Replication":
-                continue
-            currentplayerteam = "None"
-            for playerdata in match.players.playerlist:
-                playerteam = playerdata.team_id
-                if playerdata.id == currentplayerid:
-                    currentplayerteam = playerteam
-                    break
-            for round in match.rounds.roundlist:
-                if round.winnerteam.raw_name != currentplayerteam:
-                    roundlosingreason = round.winnerteam.reason
-                    currentdata = {"name": roundlosingreason, "uses": 1}
-                    dupdict = get_duplicate_json(
-                        roundlosingreasons, currentdata["name"]
-                    )
-                    roundlosingreasons = remove_duplicate_json(
-                        roundlosingreasons, currentdata["name"]
-                    )
-                    roundlosingreasons["data"].append(merge_dicts(dupdict, currentdata))
-            return sorted(
-                roundlosingreasons["data"], key=lambda x: x["uses"], reverse=True
-            )
-
-    def get_player_kills(self, stats, currentplayerid):
-        killist = []
-        for rplayer in stats.playerlist:
-            for kill in rplayer.killist:
-                puuid = kill.killer.id
-                if puuid == currentplayerid:
-                    killist.append(kill)
-        return killist
-
-    def get_player_death(self, stats, currentplayerid):
-        for rplayer in stats.playerlist:
-            for kill in rplayer.killist:
-                puuid = kill.victim.id
-                if puuid == currentplayerid:
-                    return kill
-        return None
-
-    def get_team_kills(self, stats, currentplayerid):
-        currentplayerteam = None
-        for rplayer in stats.playerlist:
-            if rplayer.id == currentplayerid:
-                currentplayerteam = rplayer.team
-        teamids = []
-        for rplayer in stats.playerlist:
-            if rplayer.team != currentplayerteam:
-                continue
-            for kill in rplayer.killist:
-                if not kill.killer.id in teamids:
-                    teamids.append(kill.killer.id)
-        killist = []
-        for puid in teamids:
-            playerkills = self.get_player_kills(stats, puid)
-            killist.append(playerkills[-1])
-        return killist
-
-    def get_map_info(self, mapname, stats, currentplayerid):
-        mapdisplayicon = ValorantAPI().get_map_display_icon(mapname)
-        try:
-            urllib.request.urlretrieve(mapdisplayicon, f"{mapname}displayicon.png")
-        except:
-            pass
-        playerkills = self.get_player_kills(stats, currentplayerid)
-        playerdeath = self.get_player_death(stats, currentplayerid)
-        enemykills = self.get_team_kills(stats, currentplayerid)
-        mapfile = Image.open(f"{mapname}displayicon.png")
-        width, height = mapfile.size
-        redarrowfile = Image.open(f"redArrow.png")
-        greenarrowfile = Image.open(f"greenArrow.png")
-        redcrossfile = Image.open(f"redCross.png")
-        if playerdeath:
-            game_x = playerdeath.victim.death_location.x
-            game_y = playerdeath.victim.death_location.y
-            valorantapi_map_x_multiplier = ValorantAPI().get_map_x_multiplier(mapname)
-            valorantapi_map_y_multiplier = ValorantAPI().get_map_y_multiplier(mapname)
-            valorantapi_map_x_scalar_add = ValorantAPI().get_map_x_scalar(mapname)
-            valorantapi_map_y_scalar_add = ValorantAPI().get_map_y_scalar(mapname)
-            x = game_y * valorantapi_map_x_multiplier + valorantapi_map_x_scalar_add
-            y = game_x * valorantapi_map_y_multiplier + valorantapi_map_y_scalar_add
-            x *= width
-            y *= height
-            x = int(x)
-            y = int(y)
-            mapfile.paste(redcrossfile, (x, y), redcrossfile)
-        if playerkills:
-            for kill in playerkills:
-                game_x = kill.victim.death_location.x
-                game_y = kill.victim.death_location.y
-                valorantapi_map_x_multiplier = ValorantAPI().get_map_x_multiplier(
-                    mapname
-                )
-                valorantapi_map_y_multiplier = ValorantAPI().get_map_y_multiplier(
-                    mapname
-                )
-                valorantapi_map_x_scalar_add = ValorantAPI().get_map_x_scalar(mapname)
-                valorantapi_map_y_scalar_add = ValorantAPI().get_map_y_scalar(mapname)
-                x = game_y * valorantapi_map_x_multiplier + valorantapi_map_x_scalar_add
-                y = game_x * valorantapi_map_y_multiplier + valorantapi_map_y_scalar_add
-                x *= width
-                y *= height
-                x = int(x)
-                y = int(y)
-                mapfile.paste(greenarrowfile, (x, y), greenarrowfile)
-        if enemykills:
-            for kill in enemykills:
-                game_x = kill.victim.death_location.x
-                game_y = kill.victim.death_location.y
-                valorantapi_map_x_multiplier = ValorantAPI().get_map_x_multiplier(
-                    mapname
-                )
-                valorantapi_map_y_multiplier = ValorantAPI().get_map_y_multiplier(
-                    mapname
-                )
-                valorantapi_map_x_scalar_add = ValorantAPI().get_map_x_scalar(mapname)
-                valorantapi_map_y_scalar_add = ValorantAPI().get_map_y_scalar(mapname)
-                x = game_y * valorantapi_map_x_multiplier + valorantapi_map_x_scalar_add
-                y = game_x * valorantapi_map_y_multiplier + valorantapi_map_y_scalar_add
-                x *= width
-                y *= height
-                x = int(x)
-                y = int(y)
-                mapfile.paste(redarrowfile, (x, y), redarrowfile)
-        ranstr = genrandomstr(10)
-        filesavename = f"{mapname}-{ranstr}.png"
-        mapfile.save(filesavename)
-        return discord.File(filesavename)
-
-
-class ValorantLink(discord.ui.View):
-    def __init__(self, ctx):
-        super().__init__(timeout=600)
-        self.ctx = ctx
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
-
-    @discord.ui.button(label="Login account", style=discord.ButtonStyle.green)
-    async def login(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embedOne = discord.Embed(
-            title="Login Account",
-            description=f"""Click the below link to link your valorant account.
-        https://auth.riotgames.com/login#client_id=vithron&redirect_uri=https://vithron.webdashboard.repl.co/valorantLogin&response_type=code&scope=openid+offline_access&state={self.ctx.author.id}""",
-        )
-        await interaction.response.send_message(embed=embedOne, ephemeral=True)
-
-
-class Valorant(commands.Cog):
-    """Valorant stat commands"""
-
-    @commands.cooldown(1, 45, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["valunlink", "unlink"],
-        brief="This command unlinks and removes your valorant username.",
-        description="This command unlinks and removes your valorant username.",
-        usage="",
-    )
-    async def unlinkaccount(self, ctx):
-        async with pool.acquire() as con:
-            await con.execute(
-                f"DELETE FROM riotaccount WHERE discorduserid = {ctx.author.id}"
-            )
-        await ctx.send(
-            f"Your account was successfully unlinked from discord.", ephemeral=True
-        )
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["vallink", "link"],
-        brief="This command links and stores your valorant username.",
-        description="This command links and stores your valorant username.",
-        usage="",
-    )
-    async def linkaccount(self, ctx):
-        # https://auth.riotgames.com/login#client_id=Aestron&redirect_uri=https://Aestron.webdashboard.repl.co/valorantLogin&response_type=code&scope=openid+offline_access&state=
-        embedOne = discord.Embed(
-            title="Link Valorant",
-            description="To link your discord account with your valorant account, click on the button below.",
-        )
-        view = ValorantLink(ctx)
-        view.set_message(await ctx.send(embed=embedOne, view=view, ephemeral=True))
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["valstats"],
-        brief="This command shows the stats of your linked account.",
-        description="This command shows the stats of your linked account.",
-        usage="@member",
-    )
-    async def vstats(
-        self, ctx, member: typing.Union[discord.Member, discord.User] = None
-    ):
-        if member is None:
-            member = ctx.author
-        async with pool.acquire() as con:
-            puuidlist = await con.fetchrow(
-                f"SELECT * FROM riotaccount WHERE discorduserid = {member.id}"
-            )
-        if puuidlist is None:
-            await send_generic_error_embed(ctx, error_data=
-                f"{member.mention} has not linked their riot account with discord."
-            )
-            return
-        try:
-            await ctx.message.add_reaction("<a:loading:824193916818554960>")
-        except:
-            pass
-        currentpuuid = puuidlist["accountpuuid"]
-        currentregion = "ap"
-        username = puuidlist["accountname"]
-        usertag = puuidlist["accounttag"]
-
-        def ordinal(n):
-            try:
-                return "%d%s" % (
-                    n,
-                    "tsnrhtdd"[(n // 10 % 10 != 1) * (n % 10 < 4) * n % 10 :: 4],
-                )
-            except:
-                return ""
-
-        url = f"https://api.henrikdev.xyz/valorant/v1/mmr/{currentregion}/{username}/{usertag}"
-        matchesinfo = Matches()
-        async with pool.acquire() as con:
-            matchidslist = await con.fetchrow(
-                f"SELECT matchids FROM riotmatches where discorduserid = {ctx.author.id}"
-            )
-        if matchidslist is None:
-            await ctx.send(
-                f"Your stats could not be fetched as they haven't been loaded yet!",
-                ephemeral=True,
-            )
-            return
-        count = 0
-        for matchid in matchidslist["matchids"]:
-            if count == 10:
-                break
-            async with pool.acquire() as con:
-                pickledmatch = await con.fetchrow(
-                    f"SELECT data FROM riotparsedmatches where id = '{matchid}'"
-                )
-            match = pickle.loads(pickledmatch["data"])
-            matchesinfo.add_match(match)
-            count += 1
-        session = client.session
-        respjson = await fetchaiohttp(session, url)
-        try:
-            respjson = json.loads(respjson)
-        except Exception as ex:
-            await ctx.send(
-                f"Your stats could not be fetched due to an error, try re-linking your account!",
-                ephemeral=True,
-            )
-            await send_generic_error_embed(ctx, error_data=
-                f"Exception in riot link cmd - {ex}", forcelog=True, userlog=False
-            )
-            return
-        currentrank = respjson["data"]["currenttierpatched"]
-        currentrankindex = respjson["data"]["currenttier"]
-        currentrankpos = respjson["data"]["ranking_in_tier"]
-        isoldrank = respjson["data"]["old"]
-        if isoldrank:
-            currentrankindex = 0
-            currentrank = "Unranked"
-            currentrankpos = "Unranked"
-        if currentrank is None:
-            currentrank = "Unranked"
-        if currentrankpos is None:
-            currentrankpos = "Unranked"
-        currentrankthumbnail = f"https://trackercdn.com/cdn/tracker.gg/valorant/icons/tiers/{currentrankindex}.png"
-        embed = discord.Embed(
-            title=f"{username}'s Stats",
-            description=f"You are {ordinal(currentrankpos)} in [{currentrank}]({currentrankthumbnail}) having a average K/D/A of {round(FormatData().get_average_kda(matchesinfo.matchlist, currentpuuid), 2)} and an average econ of {round(FormatData().get_average_econ(matchesinfo.matchlist, currentpuuid), 2)}.",
-        )
-        try:
-            embed.set_thumbnail(url=currentrankthumbnail)
-        except:
-            pass
-        try:
-            await ctx.message.remove_reaction(
-                "<a:loading:824193916818554960>", ctx.guild.me
-            )
-        except:
-            pass
-        view = ValorantControls(matchesinfo, currentpuuid, ctx)
-        view.set_message(
-            await ctx.send(
-                embed=embed,
-                view=view,
-                ephemeral=True,
-            )
-        )
-
-
 class Misc(commands.Cog):
     """Misc commands."""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.afk_reasons = {}
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Clear returning users and report mentioned AFK users."""
+        if message.author.bot:
+            return
+        self.afk_reasons.pop(message.author.id, None)
+        for member in message.mentions:
+            reason = self.afk_reasons.get(member.id)
+            if reason is not None:
+                await message.reply(
+                    f"{member.display_name} is AFK: {reason}",
+                    mention_author=False,
+                )
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
@@ -6910,24 +4352,28 @@ class Misc(commands.Cog):
     async def setreminder(self, ctx, time: str, *, reason: str = "⏰Reminder finished"):
         timenum = convert(time)
         if timenum == -1:
-            await send_generic_error_embed(ctx, error_data=
-                "You didn't answer with a proper unit. Use (s|m|h|d) next time!"
+            await send_generic_error_embed(
+                ctx,
+                error_data="You didn't answer with a proper unit. Use (s|m|h|d) next time!",
             )
 
             return
         elif timenum == -2:
-            await send_generic_error_embed(ctx, error_data=
-                "The time must be an integer. Please enter an integer next time."
+            await send_generic_error_embed(
+                ctx,
+                error_data="The time must be an integer. Please enter an integer next time.",
             )
             return
         elif timenum == -3:
-            await send_generic_error_embed(ctx, error_data=
-                "The time must be an positive number. Please enter an positive number next time."
+            await send_generic_error_embed(
+                ctx,
+                error_data="The time must be an positive number. Please enter an positive number next time.",
             )
             return
         if timenum > 86400:
-            await send_generic_error_embed(ctx, error_data=
-                "It is not recommended to set the time to more than 1 day due to bot restarts."
+            await send_generic_error_embed(
+                ctx,
+                error_data="It is not recommended to set the time to more than 1 day due to bot restarts.",
             )
             return
         a_datetime = datetime.now()
@@ -6935,7 +4381,7 @@ class Misc(commands.Cog):
         new_datetime = a_datetime + added_seconds
         try:
             await ctx.message.add_reaction("⏰")
-        except:
+        except Exception:
             pass
         await ctx.send(
             f"{ctx.author.mention} Your reminder for {await discord.utils.sleep_until(when=new_datetime, result=reason)} was completed!",
@@ -6948,15 +4394,12 @@ class Misc(commands.Cog):
         brief=" This command can be used to mark yourself as afk for a specified reason.",
         description=" This command can be used to mark yourself as afk for a specified reason.",
     )
-    async def afk(self, ctx, *, reasonafk: str = None):
-        global afkrecent
-        if reasonafk is None:
-            reasonafk = "no reason"
-        if checkProfane(reasonafk):
-            reason = "||Hidden for containing profane text||"
-        afkrecent[ctx.author.id] = reasonafk
+    async def afk(self, ctx, *, reason: str = "No reason provided"):
+        if await check_profane(reason):
+            reason = "Hidden because it contained inappropriate text."
+        self.afk_reasons[ctx.author.id] = reason
         await ctx.send(
-            f"I have set you afk for {reasonafk} , send a message again to be marked as non AFK.",
+            f"You are now AFK: {reason}. Send another message to clear your status.",
             ephemeral=True,
         )
 
@@ -6967,89 +4410,14 @@ class Misc(commands.Cog):
         description="This command can be used to calculate math.",
     )
     async def calc(self, ctx, expression: str):
-        str_obj = io.StringIO()  # Retrieves a stream of data
-        with contextlib.redirect_stdout(str_obj):
-            parser.parse(expression)
-            output = str_obj.getvalue()
-            embed = discord.Embed(
-                title="Calculator", description=f"Input : {expression}"
-            )
-            embed.add_field(name="Output", value=output)
-            await ctx.send(embed=embed)
-
-    @commands.cooldown(1, 20, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["takescreenshot", "scrn", "screenshot"],
-        brief="This command can be used to take a screenshot of a website url.",
-        description="This command can be used to take a screenshot of a website url.",
-        usage="url",
-    )
-    async def takescrn(self, ctx, url: str):
-        scrn = await take_screenshot(ctx, url=url)
-        await ctx.send(file=scrn, ephemeral=True)
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.command(
-        aliases=["ncdrtfm", "nrtfm"],
-        brief="This command can be used to rtfm search on nextcord.",
-        description="This command can be used to rtfm search on nextcord.",
-        usage="search-term",
-    )
-    @is_bot_staff()
-    async def nextcordrtfm(self, ctx, *, query: str):
         try:
-            await ctx.message.add_reaction("<a:loading:824193916818554960>")
-        except:
-            pass
-        try:
-            data = await rtfmclient.sphinxrtfm(
-                "https://nextcord.readthedocs.io/en/stable/", query
-            )
-        except:
-            try:
-                await ctx.message.remove_reaction(
-                    "<a:loading:824193916818554960>", ctx.guild.me
-                )
-            except:
-                pass
-            await send_generic_error_embed(ctx, error_data=
-                f"No results were found for {query} as the nextcord api is down!"
-            )
+            output = evaluate_expression(expression)
+        except ValueError as error:
+            await send_generic_error_embed(ctx, error_data=str(error))
             return
-        datajson = data.nodes
-        listOfEmbeds = []
-        listOfFiles = []
-        count = 1
-        for i in datajson.keys():
-            embed = discord.Embed(
-                title=f"RTFM Result - {count}",
-                description="Documentation from nextcord docs",
-            )
-            embed.add_field(name=i, value=datajson[i])
-            listOfEmbeds.append(embed)
-            name = i.replace(" ", "") + ".png"
-            scrn = await take_screenshot(ctx, datajson[i], name)
-            listOfFiles.append(scrn)
-            count = count + 1
-        if len(listOfEmbeds) == 0:
-            try:
-                await ctx.message.remove_reaction(
-                    "<a:loading:824193916818554960>", ctx.guild.me
-                )
-            except:
-                pass
-            await send_generic_error_embed(ctx, error_data=f"No results were found for {query}.")
-            return
-        try:
-            await ctx.message.remove_reaction(
-                "<a:loading:824193916818554960>", ctx.guild.me
-            )
-        except:
-            pass
-        pagview = PaginateFileEmbed(listOfEmbeds, listOfFiles)
-        pagview.set_message(
-            await ctx.send(embed=listOfEmbeds[0], file=listOfFiles[0], view=pagview)
-        )
+        embed = discord.Embed(title="Calculator", description=f"Input: `{expression}`")
+        embed.add_field(name="Output", value=f"`{output}`")
+        await ctx.send(embed=embed)
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.command(
@@ -7061,146 +4429,31 @@ class Misc(commands.Cog):
     @is_bot_staff()
     async def discordpyrtfm(self, ctx, *, query: str):
         try:
-            await ctx.message.add_reaction("<a:loading:824193916818554960>")
-        except:
-            pass
-        try:
-            data = await rtfmclient.sphinxrtfm(
+            results = await search_sphinx_docs(
                 "https://discordpy.readthedocs.io/en/stable/", query
             )
-        except:
-            try:
-                await ctx.message.remove_reaction(
-                    "<a:loading:824193916818554960>", ctx.guild.me
-                )
-            except:
-                pass
-            await send_generic_error_embed(ctx, error_data=
-                f"No results were found for {query} as the discord.py api is down!"
+        except (aiohttp.ClientError, TimeoutError):
+            LOGGER.exception("discord.py documentation search failed query=%r", query)
+            await send_generic_error_embed(
+                ctx,
+                error_data="The discord.py documentation search is unavailable.",
             )
             return
-        datajson = data.nodes
-        listOfEmbeds = []
-        listOfFiles = []
-        count = 1
-        for i in datajson.keys():
-            embed = discord.Embed(
-                title=f"RTFM Result - {count}",
-                description="Documentation from discord.py docs",
-            )
-            embed.add_field(name=i, value=datajson[i])
-            listOfEmbeds.append(embed)
-            name = i.replace(" ", "") + ".png"
-            scrn = await take_screenshot(ctx, datajson[i], name)
-            listOfFiles.append(scrn)
-            count = count + 1
-        if len(listOfEmbeds) == 0:
-            try:
-                await ctx.message.remove_reaction(
-                    "<a:loading:824193916818554960>", ctx.guild.me
-                )
-            except:
-                pass
-            await send_generic_error_embed(ctx, error_data=f"No results were found for {query}.")
-            return
-        try:
-            await ctx.message.remove_reaction(
-                "<a:loading:824193916818554960>", ctx.guild.me
-            )
-        except:
-            pass
-        pagview = PaginateFileEmbed(listOfEmbeds, listOfFiles)
-        pagview.set_message(
-            await ctx.send(embed=listOfEmbeds[0], file=listOfFiles[0], view=pagview)
-        )
 
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.command(
-        aliases=["pycrtfm", "pyrtfm", "rtfm"],
-        brief="This command can be used to rtfm search on pycord.",
-        description="This command can be used to rtfm search on pycord.",
-        usage="search-term",
-    )
-    @is_bot_staff()
-    async def pycordrtfm(self, ctx, *, query: str):
-        try:
-            await ctx.message.add_reaction("<a:loading:824193916818554960>")
-        except:
-            pass
-        try:
-            data = await rtfmclient.sphinxrtfm(
-                "https://docs.pycord.dev/en/master/", query
-            )
-        except:
-            try:
-                await ctx.message.remove_reaction(
-                    "<a:loading:824193916818554960>", ctx.guild.me
-                )
-            except:
-                pass
-            await send_generic_error_embed(ctx, error_data=
-                f"No results were found for {query} as the pycord api is down!"
+        if not results:
+            await send_generic_error_embed(
+                ctx, error_data=f"No results were found for {query}."
             )
             return
-        datajson = data.nodes
-        listOfEmbeds = []
-        listOfFiles = []
-        count = 1
-        for i in datajson.keys():
-            embed = discord.Embed(
-                title=f"RTFM Result - {count}",
-                description="Documentation from pycord docs",
-            )
-            embed.add_field(name=i, value=datajson[i])
-            listOfEmbeds.append(embed)
-            name = i.replace(" ", "") + ".png"
-            scrn = await take_screenshot(ctx, datajson[i], name)
-            listOfFiles.append(scrn)
-            count = count + 1
-        if len(listOfEmbeds) == 0:
-            try:
-                await ctx.message.remove_reaction(
-                    "<a:loading:824193916818554960>", ctx.guild.me
-                )
-            except:
-                pass
-            await send_generic_error_embed(ctx, error_data=f"No results were found for {query}.")
-            return
-        try:
-            await ctx.message.remove_reaction(
-                "<a:loading:824193916818554960>", ctx.guild.me
-            )
-        except:
-            pass
-        pagview = PaginateFileEmbed(listOfEmbeds, listOfFiles)
-        pagview.set_message(
-            await ctx.send(embed=listOfEmbeds[0], file=listOfFiles[0], view=pagview)
-        )
 
-    @commands.cooldown(1, 60, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["search", "google"],
-        brief="This command can be used to search on google.",
-        description="This command can be used to search on google.",
-        usage="search-term",
-    )
-    async def searchquery(self, ctx, *, query: str):
-        number = 1
-        embedVar = discord.Embed(
-            title="Search Results", description=query, color=Color.green()
+        embed = discord.Embed(
+            title=f"discord.py documentation: {query}",
+            description="The most relevant results from the official documentation.",
+            color=discord.Color.blurple(),
         )
-        searchresults = gsearch(
-            query, tld="co.in", num=number, stop=number, pause=2, safe="on"
-        )
-        success = False
-        for j in searchresults:
-            scrn = await take_screenshot(ctx, j)
-            embedVar.title = f"Search Results({j})"
-            await ctx.send(embed=embedVar, file=scrn, ephemeral=True)
-            success = True
-        if not success:
-            await send_generic_error_embed(ctx, error_data=f"No results were found for {query}.")
-            return
+        for label, url in list(results.items())[:10]:
+            embed.add_field(name=label[:256], value=f"[Open documentation]({url})")
+        await ctx.send(embed=embed)
 
     @commands.cooldown(1, 15, BucketType.member)
     @commands.hybrid_command(
@@ -7209,21 +4462,27 @@ class Misc(commands.Cog):
         usage="city-name",
     )
     async def weather(self, ctx, *, city: str):
-        embedVar = discord.Embed(
+        embed_var = discord.Embed(
             title=f"Weather in {city}", description="", color=Color.green()
         )
 
-        BASE_URL = "https://api.openweathermap.org/data/2.5/weather?"
-        API_KEY = "fb1ef9466bf30ea33b7237826e3d1dc0"
-        URL = BASE_URL + "q=" + city + "&appid=" + API_KEY
-        session = client.session
-        respjson = await fetch_json(session, URL)
-        assert respjson[0] == 200, f"{respjson[0].status_code}"
-        response = respjson[1]
-        # checking the status code of the request
-        if response.status_code == 200:
-            # getting data in the json format
-            data = response.json()
+        api_key = os.getenv("OPENWEATHER_API_KEY")
+        if not api_key:
+            await send_generic_error_embed(
+                ctx,
+                error_data=(
+                    "Weather is not configured. Set `OPENWEATHER_API_KEY` in `.env`."
+                ),
+            )
+            return
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with client.session.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={"q": city, "appid": api_key},
+            timeout=timeout,
+        ) as response:
+            data = await response.json(content_type=None)
+        if response.status == 200:
             # getting the main dict block
             main = data["main"]
             # getting temperature
@@ -7235,23 +4494,28 @@ class Misc(commands.Cog):
             pressure = main["pressure"]
             # weather report
             report = data["weather"]
-            embedVar.add_field(
+            embed_var.add_field(
                 name="Weather Report: ",
                 value=(f"{report[0]['description']}"),
                 inline=False,
             )
 
-            embedVar.add_field(
+            embed_var.add_field(
                 name="Temperature ", value=(f"{temperature}°​C"), inline=False
             )
-            embedVar.add_field(name="Humidity ", value=(f"{humidity}%"), inline=False)
-            embedVar.add_field(name="Pressure ", value=(f"{pressure} Pa"), inline=False)
+            embed_var.add_field(name="Humidity ", value=(f"{humidity}%"), inline=False)
+            embed_var.add_field(
+                name="Pressure ", value=(f"{pressure} Pa"), inline=False
+            )
         else:
-            await send_generic_error_embed(ctx, error_data="The city provided was not found.")
+            detail = data.get("message", "The city provided was not found.")
+            await send_generic_error_embed(
+                ctx, error_data=f"Weather lookup failed: {detail}"
+            )
             return
         try:
-            await ctx.send(embed=embedVar, ephemeral=True)
-        except:
+            await ctx.send(embed=embed_var, ephemeral=True)
+        except Exception:
             pass
 
     @commands.cooldown(1, 60, BucketType.member)
@@ -7267,41 +4531,38 @@ class Misc(commands.Cog):
         end = time.perf_counter()
         duration = (end - start) * 1000
         duration = duration / 2
-        normalPing = 0
-        webPing = 0
+        normal_ping = 0
+        web_ping = 0
         try:
-            normalPing = round(duration)
-            webPing = format(round(ctx.bot.latency * 1000))
-        except:
+            normal_ping = round(duration)
+            web_ping = format(round(ctx.bot.latency * 1000))
+        except Exception:
             pass
-        if normalPing <= 50:
+        if normal_ping <= 50:
             embed = discord.Embed(
                 title="PING",
-                description=f":ping_pong: Pong! The ping is **{normalPing}** and websocket ping is **{webPing}** milliseconds!",
+                description=f":ping_pong: Pong! The ping is **{normal_ping}** and websocket ping is **{web_ping}** milliseconds!",
                 color=0x44FF44,
             )
-        elif normalPing <= 100:
+        elif normal_ping <= 100:
             embed = discord.Embed(
                 title="PING",
-                description=f":ping_pong: Pong! The ping is **{normalPing}** and websocket ping is **{webPing}** milliseconds!",
+                description=f":ping_pong: Pong! The ping is **{normal_ping}** and websocket ping is **{web_ping}** milliseconds!",
                 color=0xFFD000,
             )
-        elif normalPing <= 200:
+        elif normal_ping <= 200:
             embed = discord.Embed(
                 title="PING",
-                description=f":ping_pong: Pong! The ping is **{normalPing}** and websocket ping is **{webPing}** milliseconds!",
+                description=f":ping_pong: Pong! The ping is **{normal_ping}** and websocket ping is **{web_ping}** milliseconds!",
                 color=0xFF6600,
             )
         else:
             embed = discord.Embed(
                 title="PING",
-                description=f":ping_pong: Pong! The ping is **{normalPing}** and websocket ping is **{webPing}** milliseconds!",
+                description=f":ping_pong: Pong! The ping is **{normal_ping}** and websocket ping is **{web_ping}** milliseconds!",
                 color=0x990000,
             )
-        try:
-            await ctx.send(embed=embed, ephemeral=True)
-        except:
-            pass
+        await message.edit(content=None, embed=embed)
 
     @commands.hybrid_command(
         aliases=["changeprefix"],
@@ -7313,9 +4574,11 @@ class Misc(commands.Cog):
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def setprefix(self, ctx, *, prefix: str):
         check_ensure_permissions(ctx, ctx.guild.me, ["add_reactions"])
-        if not ctx.guild is None:
+        if ctx.guild is not None:
             if prefix == "None" or len(prefix) > 10:
-                await send_generic_error_embed(ctx, error_data="You cannot set the prefix to that value.")
+                await send_generic_error_embed(
+                    ctx, error_data="You cannot set the prefix to that value."
+                )
                 return
             msg = await ctx.send(
                 f"Are you sure you want to change the prefix to `{prefix}`",
@@ -7335,23 +4598,25 @@ class Misc(commands.Cog):
                     reaction, user = await client.wait_for(
                         "reaction_add", timeout=5.0, check=check
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await ctx.channel.send(
                         f"Ok I won't change the prefix to `{prefix}`"
                     )
                     return
                 else:
                     pass
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(
-                    f"UPDATE prefixes VALUES SET prefix = '{prefix}' WHERE guildid = {ctx.guild.id}"
+                    "UPDATE prefixes SET prefix = $1 WHERE guildid = $2",
+                    prefix,
+                    ctx.guild.id,
                 )
 
             try:
                 await ctx.send(
                     f"My prefix has changed to {prefix} in {ctx.guild}.", ephemeral=True
                 )
-            except:
+            except Exception:
                 pass
         else:
             try:
@@ -7359,7 +4624,7 @@ class Misc(commands.Cog):
                     "My prefix cannot be changed in a dm channel , my default prefix is `a!` ",
                     ephemeral=True,
                 )
-            except:
+            except Exception:
                 pass
 
 
@@ -7374,13 +4639,13 @@ async def translatetext(
     interaction: discord.Interaction, text: str, language: str = "en"
 ):
     origmessage = text
-    origlanguage = detect(text)
+    origlanguage = await asyncio.to_thread(detect, text)
     translator = Translator(to_lang=language, from_lang=origlanguage)
-    translatedmessage = translator.translate(origmessage)
-    embedOne = discord.Embed(
+    translatedmessage = await asyncio.to_thread(translator.translate, origmessage)
+    embed_one = discord.Embed(
         title="Language : " + language, description=translatedmessage
     )
-    await interaction.response.send_message(embed=embedOne, ephemeral=True)
+    await interaction.response.send_message(embed=embed_one, ephemeral=True)
 
 
 class Call(commands.Cog):
@@ -7399,31 +4664,33 @@ class Call(commands.Cog):
         description=" This command can be used to enable/disable your incoming calls from call command.",
     )
     async def calltoggle(self, ctx):
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             warninglist = await con.fetchrow(
-                f"SELECT * FROM callsettings WHERE userid = {ctx.author.id}"
+                "SELECT * FROM callsettings WHERE userid = $1", ctx.author.id
             )
         if warninglist is None:
             statement = (
                 """INSERT INTO callsettings (userid,settingbool) VALUES($1,$2);"""
             )
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.author.id, False)
             await ctx.send(
-                f"{ctx.author.mention} Your call settings was successfully set to {checkEmoji(False)}.",
+                f"{ctx.author.mention} Your call settings was successfully set to {check_emoji(False)}.",
                 ephemeral=True,
             )
         else:
-            currentSet = warninglist["settingbool"]
-            newSet = not currentSet
+            current_set = warninglist["settingbool"]
+            new_set = not current_set
             await ctx.send(
-                f"{ctx.author.mention} Your call settings was successfully set to {checkEmoji(newSet)}.",
+                f"{ctx.author.mention} Your call settings was successfully set to {check_emoji(new_set)}.",
                 ephemeral=True,
             )
             # UPDATE shoelace_data SET sl_avail = 6 WHERE sl_name = 'sl7'
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(
-                    f"UPDATE callsettings VALUES SET settingBool = {newSet} WHERE userid = {ctx.author.id}"
+                    "UPDATE callsettings SET settingBool = $1 WHERE userid = $2",
+                    new_set,
+                    ctx.author.id,
                 )
 
     @commands.cooldown(1, 60, BucketType.member)
@@ -7434,45 +4701,45 @@ class Call(commands.Cog):
     )
     @commands.guild_only()
     async def call(self, ctx, member: discord.User, reason: str = None):
-        isVerified = checkstaff(ctx.author)
-        exEmoji = ""
-        if isVerified:
-            exEmoji = "<a:checkmark:877399181285793842>"
-        if reason == None:
+        is_verified = checkstaff(ctx.author)
+        ex_emoji = ""
+        if is_verified:
+            ex_emoji = "✅"
+        if reason is None:
             reason = "no reason"
         embed = discord.Embed(
-            title=f"Outgoing call",
-            description=f"Call ringing <a:loading:824193916818554960>",
+            title="Outgoing call",
+            description="Call ringing ⏳",
         )
         embed.add_field(name="Dialer", value=ctx.author.mention)
         embed.add_field(name="Receiver", value=member.mention)
         try:
             prefix = ctx.prefix
-        except:
+        except Exception:
             prefix = "/"
         messageonesent = None
         try:
             messageonesent = await ctx.author.send(embed=embed)
-        except:
+        except Exception:
             if ctx.channel.permissions_for(ctx.guild.me).attach_files:
                 f = discord.File(
                     "./resources/common/dmEnable.jpg", filename="dmEnable.jpg"
                 )
-                e = discord.Embed(title=f"Dms disabled")
+                e = discord.Embed(title="Dms disabled")
                 e.add_field(
                     name="Command author", value=f"{ctx.author.mention}", inline=False
                 )
                 e.set_image(url="attachment://dmEnable.jpg")
-                mentionMes = await ctx.send(ctx.author.mention, ephemeral=True)
+                mention_mes = await ctx.send(ctx.author.mention, ephemeral=True)
                 await asyncio.sleep(1)
-                await mentionMes.delete()
+                await mention_mes.delete()
                 await ctx.send(
                     f"{ctx.author.mention} Your dms are disabled , you need to enable dms for this command.",
                     ephemeral=True,
                 )
-                dmWarnings = await ctx.send(file=f, embed=e, ephemeral=True)
+                dm_warnings = await ctx.send(file=f, embed=e, ephemeral=True)
                 await asyncio.sleep(5)
-                await dmWarnings.delete()
+                await dm_warnings.delete()
             else:
                 await ctx.send(
                     f"{ctx.author.mention} Your dms are disabled , you need to enable dms for this command.",
@@ -7483,36 +4750,37 @@ class Call(commands.Cog):
             f"{ctx.author.mention} go to your dm ({messageonesent.jump_url}) for the call.",
             ephemeral=True,
         )
-        embedOne = discord.Embed(
-            title=f"Incoming call",
-            description=f"Call from {exEmoji}{ctx.author} in {ctx.guild} , click accept/deny .",
+        embed_one = discord.Embed(
+            title="Incoming call",
+            description=f"Call from {ex_emoji}{ctx.author} in {ctx.guild} , click accept/deny .",
         )
-        embedOne.add_field(name="Call reason", value=reason)
-        async with pool.acquire() as con:
+        embed_one.add_field(name="Call reason", value=reason)
+        async with client.database.pool.acquire() as con:
             calllist = await con.fetchrow(
-                f"SELECT * FROM callsettings WHERE userid = {member.id}"
+                "SELECT * FROM callsettings WHERE userid = $1", member.id
             )
-        memberSettings = False
+        member_settings = False
         if calllist is None:
             statement = (
                 """INSERT INTO callsettings (userid,settingbool) VALUES($1,$2);"""
             )
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, member.id, False)
-            memberSettings = False
+            member_settings = False
         else:
-            memberSettings = calllist["settingbool"]
-        if memberSettings:
+            member_settings = calllist["settingbool"]
+        if member_settings:
             try:
-                messagesent = await member.send(embed=embedOne)
-            except:
-                await send_generic_error_embed(ctx, error_data=
-                    f"Your call couldn't connect because {member.name} had their dms disabled ."
+                messagesent = await member.send(embed=embed_one)
+            except Exception:
+                await send_generic_error_embed(
+                    ctx,
+                    error_data=f"Your call couldn't connect because {member.name} had their dms disabled .",
                 )
                 return
 
-            await messagesent.add_reaction("<:acceptcall:874979115533484043>")
-            await messagesent.add_reaction("<:declinecall:874982302789300267>")
+            await messagesent.add_reaction("✅")
+            await messagesent.add_reaction("❌")
             reactionadded = ""
 
             def check(payload):
@@ -7523,19 +4791,14 @@ class Call(commands.Cog):
                 return (
                     payload.user_id == member.id
                     and payload.message_id == messagesent.id
-                    and (
-                        str(payload.emoji) == "<:acceptcall:874979115533484043>"
-                        or str(payload.emoji) == "<:declinecall:874982302789300267>"
-                    )
+                    and (str(payload.emoji) == "✅" or str(payload.emoji) == "❌")
                 )
 
             try:
-                payload = await client.wait_for(
-                    "raw_reaction_add", check=check, timeout=30
-                )
-            except asyncio.TimeoutError:
+                await client.wait_for("raw_reaction_add", check=check, timeout=30)
+            except TimeoutError:
                 newembed = messageonesent.embeds[0]
-                newembed.description = "Call declined <a:denied:877399177208954912>"
+                newembed.description = "Call declined ❌"
                 await messageonesent.edit(embed=newembed)
                 await ctx.author.send(
                     f"Your call to {member.mention} was declined because of no response."
@@ -7545,9 +4808,9 @@ class Call(commands.Cog):
                 )
                 return
             else:
-                if reactionadded == "<:acceptcall:874979115533484043>":
+                if reactionadded == "✅":
                     newembed = messageonesent.embeds[0]
-                    newembed.description = "Call accepted <a:yes:872664918736928858>"
+                    newembed.description = "Call accepted ✅"
                     await messageonesent.edit(embed=newembed)
                     await ctx.author.send(
                         f"Your outgoing call to {member.mention} is accepted , start talking!"
@@ -7555,9 +4818,9 @@ class Call(commands.Cog):
                     await member.send(
                         f"Your incoming call from {ctx.author.mention} is accepted , start talking!"
                     )
-                elif reactionadded == "<:declinecall:874982302789300267>":
+                elif reactionadded == "❌":
                     newembed = messageonesent.embeds[0]
-                    newembed.description = "Call declined <a:denied:877399177208954912>"
+                    newembed.description = "Call declined ❌"
                     await messageonesent.edit(embed=newembed)
                     await ctx.author.send(
                         f"Your outgoing call to {member.mention} is declined."
@@ -7567,101 +4830,42 @@ class Call(commands.Cog):
                     )
                     return
 
+                async def relay_call_message(_message, sender, recipient):
+                    content = _message.content
+                    if await check_profane(content):
+                        content = gencharstr(len(content), "-")
+                    try:
+                        await recipient.send(
+                            f"**{sender.display_name}** -> `{content}`"
+                        )
+                        for attachment in _message.attachments:
+                            data = await attachment.read()
+                            file = discord.File(
+                                BytesIO(data), filename=attachment.filename
+                            )
+                            await recipient.send(file=file)
+                    except Exception as ex:
+                        with contextlib.suppress(discord.HTTPException):
+                            await sender.send(
+                                f"Your message could not be relayed to "
+                                f"**{recipient.display_name}**: {ex}"
+                            )
+
                 def check(_message: discord.Message) -> bool:
-                    nonlocal member
-                    if _message.author == member:
-                        theMessage = _message.content
-                        if (
-                            theMessage == f"{prefix}end"
-                            or theMessage == f"{prefix}hangup"
-                        ):
-                            return True
-                        if checkProfane(theMessage):
-                            theMessage = gencharstr(len(theMessage), "-")
-                        try:
-                            asyncio.create_task(
-                                ctx.author.send(
-                                    f"**{member.name}#{member.discriminator}** -> `{theMessage}`"
-                                )
-                            )
-                        except:
-                            try:
-                                asyncio.create_task(
-                                    member.send(
-                                        f"Your message (`{_message.content}`) couldn't be sent to **{ctx.author.name}#{ctx.author.discriminator}**"
-                                    )
-                                )
-                            except:
-                                pass
-                        if len(_message.attachments) > 0:
-                            try:
-                                readfile = asyncio.create_task(
-                                    _message.attachments[0].read()
-                                )
-                                asyncio.create_task(asyncio.sleep(1))
-                                newfile = discord.File(
-                                    BytesIO(readfile),
-                                    filename=_message.attachments[0].filename,
-                                )
-                                asyncio.create_task(ctx.author.send(file=newfile))
-                            except Exception as ex:
-                                try:
-                                    asyncio.create_task(
-                                        member.send(
-                                            f"Your file couldn't be sent({ex}) to **{ctx.author.name}#{ctx.author.discriminator}**"
-                                        )
-                                    )
-                                except:
-                                    pass
-                    elif _message.author == ctx.author:
-                        theMessage = _message.content
-                        if (
-                            theMessage == f"{prefix}end"
-                            or theMessage == f"{prefix}hangup"
-                        ):
-                            return False
-                        if checkProfane(theMessage):
-                            theMessage = gencharstr(len(theMessage), "-")
-                        try:
-                            asyncio.create_task(
-                                member.send(
-                                    f"**{ctx.author.name}#{ctx.author.discriminator}** -> `{theMessage}`"
-                                )
-                            )
-                        except:
-                            try:
-                                asyncio.create_task(
-                                    ctx.author.send(
-                                        f"Your _message (`{_message.content}`) couldn't be sent to **{member.name}#{member.discriminator}**"
-                                    )
-                                )
-                            except:
-                                pass
-                        if len(_message.attachments) > 0:
-                            try:
-                                readfile = asyncio.create_task(
-                                    _message.attachments[0].read()
-                                )
-                                asyncio.create_task(asyncio.sleep(1))
-                                newfile = discord.File(
-                                    BytesIO(readfile),
-                                    filename=_message.attachments[0].filename,
-                                )
-                                asyncio.create_task(member.send(file=newfile))
-                            except Exception as ex:
-                                try:
-                                    asyncio.create_task(
-                                        ctx.author.send(
-                                            f"Your file couldn't be sent({ex}) to **{member.mention}**"
-                                        )
-                                    )
-                                except:
-                                    pass
+                    if _message.author not in (member, ctx.author):
+                        return False
+                    if _message.content in (f"{prefix}end", f"{prefix}hangup"):
+                        return True
+                    recipient = ctx.author if _message.author == member else member
+                    client.create_background_task(
+                        relay_call_message(_message, _message.author, recipient),
+                        name="call-message-relay",
+                    )
                     return False
 
                 try:
-                    message = await client.wait_for("message", timeout=150, check=check)
-                except asyncio.TimeoutError:
+                    await client.wait_for("message", timeout=150, check=check)
+                except TimeoutError:
                     await ctx.author.send(
                         f" The call between {ctx.author.mention} and {member.mention} ended (150 seconds passed)."
                     )
@@ -7679,9 +4883,9 @@ class Call(commands.Cog):
             await asyncio.sleep(30)
             try:
                 newembed = messageonesent.embeds[0]
-                newembed.description = "Call declined <a:denied:877399177208954912>"
+                newembed.description = "Call declined ❌"
                 await messageonesent.edit(embed=newembed)
-            except:
+            except Exception:
                 pass
             # await member.send(f"Your call from {ctx.author.mention} was automatically declined as it was disabled in settings , do a!calltoggle to enable it.")
             await ctx.author.send(
@@ -7712,7 +4916,9 @@ class Fun(commands.Cog):
         description=" This command can be used to play Chess in the Park (chess)",
     )
     async def playgame(self, ctx):
-        await send_generic_error_embed(ctx, error_data="No argument was provided in the playgame command.")
+        await send_generic_error_embed(
+            ctx, error_data="No argument was provided in the playgame command."
+        )
         return
 
     @commands.cooldown(1, 30, BucketType.member)
@@ -7724,22 +4930,22 @@ class Fun(commands.Cog):
     )
     async def chess(self, ctx):
         check_ensure_permissions(ctx, ctx.guild.me, ["create_instant_invite"])
-        link = await togetherControl.create_link(
-            ctx.author.voice.channel.id, "chess", max_age=3600
+        link = await create_activity_invite(
+            ctx.author.voice.channel, "chess", max_age=3600
         )
-        embedVar = discord.Embed(
+        embed_var = discord.Embed(
             title="",
             description=f'[Start playing]({link} "Join your friends in a Chess in the Park activity.")',
             color=0x00FF00,
         )
-        embedVar.set_author(
-            name=f"Chess-Park Game",
-            icon_url="https://cdn.discordapp.com/avatars/856049884758278144/0cea7c51fb8568067f92d7826496dca2.png?size=1024",
+        embed_var.set_author(
+            name="Chess-Park Game",
+            icon_url=client.user.display_avatar.url,
         )
-        embedVar.set_footer(
+        embed_var.set_footer(
             text="This game is a discord beta feature only supported on desktop versions of discord."
         )
-        await ctx.send(embed=embedVar)
+        await ctx.send(embed=embed_var)
 
     @chess.before_invoke
     async def ensure_voice(self, ctx):
@@ -7749,23 +4955,12 @@ class Fun(commands.Cog):
                 pass
             else:
                 ctx.command.reset_cooldown(ctx)
-                await send_generic_error_embed(ctx, error_data="You are not connected to a voice channel.")
+                await send_generic_error_embed(
+                    ctx, error_data="You are not connected to a voice channel."
+                )
                 return
         elif ctx.voice_client.is_playing():
             ctx.voice_client.stop()
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        brief="This command can be used to get some (python or java) facts.",
-        description="This command can be used to get some (python or java) facts.",
-        usage="",
-    )
-    async def fact(self, ctx):
-        fact = random.choice(randomlist)
-        if fact in randomjava:
-            await ctx.send(f"``` Random Java Fact : {fact}```", ephemeral=True)
-        elif fact in randompython:
-            await ctx.send(f"``` Random Python Fact : {fact}```", ephemeral=True)
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
@@ -7788,25 +4983,25 @@ class Fun(commands.Cog):
             description=f"This emoji {animatemsg}has an id {emoji.id} and was created in {emoji.guild}.",
             timestamp=emoji.created_at,
         )
-        authorEm = emoji.user
-        if authorEm == None:
-            authorEm = "Not Found <a:denied:877399177208954912>"
-            selectEm = None
-            emojisL = emoji.guild.emojis
-            for emojiloop in emojisL:
+        author_em = emoji.user
+        if author_em is None:
+            author_em = "Not Found ❌"
+            select_em = None
+            emojis_l = emoji.guild.emojis
+            for emojiloop in emojis_l:
                 if emoji.id == emojiloop.id:
-                    selectEm = emojiloop
-            if not selectEm == None:
-                authorEm = selectEm.user
+                    select_em = emojiloop
+            if select_em is not None:
+                author_em = select_em.user
             else:
-                authorEm = "Not Found <a:denied:877399177208954912>"
+                author_em = "Not Found ❌"
 
-        embed.add_field(name="Author :", value=authorEm)
+        embed.add_field(name="Author :", value=author_em)
         embed.add_field(name="Emoji URL :", value=emoji.url)
         embed.add_field(name="Emoji Syntax :", value=f"`{emojisyntax}`")
         embed.add_field(
             name=f"Does it require colons? :{emoji.name}:",
-            value=checkEmoji(emoji.require_colons),
+            value=check_emoji(emoji.require_colons),
         )
         emojimsg = "Is usable by bots ? :"
         emojimention = ":red_circle:"
@@ -7831,47 +5026,37 @@ class Fun(commands.Cog):
     async def serverinfo(self, ctx, *, guild: discord.Guild = None):
         if guild is None:
             guild = ctx.guild
-        guildname = str(guild.name)
         guilddescription = guild.description
         if guilddescription is None:
             guilddescription = ""
         else:
             guilddescription = guilddescription + "\n"
         if "COMMUNITY" in guild.features:
-            guilddescription = (
-                guilddescription + "Community server <a:verified:875327156572532736> \n"
-            )
+            guilddescription = guilddescription + "Community server ✅ \n"
         if "VANITY_URL" in guild.features:
-            guilddescription = (
-                guilddescription + "Vanity url <a:verified:875327156572532736> \n"
-            )
+            guilddescription = guilddescription + "Vanity url ✅ \n"
         if "VERIFIED" in guild.features:
-            guilddescription = (
-                guilddescription + "Verified server <a:verified:875327156572532736> \n"
-            )
+            guilddescription = guilddescription + "Verified server ✅ \n"
         if "PARTNERED" in guild.features:
-            guilddescription = (
-                guilddescription + "Partnered server <a:verified:875327156572532736> \n"
-            )
+            guilddescription = guilddescription + "Partnered server ✅ \n"
         if len(guilddescription) == 0:
             guilddescription = "** **"
         id = str(guild.id)
-        memberCount = str(guild.member_count)
+        member_count = str(guild.member_count)
         role_count = str(len(guild.roles))
         icon = guild.icon
         banner = guild.banner
-        guildowner = guild.owner_id
-        guildowner = f"<@{guildowner}>"
-        if guildowner == None:
-            guildowner = "<:offline:886434154412113961> Not found"
+        guild_owner = guild.owner
+        guild_owner_value = (
+            guild_owner.mention if guild_owner is not None else "⚫ Not found"
+        )
         embedcolor = Color.blue()
         embed = discord.Embed(title=guilddescription, color=embedcolor)
         embed.add_field(name="Name", value=f"{guild.name}", inline=False)
-        embed.add_field(name="Owner", value=guildowner, inline=True)
+        embed.add_field(name="Owner", value=guild_owner_value, inline=True)
         embed.add_field(name="Server ID", value=id, inline=True)
         embed.add_field(name="Channel ID", value=ctx.channel.id, inline=True)
         # list_of_bots = []
-        botcount = 0
         # for botloop in guild.members:
         #    if botloop.bot:
         #        list_of_bots.append(botloop)
@@ -7879,10 +5064,10 @@ class Fun(commands.Cog):
 
         embed.add_field(
             name="Bot Count",
-            value="<:offline:886434154412113961> Not found",
+            value="⚫ Not found",
             inline=True,
         )
-        embed.add_field(name="Member Count", value=str(memberCount), inline=True)
+        embed.add_field(name="Member Count", value=str(member_count), inline=True)
         embed.add_field(name="Role Count", value=str(role_count), inline=True)
         timel = guild.created_at
         tuplea = timel.timetuple()
@@ -7905,11 +5090,11 @@ class Fun(commands.Cog):
             mfarequired = "Authorization required for moderation"
         embed.add_field(name="Authorization", value=mfarequired, inline=True)
         embed.add_field(
-            name="Server level <:serverboost:877403934011064320>",
+            name="Server level 🚀",
             value=f"Level {guild.premium_tier}",
         )
         embed.add_field(
-            name="Server boosts <:serverboost:877403934011064320>",
+            name="Server boosts 🚀",
             value=guild.premium_subscription_count,
         )
 
@@ -7919,7 +5104,7 @@ class Fun(commands.Cog):
             embed.set_thumbnail(url=banner.url)
         try:
             await ctx.send(embed=embed, ephemeral=True)
-        except:
+        except Exception:
             pass
 
     @commands.cooldown(1, 60, BucketType.member)
@@ -7930,30 +5115,28 @@ class Fun(commands.Cog):
         usage="@member",
     )
     @commands.guild_only()
-    async def profile(
-        self, ctx, *, member: typing.Union[discord.Member, discord.User] = None
-    ):
+    async def profile(self, ctx, *, member: discord.Member | discord.User = None):
         if member is None:
             member = ctx.author
         asset = member.display_avatar
         banner = member.banner
         embedcolor = member.accent_color
-        if embedcolor == None:
+        if embedcolor is None:
             embedcolor = Color.blue()
-        embedOne = discord.Embed(title="", description=str(asset), color=embedcolor)
-        bypassedEmoji = "<a:denied:877399177208954912>"
+        embed_one = discord.Embed(title="", description=str(asset), color=embedcolor)
+        bypassed_emoji = "❌"
         try:
             guildpos = "Member"
             if member.guild.owner_id == member.id:
                 guildpos = "Owner"
             if ctx.channel.permissions_for(member).manage_guild or checkstaff(member):
-                bypassedEmoji = "<a:verified:875327156572532736>"
-            embedOne.add_field(name="Auto-mod bypass", value=bypassedEmoji)
-            embedOne.add_field(name=f"{member.guild}", value=f"{guildpos}")
-        except:
+                bypassed_emoji = "✅"
+            embed_one.add_field(name="Auto-mod bypass", value=bypassed_emoji)
+            embed_one.add_field(name=f"{member.guild}", value=f"{guildpos}")
+        except Exception:
             pass
-        embedOne.add_field(name="Member id", value=str(member.id))
-        embedOne.add_field(name="Bot", value=str(checkEmoji(member.bot)))
+        embed_one.add_field(name="Member id", value=str(member.id))
+        embed_one.add_field(name="Bot", value=str(check_emoji(member.bot)))
         try:
             timel = member.created_at
             tuplea = timel.timetuple()
@@ -7970,8 +5153,8 @@ class Fun(commands.Cog):
             warning = ""
             if newaccount(member):
                 warning = "(:octagonal_sign: New account)"
-            embedOne.add_field(name="Registered", value=f"<t:{timestamp}:R> {warning}")
-        except:
+            embed_one.add_field(name="Registered", value=f"<t:{timestamp}:R> {warning}")
+        except Exception:
             pass
         try:
             timel = member.joined_at
@@ -7986,13 +5169,13 @@ class Fun(commands.Cog):
                     tuplea.tm_sec,
                 ).timestamp()
             )
-            embedOne.add_field(name="Joined", value=f"<t:{timestamp}:R>")
-        except:
+            embed_one.add_field(name="Joined", value=f"<t:{timestamp}:R>")
+        except Exception:
             pass
         try:
-            embedOne.add_field(name="Roles", value=listToString(member.roles))
-            embedOne.add_field(name="Nicknames", value=str(member.nick))
-        except:
+            embed_one.add_field(name="Roles", value=list_to_string(member.roles))
+            embed_one.add_field(name="Nicknames", value=str(member.nick))
+        except Exception:
             pass
 
         details = member.public_flags
@@ -8008,14 +5191,14 @@ class Fun(commands.Cog):
         if details.staff:
             detailstring += "Official Discord Staff \n"
         if checkstaff(member):
-            detailstring += f"<a:checkmark:877399181285793842> Official {client.user.name} developer ! \n"
+            detailstring += f"✅ Official {client.user.name} developer ! \n"
         if await uservoted(member):
-            detailstring += f"<a:verified:875327156572532736> Voted on top.gg \n"
+            detailstring += "✅ Voted on top.gg \n"
         exists = False
         banperms = True
         try:
-            bannedmembers = await ctx.guild.bans(limit=None).flatten()
-        except:
+            bannedmembers = [entry async for entry in ctx.guild.bans(limit=None)]
+        except Exception:
             banperms = False
         if banperms:
             for loopmember in bannedmembers:
@@ -8023,23 +5206,23 @@ class Fun(commands.Cog):
                     exists = True
                     break
         if exists:
-            detailstring += f"Member banned :hammer:"
+            detailstring += "Member banned :hammer:"
         try:
-            dangperms = await dangPerm(ctx, member)
-            embedOne.add_field(name="Dangerous permissions: ", value=dangperms)
-        except:
+            dangperms = await dang_perm(ctx, member)
+            embed_one.add_field(name="Dangerous permissions: ", value=dangperms)
+        except Exception:
             pass
         if detailstring != "":
-            embedOne.add_field(
+            embed_one.add_field(
                 name="Additional Details :", value=detailstring, inline=False
             )
         if member.display_avatar is not None:
-            embedOne.set_author(name=member.name, icon_url=member.display_avatar)
+            embed_one.set_author(name=member.name, icon_url=member.display_avatar)
         if banner is not None:
-            embedOne.set_thumbnail(url=banner.url)
+            embed_one.set_thumbnail(url=banner.url)
         try:
-            await ctx.send(embed=embedOne, ephemeral=True)
-        except:
+            await ctx.send(embed=embed_one, ephemeral=True)
+        except Exception:
             pass
 
 
@@ -8057,25 +5240,17 @@ class Social(commands.Cog):
         check_ensure_permissions(ctx, ctx.guild.me, ["attach_files"])
         if member is None:
             member = ctx.author
-        imgbackground = Image.open("./resources/welcomeuser/background.jpg")
-        asset = member.display_avatar
-        data = BytesIO(await asset.read())
-        pfp = Image.open(data)
-        pfp = pfp.resize((170, 170))
-        imgbackground.paste(pfp, (388, 195))
-        draw = ImageDraw.Draw(imgbackground)
-        # font = ImageFont.truetype(<font-file>, <font-size>)
-        font = ImageFont.truetype("./consolasbold.ttf", 18)
-        # draw.text((x, y),"Sample Text",(r,g,b))
-        draw.text(
-            (8, 465),
-            f"Welcome {member.name} , you are the {member.guild.member_count}th member to join {member.guild}.",
-            (255, 255, 255),
-            font=font,
+        avatar_bytes = await member.display_avatar.read()
+        destination = f"./resources/temp/welcome_{ctx.author.id}.jpg"
+        await asyncio.to_thread(
+            render_welcome_image,
+            avatar_bytes,
+            member.name,
+            member.guild.member_count,
+            str(member.guild),
+            destination,
         )
-
-        imgbackground.save(f"./resources/temp/welcome_{ctx.author.id}.jpg")
-        file = discord.File(f"./resources/temp/welcome_{ctx.author.id}.jpg")
+        file = discord.File(destination)
         embed = discord.Embed()
         embed.set_image(url=f"attachment://welcome_{ctx.author.id}.jpg")
         await ctx.send(file=file, embed=embed, ephemeral=True)
@@ -8091,23 +5266,24 @@ class Social(commands.Cog):
         check_ensure_permissions(ctx, ctx.guild.me, ["attach_files"])
         if member is None:
             member = ctx.author
-        wanted = Image.open("./resources/wanteduser/background.jpg")
-        asset = member.display_avatar
-        data = BytesIO(await asset.read())
-        pfp = Image.open(data)
-        pfp = pfp.resize((139, 172))
-        wanted.paste(pfp, (114, 153))
-        wanted.save(f"./resources/temp/wanted_{ctx.author.id}.jpg")
-        file = discord.File(f"./resources/temp/wanted_{ctx.author.id}.jpg")
+        avatar_bytes = await member.display_avatar.read()
+        destination = f"./resources/temp/wanted_{ctx.author.id}.jpg"
+        await asyncio.to_thread(render_wanted_image, avatar_bytes, destination)
+        file = discord.File(destination)
         embed = discord.Embed()
         embed.set_image(url=f"attachment://wanted_{ctx.author.id}.jpg")
         try:
             await ctx.send(file=file, embed=embed, ephemeral=True)
-        except:
+        except Exception:
             pass
 
 
+def constructslashephemeralctx(ctx):
+    async def fakerespond(*args, **kwargs):
+        return await ctx.send(*args, **kwargs, ephemeral=True)
 
+    ctx.send = fakerespond
+    return ctx
 
 
 def message_probability(
@@ -8152,23 +5328,27 @@ class Giveaways(commands.Cog):
     async def poll(self, ctx, time: str, *, reasonpoll: str):
         timenum = convert(time)
         if timenum == -1:
-            await send_generic_error_embed(ctx, error_data=
-                "You didn't answer with a proper unit. Use (s|m|h|d) next time!"
+            await send_generic_error_embed(
+                ctx,
+                error_data="You didn't answer with a proper unit. Use (s|m|h|d) next time!",
             )
             return
         elif timenum == -2:
-            await send_generic_error_embed(ctx, error_data=
-                "The time must be an integer. Please enter an integer next time."
+            await send_generic_error_embed(
+                ctx,
+                error_data="The time must be an integer. Please enter an integer next time.",
             )
             return
         elif timenum == -3:
-            await send_generic_error_embed(ctx, error_data=
-                "The time must be an positive number. Please enter an positive number next time."
+            await send_generic_error_embed(
+                ctx,
+                error_data="The time must be an positive number. Please enter an positive number next time.",
             )
             return
         if timenum > 86400:
-            await send_generic_error_embed(ctx, error_data=
-                "It is not recommended to set the time to more than 1 day due to bot restarts."
+            await send_generic_error_embed(
+                ctx,
+                error_data="It is not recommended to set the time to more than 1 day due to bot restarts.",
             )
         embed = discord.Embed(
             title=reasonpoll,
@@ -8176,14 +5356,14 @@ class Giveaways(commands.Cog):
         )
         embed.add_field(name="Total users", value="0")
         embed.add_field(
-            name="Percentage of votes <a:verified:875327156572532736>/<a:denied:877399177208954912>",
+            name="Percentage of votes ✅/❌",
             value="0/0 %",
         )
         msgsent = await ctx.send(embed=embed)
-        await msgsent.add_reaction("<a:verified:875327156572532736>")
-        await msgsent.add_reaction("<a:denied:877399177208954912>")
-        results = f"INSERT INTO polls (messageid) VALUES($1);"
-        async with pool.acquire() as con:
+        await msgsent.add_reaction("✅")
+        await msgsent.add_reaction("❌")
+        results = "INSERT INTO polls (messageid) VALUES($1);"
+        async with client.database.pool.acquire() as con:
             await con.execute(results, msgsent.id)
         await asyncio.sleep(timenum)
         _message = await ctx.channel.fetch_message(msgsent.id)
@@ -8193,8 +5373,8 @@ class Giveaways(commands.Cog):
         )
         await _message.edit(embed=editedembed)
         await msgsent.reply(f"The poll on {reasonpoll} for {time} was completed.")
-        async with pool.acquire() as con:
-            await con.execute(f"DELETE FROM polls WHERE messageid = {msgsent.id}")
+        async with client.database.pool.acquire() as con:
+            await con.execute("DELETE FROM polls WHERE messageid = $1", msgsent.id)
 
     @commands.hybrid_command(
         brief="This command can be used to do a instant giveaway for the provided members.",
@@ -8210,7 +5390,7 @@ class Giveaways(commands.Cog):
             try:
                 member = await commands.MemberConverter().convert(ctx, membername)
                 members.append(member)
-            except:
+            except Exception:
                 pass
 
         if len(members) == 0:
@@ -8234,7 +5414,7 @@ class Giveaways(commands.Cog):
             ctx.guild.me,
             ["manage_messages", "read_message_history", "add_reactions"],
         )
-        await ctx.interaction.response.defer()
+        await ctx.defer()
         count = 1
         await ctx.send(
             "Let's start with this giveaway! Answer these questions within 15 seconds!",
@@ -8260,36 +5440,39 @@ class Giveaways(commands.Cog):
         count = count + 1
         try:
             msg = await client.wait_for("message", timeout=15.0, check=check)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             try:
                 await ctx.channel.purge(limit=count)
-            except:
+            except Exception:
                 await ctx.send(
                     "I do not have `manage messages` permissions to delete messages.",
                     ephemeral=True,
                 )
         try:
             membercount = int(msg.content)
-        except:
+        except Exception:
             try:
                 await ctx.channel.purge(limit=count)
-            except:
+            except Exception:
                 await ctx.send(
                     "I do not have `manage messages` permissions to delete messages.",
                     ephemeral=True,
                 )
-            await send_generic_error_embed(ctx, error_data="You didn't answer with a valid number.")
+            await send_generic_error_embed(
+                ctx, error_data="You didn't answer with a valid number."
+            )
             return
         if membercount <= 0:
             try:
                 await ctx.channel.purge(limit=count)
-            except:
+            except Exception:
                 await ctx.send(
                     "I do not have `manage messages` permissions to delete messages.",
                     ephemeral=True,
                 )
-            await send_generic_error_embed(ctx, error_data=
-                "You didn't answer with a proper number , Give a number above zero."
+            await send_generic_error_embed(
+                ctx,
+                error_data="You didn't answer with a proper number , Give a number above zero.",
             )
             return
 
@@ -8298,125 +5481,134 @@ class Giveaways(commands.Cog):
             count = count + 1
             try:
                 msg = await client.wait_for("message", timeout=15.0, check=check)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 try:
                     await ctx.channel.purge(limit=count)
-                except:
+                except Exception:
                     await ctx.send(
                         "I do not have `manage messages` permissions to delete messages.",
                         ephemeral=True,
                     )
 
-                await send_generic_error_embed(ctx, error_data=
-                    "You didn't answer in time, please be quicker next time!"
+                await send_generic_error_embed(
+                    ctx,
+                    error_data="You didn't answer in time, please be quicker next time!",
                 )
                 return
             answers.append(msg.content)
 
         try:
             c_id = int(answers[0][2:-1])
-        except:
+        except Exception:
             try:
                 await ctx.channel.purge(limit=count)
-            except:
+            except Exception:
                 await ctx.send(
                     "I do not have `manage messages` permissions to delete messages.",
                     ephemeral=True,
                 )
-            await send_generic_error_embed(ctx, error_data=
-                f"You didn't mention a channel properly. Do it like this {ctx.channel.mention} next time."
+            await send_generic_error_embed(
+                ctx,
+                error_data=f"You didn't mention a channel properly. Do it like this {ctx.channel.mention} next time.",
             )
             return
 
         channel = client.get_channel(c_id)
         if not channel.permissions_for(ctx.guild.me).view_channel:
-            await send_generic_error_embed(ctx, error_data=
-                f"I cannot view the channel(view_channel) {channel.mention} for sending a message for a giveaway."
+            await send_generic_error_embed(
+                ctx,
+                error_data=f"I cannot view the channel(view_channel) {channel.mention} for sending a message for a giveaway.",
             )
             return
         if not channel.permissions_for(ctx.guild.me).send_messages:
-            await send_generic_error_embed(ctx, error_data=
-                f"I cannot send messages(send_messages) in channel {channel.mention} for sending a message for a giveaway."
+            await send_generic_error_embed(
+                ctx,
+                error_data=f"I cannot send messages(send_messages) in channel {channel.mention} for sending a message for a giveaway.",
             )
             return
         if not channel.permissions_for(ctx.guild.me).embed_links:
-            await send_generic_error_embed(ctx, error_data=
-                f"I cannot send embeds(embed_links) in channel {channel.mention} for sending a message for a giveaway."
+            await send_generic_error_embed(
+                ctx,
+                error_data=f"I cannot send embeds(embed_links) in channel {channel.mention} for sending a message for a giveaway.",
             )
             return
         timenum = convert(answers[1])
         if timenum == -1:
             try:
                 await ctx.channel.purge(limit=count)
-            except:
+            except Exception:
                 await ctx.send(
                     "I do not have `manage messages` permissions to delete messages.",
                     ephemeral=True,
                 )
 
-            await send_generic_error_embed(ctx, error_data=
-                "You didn't answer with a proper unit. Use (s|m|h|d) next time!"
+            await send_generic_error_embed(
+                ctx,
+                error_data="You didn't answer with a proper unit. Use (s|m|h|d) next time!",
             )
 
             return
         elif timenum == -2:
             try:
                 await ctx.channel.purge(limit=count)
-            except:
+            except Exception:
                 await ctx.send(
                     "I do not have `manage messages` permissions to delete messages.",
                     ephemeral=True,
                 )
 
-            await send_generic_error_embed(ctx, error_data=
-                "The time must be an integer. Please enter an integer next time."
+            await send_generic_error_embed(
+                ctx,
+                error_data="The time must be an integer. Please enter an integer next time.",
             )
             return
         elif timenum == -3:
             try:
                 await ctx.channel.purge(limit=count)
-            except:
+            except Exception:
                 await ctx.send(
                     "I do not have `manage messages` permissions to delete messages.",
                     ephemeral=True,
                 )
-            await send_generic_error_embed(ctx, error_data=
-                "The time must be an positive number. Please enter an positive number next time."
+            await send_generic_error_embed(
+                ctx,
+                error_data="The time must be an positive number. Please enter an positive number next time.",
             )
             return
         if timenum > 86400:
-            await send_generic_error_embed(ctx, error_data=
-                "It is not recommended to set the time to more than 1 day due to bot restarts."
+            await send_generic_error_embed(
+                ctx,
+                error_data="It is not recommended to set the time to more than 1 day due to bot restarts.",
             )
             return
 
         prize = answers[2]
         try:
             await ctx.channel.purge(limit=count)
-        except:
+        except Exception:
             await ctx.send(
                 "I do not have `manage messages` permissions to delete messages.",
                 ephemeral=True,
             )
 
-        embedOne = discord.Embed(
+        embed_one = discord.Embed(
             title="Giveaways🎉", description=prize, color=Color.green()
         )
 
-        embedOne.add_field(name="** **", value=f"Ends At: {answers[1]}", inline=False)
+        embed_one.add_field(name="** **", value=f"Ends At: {answers[1]}", inline=False)
 
-        embedOne.add_field(
+        embed_one.add_field(
             name="** **", value=f"Hosted By {ctx.author.mention}", inline=False
         )
 
-        embedOne.add_field(name="** **", value="Giveaway id:", inline=False)
-        my_msg = await channel.send(embed=embedOne)
-        listEmbeds = my_msg.embeds
-        for embedTwo in listEmbeds:
-            embedTwo.set_field_at(
+        embed_one.add_field(name="** **", value="Giveaway id:", inline=False)
+        my_msg = await channel.send(embed=embed_one)
+        list_embeds = my_msg.embeds
+        for embed_two in list_embeds:
+            embed_two.set_field_at(
                 index=2, name="** **", value=f"Giveaway id: {my_msg.id}", inline=False
             )
-            await my_msg.edit(embed=embedTwo)
+            await my_msg.edit(embed=embed_two)
         await my_msg.add_reaction("🎉")
 
         await asyncio.sleep(timenum)
@@ -8424,20 +5616,21 @@ class Giveaways(commands.Cog):
         new_msg = await channel.fetch_message(my_msg.id)
         await asyncio.sleep(1)
         if len(new_msg.reactions) > 0:
-            users = await new_msg.reactions[0].users().flatten()
+            users = [user async for user in new_msg.reactions[0].users()]
             try:
                 users.pop(users.index(client.user))
-            except:
+            except Exception:
                 pass
             if len(users) < membercount:
-                await send_generic_error_embed(ctx, error_data=
-                    f"Enough number of users didn't participate in giveaway of {prize}. "
+                await send_generic_error_embed(
+                    ctx,
+                    error_data=f"Enough number of users didn't participate in giveaway of {prize}. ",
                 )
                 return
             selectedwinnerids = []
             for i in range(membercount):
                 winner = random.choice(users)
-                if not winner.id in selectedwinnerids:
+                if winner.id not in selectedwinnerids:
                     selectedwinnerids.append(winner.id)
                     msgurl = new_msg.jump_url
                     await channel.send(
@@ -8459,9 +5652,11 @@ class Giveaways(commands.Cog):
         id_: int,
         prize: str,
     ):
-        await ctx.interaction.response.defer()
+        await ctx.defer()
         if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
             return
         if not channel.permissions_for(ctx.guild.me).send_messages:
             raise commands.BotMissingPermissions(["send_messages"])
@@ -8471,9 +5666,10 @@ class Giveaways(commands.Cog):
             raise commands.BotMissingPermissions(["embed_links"])
         try:
             new_msg = await channel.fetch_message(id_)
-        except:
-            await send_generic_error_embed(ctx, error_data=
-                "The ID that was entered was incorrect, make sure you have entered the correct giveaway message ID."
+        except Exception:
+            await send_generic_error_embed(
+                ctx,
+                error_data="The ID that was entered was incorrect, make sure you have entered the correct giveaway message ID.",
             )
             return
         msgurl = new_msg.jump_url
@@ -8489,9 +5685,11 @@ class Giveaways(commands.Cog):
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
     async def reroll(self, ctx, channel: discord.TextChannel, id_: int, *, prize: str):
-        await ctx.interaction.response.defer()
+        await ctx.defer()
         if channel.guild != ctx.guild:
-            await send_generic_error_embed(ctx, error_data=" The channel provided was not in this guild.")
+            await send_generic_error_embed(
+                ctx, error_data=" The channel provided was not in this guild."
+            )
             return
         if not channel.permissions_for(ctx.guild.me).send_messages:
             raise commands.BotMissingPermissions(["send_messages"])
@@ -8501,16 +5699,17 @@ class Giveaways(commands.Cog):
             raise commands.BotMissingPermissions(["embed_links"])
         try:
             new_msg = await channel.fetch_message(id_)
-        except:
-            await send_generic_error_embed(ctx, error_data=
-                "The ID that was entered was incorrect, make sure you have entered the correct giveaway message ID."
+        except Exception:
+            await send_generic_error_embed(
+                ctx,
+                error_data="The ID that was entered was incorrect, make sure you have entered the correct giveaway message ID.",
             )
             return
 
-        users = await new_msg.reactions[0].users().flatten()
+        users = [user async for user in new_msg.reactions[0].users()]
         try:
             users.pop(users.index(client.user))
-        except:
+        except Exception:
             pass
         winner = random.choice(users)
         new_msg = await channel.fetch_message(id_)
@@ -8559,20 +5758,22 @@ class Support(commands.Cog):
                 or command.name == "enable"
             ):
                 continue
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 commandlist = await con.fetchrow(
-                    f"SELECT * FROM commandguildstatus WHERE guildid = {ctx.guild.id} AND commandname = '{command.name}'"
+                    "SELECT * FROM commandguildstatus WHERE guildid = $1 AND commandname = $2",
+                    ctx.guild.id,
+                    command.name,
                 )
             if commandlist is not None:
                 continue
             else:
                 try:
                     statement = """INSERT INTO commandguildstatus (guildid,commandname) VALUES($1,$2);"""
-                    async with pool.acquire() as con:
+                    async with client.database.pool.acquire() as con:
                         await con.execute(statement, ctx.guild.id, command.name)
-                except:
+                except Exception:
                     pass
-        await ctx.send(f"Successfully disabled the commands!", ephemeral=True)
+        await ctx.send("Successfully disabled the commands!", ephemeral=True)
 
     @commands.hybrid_command(
         brief="This command can be used for enabling all commands by admin per guild.",
@@ -8591,21 +5792,25 @@ class Support(commands.Cog):
                 or command.name == "enable"
             ):
                 continue
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 commandlist = await con.fetchrow(
-                    f"SELECT * FROM commandguildstatus WHERE guildid = {ctx.guild.id} AND commandname = '{command.name}'"
+                    "SELECT * FROM commandguildstatus WHERE guildid = $1 AND commandname = $2",
+                    ctx.guild.id,
+                    command.name,
                 )
             if commandlist is None:
                 continue
             else:
                 try:
-                    async with pool.acquire() as con:
+                    async with client.database.pool.acquire() as con:
                         commandlist = await con.fetchrow(
-                            f"DELETE FROM commandguildstatus WHERE guildid = {ctx.guild.id} AND commandname = '{command.name}'"
+                            "DELETE FROM commandguildstatus WHERE guildid = $1 AND commandname = $2",
+                            ctx.guild.id,
+                            command.name,
                         )
-                except:
+                except Exception:
                     pass
-        await ctx.send(f"Successfully enabled the commands!", ephemeral=True)
+        await ctx.send("Successfully enabled the commands!", ephemeral=True)
 
     @commands.hybrid_command(
         brief="This command can be used for disabling a command by admin per guild.",
@@ -8618,8 +5823,8 @@ class Support(commands.Cog):
     async def disable(self, ctx, command):
         commandobj = client.get_command(command)
         if commandobj is None:
-            await send_generic_error_embed(ctx, error_data=
-                f"The command {command} couldn't be found in the bot."
+            await send_generic_error_embed(
+                ctx, error_data=f"The command {command} couldn't be found in the bot."
             )
             return
         if (
@@ -8628,24 +5833,29 @@ class Support(commands.Cog):
             or commandobj.name == "disable"
             or commandobj.name == "enable"
         ):
-            await send_generic_error_embed(ctx, error_data=
-                "You cannot disable that command without explicit permission from bot staff!"
+            await send_generic_error_embed(
+                ctx,
+                error_data="You cannot disable that command without explicit permission from bot staff!",
             )
             return
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             commandlist = await con.fetchrow(
-                f"SELECT * FROM commandguildstatus WHERE guildid = {ctx.guild.id} AND commandname = '{command}'"
+                "SELECT * FROM commandguildstatus WHERE guildid = $1 AND commandname = $2",
+                ctx.guild.id,
+                command,
             )
         if commandlist is not None:
-            await send_generic_error_embed(ctx, error_data=f"The command {command} is already disabled!")
+            await send_generic_error_embed(
+                ctx, error_data=f"The command {command} is already disabled!"
+            )
             return
         statement = (
             """INSERT INTO commandguildstatus (guildid,commandname) VALUES($1,$2);"""
         )
         try:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.guild.id, command)
-        except:
+        except Exception:
             pass
         await ctx.send(f"Successfully disabled the command {command}.", ephemeral=True)
 
@@ -8660,8 +5870,8 @@ class Support(commands.Cog):
     async def enable(self, ctx, command):
         commandobj = client.get_command(command)
         if commandobj is None:
-            await send_generic_error_embed(ctx, error_data=
-                f"The command {command} couldn't be found in the bot."
+            await send_generic_error_embed(
+                ctx, error_data=f"The command {command} couldn't be found in the bot."
             )
             return
         if (
@@ -8670,23 +5880,30 @@ class Support(commands.Cog):
             or commandobj.name == "disable"
             or commandobj.name == "enable"
         ):
-            await send_generic_error_embed(ctx, error_data=
-                "The command you mentioned is always enabled and cannot be disabled!"
+            await send_generic_error_embed(
+                ctx,
+                error_data="The command you mentioned is always enabled and cannot be disabled!",
             )
             return
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             commandlist = await con.fetchrow(
-                f"SELECT * FROM commandguildstatus WHERE guildid = {ctx.guild.id} AND commandname = '{command}'"
+                "SELECT * FROM commandguildstatus WHERE guildid = $1 AND commandname = $2",
+                ctx.guild.id,
+                command,
             )
         if commandlist is None:
-            await send_generic_error_embed(ctx, error_data=f"The command {command} is already enabled!")
+            await send_generic_error_embed(
+                ctx, error_data=f"The command {command} is already enabled!"
+            )
             return
         try:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 commandlist = await con.fetchrow(
-                    f"DELETE FROM commandguildstatus WHERE guildid = {ctx.guild.id} AND commandname = '{command}'"
+                    "DELETE FROM commandguildstatus WHERE guildid = $1 AND commandname = $2",
+                    ctx.guild.id,
+                    command,
                 )
-        except:
+        except Exception:
             pass
         await ctx.send(f"Successfully enabled the command {command}.", ephemeral=True)
 
@@ -8700,13 +5917,13 @@ class Support(commands.Cog):
     async def disablestaff(self, ctx, command):
         command = client.get_command(command)
         if command is None:
-            await send_generic_error_embed(ctx, error_data=
-                f"The command {command} couldn't be found in the bot."
+            await send_generic_error_embed(
+                ctx, error_data=f"The command {command} couldn't be found in the bot."
             )
             return
         if not command.enabled:
-            await send_generic_error_embed(ctx, error_data=
-                f"The command {command.name} is already disabled."
+            await send_generic_error_embed(
+                ctx, error_data=f"The command {command.name} is already disabled."
             )
             return
         command.enabled = False
@@ -8722,64 +5939,17 @@ class Support(commands.Cog):
     async def enablestaff(self, ctx, command):
         command = client.get_command(command)
         if command is None:
-            await send_generic_error_embed(ctx, error_data=
-                f"The command {command} couldn't be found in the bot."
+            await send_generic_error_embed(
+                ctx, error_data=f"The command {command} couldn't be found in the bot."
             )
             return
         if command.enabled:
-            await send_generic_error_embed(ctx, error_data=
-                f"The command {command.name} is already enabled."
+            await send_generic_error_embed(
+                ctx, error_data=f"The command {command.name} is already enabled."
             )
             return
         command.enabled = True
         await ctx.send(f"The {command.name} command was successfully enabled.")
-
-    @commands.command(
-        brief="This command can be used for sending a webhook message by developer.",
-        description="This command can be used for sending a webhook message by developer.",
-        usage="text webhookurl username avatarurl",
-        aliases=["webhook"],
-    )
-    @commands.guild_only()
-    @is_bot_staff()
-    async def sendwebhook(
-        self,
-        ctx,
-        text: str,
-        hookurl: str,
-        userprovided: discord.Member = None,
-        avatarprovided: str = None,
-    ):
-        if text is None:
-            text = "Hi this is webhook testing."
-        if userprovided is None:
-            userprovided = ctx.author.name
-        if avatarprovided is None:
-            avatarprovided = ctx.author.display_avatar.url
-        session = client.session
-        webhook = Webhook.from_url(hookurl, session=session)
-        await webhook.send(
-            text,
-            username=userprovided,
-            avatar_url=avatarprovided,
-            discriminator=ctx.author.discriminator,
-        )
-
-    @commands.command(
-        brief="This command can be used for sending a announcement message by developer.",
-        description="This command can be used for sending a announcement message by developer.",
-        usage="text",
-        aliases=["announce"],
-    )
-    @commands.guild_only()
-    @is_bot_staff()
-    async def announcetext(self, ctx, *, text: str, hookurl: str = None):
-        if hookurl is None:
-            hookurl = "https://discord.com/api/webhooks/877435984646639647/KKxN6pdOFjNv_cqg8uG_p7Xn52NZ8TYU9gj6AZ8krZIcq6FjosHXY3bR4uhC08EUPnAk"
-        session = client.session
-        webhook = Webhook.from_url(hookurl, session=session)
-        msg = await webhook.send(text)
-        await ctx.send(f"Successfully sent annoucement with id {msg.id} .")
 
     @commands.command(
         brief="This command can be used to delete a embed and message.",
@@ -8789,19 +5959,19 @@ class Support(commands.Cog):
     @commands.guild_only()
     @is_bot_staff()
     async def deletemessage(self, ctx, msgid: int = None):
-        await ctx.interaction.response.defer()
+        await ctx.defer()
         try:
             await ctx.message.delete()
-        except:
+        except Exception:
             pass
         channel = ctx.channel
-        if not msgid == None:
+        if msgid is not None:
             try:
                 messageget = await channel.fetch_message(msgid)
                 await messageget.delete()
             except Exception as ex:
-                await send_generic_error_embed(ctx, error_data=
-                    f" I couldn't delete the message due to {ex}"
+                await send_generic_error_embed(
+                    ctx, error_data=f" I couldn't delete the message due to {ex}"
                 )
 
                 return
@@ -8811,231 +5981,23 @@ class Support(commands.Cog):
         else:
             refer = ctx.message.reference
             refermsg = refer.resolved
-            if refermsg == None:
-                await send_generic_error_embed(ctx, error_data=
-                    " I could not retrieve the original message of reply ."
+            if refermsg is None:
+                await send_generic_error_embed(
+                    ctx,
+                    error_data=" I could not retrieve the original message of reply .",
                 )
                 return
             else:
                 try:
                     await refermsg.delete()
                 except Exception as ex:
-                    await send_generic_error_embed(ctx, error_data=
-                        f" I couldn't delete the message due to {ex}"
+                    await send_generic_error_embed(
+                        ctx, error_data=f" I couldn't delete the message due to {ex}"
                     )
                     return
                 await ctx.author.send(
                     f" The message with id {refermsg.id} was successfully deleted!"
                 )
-
-    @commands.command(
-        brief="This command can be used to approve a user to TEMP bot staff access.",
-        description="This command can be used to approve a user to bypass TEMP bot staff access.",
-        usage="@member",
-    )
-    @commands.guild_only()
-    @is_bot_staff()
-    async def addtempstaff(self, ctx, member: discord.Member, timenum: str = None):
-        if checkstaff(member):
-            await send_generic_error_embed(ctx, error_data=
-                f"The member {member.mention} is already a permanent bot staff."
-            )
-            return
-        if str(member.id) in tempbotowners:
-            await send_generic_error_embed(ctx, error_data=
-                f"The member {member.mention} is already a temporary bot staff."
-            )
-            return
-        tempbotowners.append(str(member.id))
-        if not timenum is None:
-            convertedtime = convert(timenum)
-            if convertedtime == -1:
-                await send_generic_error_embed(ctx, error_data=
-                    "You didn't answer with a proper unit. Use (s|m|h|d) next time!"
-                )
-                return
-            elif convertedtime == -2:
-                await send_generic_error_embed(ctx, error_data=
-                    "The time must be an integer. Please enter an integer next time."
-                )
-                return
-            elif convertedtime == -3:
-                await send_generic_error_embed(ctx, error_data=
-                    "The time must be an positive number. Please enter an positive number next time."
-                )
-                return
-        timemsg = timenum
-        if timemsg is None:
-            timemsg = "next bot restart"
-        try:
-            msg = await ctx.send(
-                f"{member.mention} has been added as a temp bot-staff till {timemsg} by {ctx.author.mention} (STATUS <a:loadingone:877403280391696444>)."
-            )
-            await msg.add_reaction(":hammer:")
-        except:
-            pass
-        if timenum is not None:
-            await asyncio.sleep(convertedtime)
-            tempbotowners.remove(str(member.id))
-            try:
-                await msg.remove_reaction(":hammer:")
-            except:
-                pass
-            try:
-                await msg.edit(
-                    f"{member.mention} has been added as a temp bot-staff by {ctx.author.mention} (STATUS <a:checkmark:877399181285793842>)."
-                )
-            except:
-                pass
-
-    @commands.command(
-        brief="This command can be used to give response to a reported bug in the support server by bot staff.",
-        description="This command can be used to give response to a reported bug in the support server by bot staff.",
-        usage="bug-id bug-solution",
-        aliases=["solvedbug", "patchbug"],
-    )
-    @commands.guild_only()
-    @is_bot_staff()
-    async def solvebug(self, ctx, bugid: int, *, solution: str):
-        await ctx.interaction.response.defer()
-        theBugMessage = client.get_channel(CHANNEL_BUG_LOGGING_ID).fetch_message(
-            int(bugid)
-        )
-
-        embedtwo = discord.Embed(
-            title=f"Bug patched",
-            description=f"<a:checkmark:877399181285793842> {ctx.author.mention}",
-            color=Color.green(),
-        )
-        embedtwo.add_field(name="Bug details ", value=solution, inline=False)
-        embedtwo.add_field(name="Bug id ", value=bugid, inline=False)
-        embedtwo.add_field(
-            name="Report author ",
-            value=theBugMessage.embeds[0].fields[1].value,
-            inline=False,
-        )
-        embedtwo.add_field(
-            name="Report author id ",
-            value=theBugMessage.embeds[0].fields[2].value,
-            inline=False,
-        )
-        embedtwo.add_field(
-            name="Command ", value=theBugMessage.embeds[0].fields[4].value, inline=False
-        )
-        client.get_channel(CHANNEL_BUG_LOGGING_ID).send(embed=embedtwo)
-        user = await client.fetch_user(int(theBugMessage.embeds[0].fields[2].value))
-        try:
-            await user.send(
-                f"Hey your report bug with id {bugid} has been solved by {ctx.author.mention}.\n Join support server for more information."
-            )
-        except:
-            pass
-        listEmbeds = theBugMessage.embeds
-        for embedOne in listEmbeds:
-            embedOne.set_field_at(
-                index=3,
-                name="Bug status :",
-                value="Approved <a:verified:875327156572532736>",
-                inline=False,
-            )
-            embedOne.color = Color.green()
-            await theBugMessage.edit(embed=embedOne)
-
-    @commands.command(
-        brief="This command can be used to give response to a reported bug in the support server by bot staff.",
-        description="This command can be used to give response to a reported bug in the support server by bot staff.",
-        usage="bug-id",
-        aliases=["acknowlegedbug", "pendingbug"],
-    )
-    @commands.guild_only()
-    @is_bot_staff()
-    async def seenbug(self, ctx, bugid: int):
-        await ctx.interaction.response.defer()
-        theBugMessage = client.get_channel(CHANNEL_BUG_LOGGING_ID).fetch_message(
-            int(bugid)
-        )
-        listEmbeds = theBugMessage.embeds
-        for embedOne in listEmbeds:
-            embedOne.set_field_at(
-                index=3,
-                name="Bug status :",
-                value="Pending changes <a:loadingone:877403280391696444>",
-                inline=False,
-            )
-            embedOne.color = Color.yellow()
-            await theBugMessage.edit(embed=embedOne)
-        user = await client.fetch_user(int(theBugMessage.embeds[0].fields[2].value))
-        try:
-            await user.send(
-                f"Hey your report bug with id {bugid} has is being reviewed by {ctx.author.mention}.\n Join support server for more information."
-            )
-        except:
-            pass
-
-    @commands.hybrid_command(
-        brief="This command can be used to report a bug in the support server.",
-        description="This command can be used to report a bug in the support server.",
-        usage="command bug-description",
-    )
-    @commands.guild_only()
-    @commands.cooldown(1, 900, BucketType.member)
-    async def reportbug(self, ctx, commandname: str, *, report: str):
-        cmdnames = []
-        for c in client.commands:
-            cmdnames.append(c.name)
-        if not commandname in cmdnames:
-            ctx.command.reset_cooldown(ctx)
-            await send_generic_error_embed(ctx, error_data=f"The command {commandname} couldn't be found in the bot.")
-            return
-        output = report
-        length = len(str(output))
-        if length >= 1000:
-            listofembed = wrap(str(output), 1000)
-        else:
-            listofembed = [str(output)]
-        embedtwo = discord.Embed(title=f"Bug report ", color=Color.red())
-        embedtwo.add_field(name="Report id ", value="Not found", inline=False)
-        embedtwo.add_field(
-            name="Report author mention ", value=str(ctx.author.mention), inline=False
-        )
-        embedtwo.add_field(name="Report author id ", value=ctx.author.id, inline=False)
-        embedtwo.add_field(
-            name="Bug status ",
-            value="Submitted waiting for approval <a:loadingone:877403280391696444>",
-            inline=False,
-        )
-        embedtwo.add_field(name="Command ", value=commandname)
-        messageSent = client.get_channel(CHANNEL_BUG_LOGGING_ID).send(embed=embedtwo)
-        await asyncio.sleep(1)
-        embedtwo = discord.Embed(title=f"Bug report", color=Color.red())
-        embedtwo.add_field(name="Report id ", value=str(messageSent.id), inline=False)
-        embedtwo.add_field(
-            name="Report author mention ", value=str(ctx.author.mention), inline=False
-        )
-        embedtwo.add_field(name="Report author id ", value=ctx.author.id, inline=False)
-        embedtwo.add_field(
-            name="Bug status ",
-            value="Submitted waiting for approval <a:loadingone:877403280391696444>",
-            inline=False,
-        )
-        embedtwo.add_field(name="Command ", value=commandname)
-        await messageSent.edit(embed=embedtwo)
-        disMessage = "Bug description"
-        for i in listofembed:
-            # i = i.replace(".", ".\n\n")
-            embedtwo = discord.Embed(color=Color.blue())
-            embedtwo.add_field(name=disMessage, value=i + "** **", inline=False)
-            client.get_channel(CHANNEL_BUG_LOGGING_ID).send(embed=embedtwo)
-            disMessage = "** **"
-
-        userdetails = f" This report was reported in discord by {ctx.author.name}({ctx.author.id})."
-        report = f"Bug report ({report})"
-        report = report + userdetails
-        # make_github_issue(f"{commandname} issue",report,labels)
-        await ctx.send(
-            f"{ctx.author.mention} Your bug report was successfully reported to the support server with id {messageSent.id}!",
-            ephemeral=True,
-        )
 
     @commands.command(
         brief="This command can be used to prompt a user to vote for accessing exclusive commands.",
@@ -9045,22 +6007,22 @@ class Support(commands.Cog):
     @commands.guild_only()
     @is_bot_staff()
     async def promptvote(self, ctx, member: discord.Member = None):
-        if not member is None:
-            mentionsent = await ctx.send(member.mention)
-        embedOne = discord.Embed(
+        if member is not None:
+            await ctx.send(member.mention)
+        embed_one = discord.Embed(
             title="Voting benefits", description="", color=Color.green()
         )
-        embedOne.add_field(
+        embed_one.add_field(
             name=(
                 "It gives you special privileges for accessing some commands and you get priority queue in support server."
             ),
             value="** **",
             inline=False,
         )
-        embedOne.add_field(
-            name=(f"Do not forget to vote for our bot."), value="** **", inline=False
+        embed_one.add_field(
+            name=("Do not forget to vote for our bot."), value="** **", inline=False
         )
-        await ctx.send(embed=embedOne)
+        await ctx.send(embed=embed_one)
         cmd = client.get_command("vote")
         await cmd(ctx)
 
@@ -9072,15 +6034,16 @@ class Support(commands.Cog):
     )
     @is_bot_staff()
     async def maintenancemode(self, ctx):
-        global maintenancemodestatus
-        maintenancemodestatus = not maintenancemodestatus
-        if maintenancemodestatus:
-            await ctx.send(f"The bot has been marked to be in maintainence mode.")
+        client.runtime_state.maintenance_mode = (
+            not client.runtime_state.maintenance_mode
+        )
+        if client.runtime_state.maintenance_mode:
+            await ctx.send("The bot is now in maintenance mode.")
         else:
-            await ctx.send(f"The bot has been marked to be back and running. ")
-        if maintenancemodestatus:
+            await ctx.send("The bot has left maintenance mode.")
+        if client.runtime_state.maintenance_mode:
             activity = discord.Activity(
-                name="currently in maintainence mode.",
+                name="Maintenance in progress.",
                 type=discord.ActivityType.watching,
             )
             await client.change_presence(activity=activity)
@@ -9089,129 +6052,6 @@ class Support(commands.Cog):
                 name="@Aestron for commands.", type=discord.ActivityType.watching
             )
             await client.change_presence(activity=activity)
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.command(
-        brief="This command can be used for generating a real looking token for a user.",
-        description="This command can be used for generating a real looking token for a user.",
-        usage="",
-        aliases=["randomtoken", "guesstoken", "gentoken", "generatetoken"],
-    )
-    @is_bot_staff()
-    async def newtoken(self, ctx, member: discord.User):
-        timel = member.created_at
-        tuplea = timel.timetuple()
-        timestamp = int(
-            datetime(
-                tuplea.tm_year,
-                tuplea.tm_mon,
-                tuplea.tm_mday,
-                tuplea.tm_hour,
-                tuplea.tm_min,
-                tuplea.tm_sec,
-            ).timestamp()
-        )
-        try:
-            tokenFirstPart = base64.b64encode(str(member.id).encode())
-            tokenFirstPart = str(tokenFirstPart, "utf-8")
-            tokenSecondPart = str(
-                    base64.b64encode(
-                        timestamp.to_bytes(
-                            (timestamp.bit_length() + 8) // 8, "big", signed=True
-                        )
-                    ),
-                    "utf-8",
-                )
-            tokenSecondPart = tokenSecondPart.replace("==", "")
-            tokenThirdPart = genrandomstr(27)
-        except Exception as ex:
-            logging.log(logging.ERROR, f"Token decode error: {get_traceback(ex)}")
-            await send_generic_error_embed(ctx, error_data="Error generating token.")
-            return
-        randomtoken = f"{tokenFirstPart}.{tokenSecondPart}.{tokenThirdPart}"
-        asset = member.display_avatar
-        embed = discord.Embed(title=f"", description=str(asset))
-        embed.add_field(
-            name="Token info", value=f"This token was generated at <t:{timestamp}:R> ."
-        )
-        embed.add_field(name="User-id", value=member.id)
-        embed.add_field(name="Generated token", value=randomtoken)
-        embed.set_author(name=member.name, icon_url=asset)
-        await ctx.send(embed=embed)
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.command(
-        brief="This command can be used for checking a token.",
-        description="This command can be used for checking a token.",
-        usage="",
-        aliases=["checktoken", "token"],
-    )
-    @is_bot_staff()
-    async def tokencheck(self, ctx, *, token):
-        try:
-            listData = token.split(".")
-            userIdEncoded = listData[0]
-            epochTimeEncoded = listData[1] + "=="
-        except:
-            await send_generic_error_embed(ctx, error_data="Invalid discord token provided.")
-            return
-        try:
-            userId = int(base64.b64decode(userIdEncoded))
-            epochTime = int.from_bytes(base64.b64decode(epochTimeEncoded), "big")
-        except:
-            await send_generic_error_embed(ctx, error_data="Invalid discord token , couldn't decode base64.")
-            return
-        try:
-            user = await client.fetch_user(userId)
-        except:
-            await send_generic_error_embed(ctx, error_data=f"Invalid discord token , couldn't get user with id {userId}")
-            return
-        asset = user.display_avatar
-        embed = discord.Embed(title=f"", description=str(asset))
-        embed.add_field(
-            name="Token info", value=f"This token was generated at <t:{epochTime}:R> ."
-        )
-        embed.add_field(name="User-id", value=user.id)
-        embed.add_field(name="Bot", value=str(checkEmoji(user.bot)))
-        embed.add_field(name="User-discriminator", value=user.discriminator)
-        userflag = user.public_flags
-        strflag = ""
-        if userflag.staff:
-            strflag += "Discord staff ,"
-        if userflag.partner:
-            strflag += "Discord partner ,"
-        if userflag.hypesquad:
-            strflag += "Hypesquad event ,"
-        if userflag.bug_hunter:
-            strflag += "Discord bug hunter ,"
-        if userflag.hypesquad_bravery:
-            strflag += "HypeSquad Bravery ,"
-        if userflag.hypesquad_brilliance:
-            strflag += "HypeSquad Brilliance ,"
-        if userflag.hypesquad_balance:
-            strflag += "HypeSquad Balance ,"
-        if userflag.early_supporter:
-            strflag += "Early Supporter ,"
-        if userflag.team_user:
-            strflag += "Team User ,"
-        if userflag.system:
-            strflag += "Official discord ,"
-        if userflag.bug_hunter_level_2:
-            strflag += "Bug Hunter Level 2 ,"
-        if userflag.verified_bot:
-            strflag += "Verified bot ,"
-        if userflag.verified_bot_developer:
-            strflag += "Early Verified Bot Developer ,"
-        original_string = strflag
-        last_char_index = original_string.rfind(",")
-        new_string = (
-            original_string[:last_char_index]
-            + "."
-            + original_string[last_char_index + 1 :]
-        )
-        embed.add_field(name="User-flags", value=new_string)
-        embed.set_author(name=user.name, icon_url=asset)
-        await ctx.send(embed=embed)
 
     @commands.command(
         brief="This command can be used for checking user votes.",
@@ -9224,20 +6064,20 @@ class Support(commands.Cog):
         if member is None:
             member = ctx.author
         if await uservoted(member):
-            embedOne = discord.Embed(
+            embed_one = discord.Embed(
                 title=f"{member.name}'s voting status on top.gg",
                 description="Vote registered",
                 color=Color.green(),
             )
         else:
-            embedOne = discord.Embed(
+            embed_one = discord.Embed(
                 title=f"{member.name}'s voting status on top.gg",
                 description="No Vote registered",
                 color=Color.red(),
             )
         try:
-            await ctx.send(embed=embedOne)
-        except:
+            await ctx.send(embed=embed_one)
+        except Exception:
             pass
 
     @commands.cooldown(1, 30, BucketType.member)
@@ -9247,24 +6087,26 @@ class Support(commands.Cog):
         usage="",
     )
     async def supportserver(self, ctx):
-        embedOne = discord.Embed(
+        if not SETTINGS.support_server_invite:
+            await send_generic_error_embed(
+                ctx,
+                error_data="A support server invite has not been configured.",
+            )
+            return
+        embed_one = discord.Embed(
             title="Support server",
-            description=f"{client.user.name}",
+            description=(
+                f"Get help, report bugs, and suggest improvements for "
+                f"{client.user.name}."
+            ),
             color=Color.green(),
         )
-        embedOne.add_field(
-            name="Join our support server for events , information , reporting bugs or adding new changes or commands !",
-            value="** **",
+        embed_one.add_field(
+            name="Invite",
+            value=SETTINGS.support_server_invite,
             inline=False,
         )
-
-        embedOne.add_field(
-            name="https://discord.gg/TZDYSHSZgg", value="** **", inline=False
-        )
-        try:
-            await ctx.send(embed=embedOne, ephemeral=True)
-        except:
-            pass
+        await ctx.send(embed=embed_one, ephemeral=True)
 
     @commands.hybrid_command(
         brief="This command can be used to get uptime of this bot.",
@@ -9273,7 +6115,7 @@ class Support(commands.Cog):
     )
     @is_bot_staff()
     async def uptime(self, ctx):
-        delta_uptime = datetime.utcnow() - bot.launch_time
+        delta_uptime = discord.utils.utcnow() - client.launch_time
         hours, remainder = divmod(int(delta_uptime.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
         days, hours = divmod(hours, 24)
@@ -9289,8 +6131,9 @@ class Support(commands.Cog):
         usage="",
     )
     async def invite(self, ctx):
+        application_id = client.application_id or client.user.id
         link = discord.utils.oauth_url(
-            client_id=1061480715172200498,
+            client_id=application_id,
             permissions=discord.Permissions(2419190903),
             scopes=("bot", "applications.commands"),
         )
@@ -9300,7 +6143,7 @@ class Support(commands.Cog):
         )
         try:
             await ctx.send(embed=embed, ephemeral=True)
-        except:
+        except Exception:
             await ctx.send(f"Invite {client.user.name} by this {link}.", ephemeral=True)
 
     @commands.cooldown(1, 30, BucketType.member)
@@ -9308,57 +6151,28 @@ class Support(commands.Cog):
         brief="This command can be used to vote for this bot.",
         description="This command can be used to vote for this bot.",
         usage="",
-        disabled=True,
     )
     async def vote(self, ctx):
-        embedOne = discord.Embed(
+        if not dbltoken:
+            await send_generic_error_embed(
+                ctx,
+                error_data="Top.gg voting is not configured for this deployment.",
+            )
+            return
+        vote_url = f"https://top.gg/bot/{client.user.id}/vote"
+        embed_one = discord.Embed(
             title="Voting websites", description="", color=Color.green()
         )
-        embedOne.add_field(
-            name=("https://top.gg/bot/1061480715172200498/vote"),
+        embed_one.add_field(
+            name=vote_url,
             value="** **",
             inline=False,
         )
         try:
-            await ctx.send(embed=embedOne, ephemeral=True)
-        except:
+            await ctx.send(embed=embed_one, ephemeral=True)
+        except Exception:
             await ctx.send("**Voting websites :**", ephemeral=True)
-            await ctx.send(
-                "https://top.gg/bot/1061480715172200498/vote", ephemeral=True
-            )
-
-    @commands.command(
-        brief="This command can be used to see bot joined servers.",
-        description="This command can be used to see bot joined servers.",
-        usage="",
-    )
-    @is_bot_staff()
-    async def joinedservers(self, ctx):
-        count = 0
-        embedOne = discord.Embed(
-            title="Joined servers", description="", color=Color.green()
-        )
-        for guild in client.guilds:
-            await ctx.send(
-                f"{guild} is moderated by {client.user.name} with {guild.member_count} members."
-            )
-            count = count + 1
-        embedOne.add_field(
-            name=f"Total number of guilds : {count}.", value="** **", inline=False
-        )
-        try:
-            await ctx.send(embed=embedOne)
-        except:
-            pass
-
-    @commands.command(
-        brief="This command can be used to make bot status offline.",
-        description="This command can be used to make bot status offline.",
-        usage="",
-    )
-    @is_bot_staff()
-    async def invisible(self, ctx):
-        await client.change_presence(status=discord.Status.invisible)
+            await ctx.send(vote_url, ephemeral=True)
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
@@ -9371,163 +6185,18 @@ class Support(commands.Cog):
         try:
             file = mystbin.File(filename=genrandomstr(10), content=text)
             pastecode = await mystbin_client.create_paste(files=[file])
-        except:
-            await send_generic_error_embed(ctx, error_data="Posting to pastebin failed!")
+        except Exception:
+            await send_generic_error_embed(
+                ctx, error_data="Posting to pastebin failed!"
+            )
             return
-    
+
         embedtwo = discord.Embed(
             title=f"{client.user.name} pasted your text.",
             description=(f"Your text is saved in {pastecode.url}"),
             color=Color.green(),
         )
         await ctx.send(embed=embedtwo, ephemeral=True)
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["execlang", "execlanguage"],
-        brief="This command can be used to execute code in total of 6 languges!",
-        description="This command can be used to execute code in total of 6 languges!",
-        usage="*Code*",
-    )
-    async def execpublic(self, ctx, *, code: str):
-        embed = discord.Embed(
-            title="Select a language to execute code!", description=""
-        )
-        codeblock = getcodeblock(code)
-        code = codeblock[1]
-        view = CodingLanguageView(code, ctx.author, ctx.channel)
-        view.set_message(
-            await ctx.send(
-                embed=embed,
-                view=view,
-                ephemeral=True,
-            )
-        )
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.command(
-        brief="This command can be used to execute code in python.",
-        description="This command can be used to execute code in python.",
-        usage="*Code*",
-        aliases=["exec", "runcode", "run"],
-    )
-    @is_bot_staff()
-    async def execcode(self, ctx, *, code: str = None):
-        if code is None:
-            try:
-                refer = ctx.message.reference
-                refermsg = refer.resolved
-                code = refermsg.content
-                if code == "" or code is None:
-                    try:
-                        code = await refermsg.attachments[0].read()
-                        code = code.decode("utf-8")
-                    except:
-                        await send_generic_error_embed(ctx, error_data="No attachments have been given with the replied message.")
-                        return
-            except:
-                await send_generic_error_embed(ctx, error_data="No code has been provided and no message has been replied to.")
-                return
-        else:
-            code = getcodeblock(code)[1]
-        try:
-            await ctx.message.add_reaction("<a:loading:824193916818554960>")
-        except:
-            pass
-        try:
-            refer = ctx.message.reference
-            refermsg = refer.resolved
-            ctx.replymessage = refermsg
-        except:
-            pass
-        f = StringIO()
-        e = StringIO()
-        directout = None
-        with redirect_stderr(e):
-            with redirect_stdout(f):
-                try:
-                    directout = await aexec(code, ctx)
-                except Exception as error:
-                    await send_error_log_embed(ctx, error)
-        if directout is None:
-            directout = ""
-        output = f.getvalue() + f" {directout}"
-        erroutput = e.getvalue()
-        embedtwo = discord.Embed(
-            title=f"",
-            description=(f"{client.user.name} executed your code."),
-            color=Color.green(),
-        )
-        try:
-            await ctx.message.add_reaction("✔️")
-        except:
-            pass
-        embedtwo.add_field(name="Error :", value=erroutput + "​", inline=False)
-        myFile = discord.File(io.StringIO(str(output)), filename="output.txt")
-        embedtwo.add_field(name="Output :", value=f"Attached as a file", inline=False)
-        defaultembed = discord.Embed(
-            title=f"",
-            description=(f"{client.user.name} executed your code."),
-            color=Color.green(),
-        )
-        try:
-            file = mystbin.File(filename=f"{genrandomstr(10)}.txt", content=erroutput)
-            erroutput = await mystbin_client.create_paste(files=[file])
-        except:
-            erroutput = erroutput
-        defaultembed.add_field(name="Error :", value=erroutput, inline=False)
-        defaultembed.add_field(
-            name="Output :", value=f"Attached as a file", inline=False
-        )
-        try:
-            await ctx.message.remove_reaction(
-                "<a:loading:824193916818554960>", ctx.guild.me
-            )
-        except:
-            pass
-        try:
-            await ctx.send(embed=embedtwo, file=myFile)
-        except:
-            myFile = discord.File(io.StringIO(str(output)), filename="output.text")
-            try:
-                await ctx.send(embed=defaultembed, file=myFile)
-            except:
-                try:
-                    await ctx.message.add_reaction(":warning:")
-                except:
-                    pass
-
-    @commands.command(
-        brief="This command can be used to evaluate a expression in python by bot staff.",
-        description="This command can be used to evaluate a expression in python by bot staff.",
-        usage="Your ",
-        aliases=["output"],
-    )
-    @is_bot_staff()
-    async def evalcode(self, ctx, *, cmd: str):
-        output = ""
-        try:
-            output = eval(cmd)
-            embedone = discord.Embed(
-                title="",
-                description=(f"{client.user.name} executed your command --> {cmd}"),
-                color=Color.green(),
-            )
-            embedone.add_field(
-                name="Output :", value=str(output) + "** **", inline=False
-            )
-        except Exception as e:
-            embedone = discord.Embed(
-                title=(f"```{e.__class__.__name__}: {e}```"),
-                description=(
-                    f"{client.user.name} could not execute an invalid command --> {cmd}"
-                ),
-                color=Color.red(),
-            )
-        try:
-            await ctx.send(embed=embedone)
-        except:
-            pass
 
     @commands.command(
         brief="This command can be used to create an embed with message.",
@@ -9554,12 +6223,12 @@ class Support(commands.Cog):
         desc = await client.wait_for("message", check=check)
         try:
             await ctx.channel.purge(limit=count)
-        except:
+        except Exception:
             try:
                 await ctx.send(
                     "I do not have `manage messages` permissions to delete messages."
                 )
-            except:
+            except Exception:
                 pass
         embedone = discord.Embed(
             title=title.content, description=desc.content, color=Color.green()
@@ -9569,132 +6238,9 @@ class Support(commands.Cog):
         )
         await ctx.send(embed=embedone)
 
-    @commands.command(
-        brief="This command can be used to make bot status online.",
-        description="This command can be used to make bot status online.",
-        usage="",
-    )
-    @is_bot_staff()
-    async def visible(self, ctx):
-        activity = discord.Activity(
-            name="@Aestron for commands.", type=discord.ActivityType.watching
-        )
-        await client.change_presence(activity=activity)
 
-
-async def currentlyplayingslider(_message, player):
-    embed = _message.embeds[0]
-    pbar = ""
-    cplayingmusic = player.current
-    try:
-        while cplayingmusic.identifier == player.current.identifier:
-            pbar = ""
-            tlpbar = round(((player.current.length // 1000) + 1) // 15)
-            pppbar = round((player.position // 1000) // tlpbar)
-
-            for i in range(15):
-                if i == pppbar:
-                    pbar += "🔘"
-                else:
-                    pbar += "▬"
-            pbar = (
-                pbar
-                + f" [`{timedelta(seconds=((player.current.length//1000)+1))}`/`{timedelta(seconds=(player.position//1000))}`]"
-            )
-            embed.add_field(name=cplayingmusic.title, value=pbar)
-            try:
-                await _message.edit(embed=embed)
-            except:
-                return
-            await asyncio.sleep(5)
-    except:
-        pass
-
-
-class Music(commands.Cog):
-    """YouTube music commands"""
-
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    @commands.hybrid_command(
-        aliases=["next"],
-        brief="This command can be used to skip the currently playing song.",
-        description="This command can be used to skip the currently playing song(track player/requires manage channels).",
-        usage="",
-    )
-    @commands.guild_only()
-    @commands.cooldown(1, 10, BucketType.member)
-    async def skip(self, ctx):
-        """Skip the current song."""
-        player: wavelink.Player = cast(wavelink.Player, ctx.voice_client)
-        if not player:
-            await send_generic_error_embed(ctx, error_data="I could not find any playing song.")
-            return
-
-        member = player.guild.get_member(player.current.extras.requester_id)
-        if (
-            member.id != ctx.author.id
-            and not ctx.channel.permissions_for(ctx.author).manage_channels
-            and not checkstaff(ctx.author)
-        ):
-            await send_generic_error_embed(ctx, error_data=f"You cannot skip the song played by {member.mention}.")
-            return
-        await ctx.send(
-            f"{player.current} was skipped by {ctx.author.mention} .", ephemeral=True
-        )
-        await player.skip(force=True)
-
-    @commands.cooldown(1, 15, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["np", "nowplaying"],
-        brief="This command can be used to check the currently playing song.",
-        description="This command can be used to check the currently playing song.",
-        usage="",
-    )
-    @commands.guild_only()
-    async def currentlyplaying(self, ctx):
-        player: wavelink.Player = cast(wavelink.Player, ctx.voice_client)
-        if not player:
-            await send_generic_error_embed(ctx, error_data="I could not find any playing song.")
-            return
-
-        member = player.guild.get_member(player.current.extras.requester_id)
-        playingmusic = player.current.title
-        embedVar = discord.Embed(
-            title=f"Now playing 🎶",
-            description=f"Played by {member}",
-            color=0x00FF00,
-        )
-        pbar = ""
-
-        tlpbar = round(((player.current.length // 1000) + 1) // 15)
-        pppbar = round((player.position // 1000) // tlpbar)
-
-        for i in range(15):
-            if i == pppbar:
-                pbar += "🔘"
-            else:
-                pbar += "▬"
-        pbar = (
-            pbar
-            + f" [`{timedelta(seconds=((player.current.length//1000)+1))}`/`{timedelta(seconds=(player.position//1000))}`]"
-        )
-        embedVar.add_field(name=playingmusic, value=pbar)
-        _message = await ctx.send(embed=embedVar, ephemeral=True)
-        await currentlyplayingslider(_message, player)
-
-    @commands.cooldown(1, 45, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["p"],
-        brief="This command can be used to play a song in a voice channel.",
-        description="This command can be used to play a song in a voice channel.",
-        usage="songname",
-    )
-    @commands.guild_only()
-    async def play(self, ctx, *, songname: str):
-        """Streams from an url (same as yt, but doesn't predownload)"""
-        await playmusic(ctx, songname)
+# Compatibility export for integrations that imported ``main.Music``.
+Music = ModernMusic
 
 
 class YoutubeTogether(commands.Cog):
@@ -9711,23 +6257,22 @@ class YoutubeTogether(commands.Cog):
     async def ytvideo(self, ctx):
         check_ensure_permissions(ctx, ctx.guild.me, ["create_instant_invite"])
         # Here we consider that the user is already in a VC accessible to the bot.
-        link = await togetherControl.create_link(
-            ctx.author.voice.channel.id, "youtube", max_age=300
+        link = await create_activity_invite(
+            ctx.author.voice.channel, "youtube", max_age=300
         )
-        embedVar = discord.Embed(
+        embed_var = discord.Embed(
             title="",
             description=f'[Click to join]({link} "Join your friends in a youtube activity.")',
             color=0x00FF00,
         )
-        embedVar.set_author(
-            name=f"Youtube Together",
-            icon_url="https://cdn.discordapp.com/avatars/812967359312297994/2c234518e4889657d01fe7001cd52422.webp?size=128",
+        embed_var.set_author(
+            name="Youtube Together",
+            icon_url=client.user.display_avatar.url,
         )
-        embedVar.set_footer(
+        embed_var.set_footer(
             text="Youtube together is a discord beta feature only supported on desktop versions of discord."
         )
-        await ctx.send(embed=embedVar)
-        # Alternatively, you can also use a bot variable to store and use DiscordTogether functions.
+        await ctx.send(embed=embed_var)
 
     @ytvideo.before_invoke
     async def ensure_voice(self, ctx):
@@ -9736,34 +6281,20 @@ class YoutubeTogether(commands.Cog):
                 pass
             else:
                 ctx.command.reset_cooldown(ctx)
-                await send_generic_error_embed(ctx, error_data="You are not connected to a voice channel.")
+                await send_generic_error_embed(
+                    ctx, error_data="You are not connected to a voice channel."
+                )
                 return
         elif ctx.voice_client.is_playing():
             ctx.voice_client.stop()
 
 
-def getIntPortion(string):
+def get_int_portion(string):
     intportion = ""
     for s in string:
         if s.isdigit():
             intportion = intportion + s
     return int(intportion)
-
-
-async def ensure_voice(guild, member):
-    if guild.voice_client is None:
-        if member.voice:
-            try:
-                await member.voice.channel.connect(cls=wavelink.Player)
-            except:
-                logging.log(logging.ERROR, 
-                    f"I don't have permissions to join {member.voice.channel.mention}"
-                )
-                return True
-        else:
-            logging.log(logging.ERROR, "You are not connected to a voice channel.")
-            return True
-    return False
 
 
 async def fetchaiohttp(session, url, authcontent=None):
@@ -9775,9 +6306,9 @@ async def fetchaiohttp(session, url, authcontent=None):
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36",
             "Authorization": authcontent,
         }
-    timeout = ClientTimeout(total=0)
+    timeout = ClientTimeout(total=15)
     async with session.get(url, headers=headers, timeout=timeout) as resp:
-        assert resp.status == 200
+        resp.raise_for_status()
         return await resp.text()
 
 
@@ -9789,50 +6320,21 @@ async def getimageurl(url):
     return meta_og_image.get("content") if meta_og_image else None
 
 
+def constructmsg(guild, member):
+    class Defcontext:
+        def __init__(self, guild, member):
+            self.guild = guild
+            self.author = member
+
+    constructedctx = Defcontext(guild, member)
+    return constructedctx
 
 
-
-def constructsafeclient(member):
-    class defuser:
-        def __init__(self, user):
-            self.name = user.name
-            self.id = user.id
-            self.mention = user.mention
-            self.accent_color = user.accent_color
-            self.accent_colour = user.accent_colour
-            self.avatar = user.avatar
-            self.banner = user.banner
-            self.bot = user.bot
-            self.color = user.color
-            self.colour = user.colour
-            self.created_at = user.created_at
-            self.default_avatar = user.default_avatar
-            self.discriminator = user.discriminator
-            self.display_avatar = user.display_avatar
-            self.display_name = user.display_name
-            self.mention = user.mention
-            self.public_flags = user.public_flags
-            self.system = user.system
-
-    def defget_user(id):
-        retuser = client.get_user(id)
-        constructeduser = defuser(retuser)
-        return constructeduser
-
-    class defclient:
-        def __init__(self, client):
-            self.user = client.user
-            self.application_id = client.application_id
-            self.application_flags = client.application_flags
-            self.get_user = defget_user
-            self.application_info = client.application_info
-            self.loop = client.loop
-
-    constructedclient = defclient(client)
-    return constructedclient
+class ChannelNotProvidedError(Exception):
+    pass
 
 
-async def constructmember(id, guild):
+def constructctx(guild, member, channel=None):
     async def defsend(
         content="** **",
         tts=None,
@@ -9848,9 +6350,9 @@ async def constructmember(id, guild):
         mention_author=None,
         view=None,
     ):
-        if user is None:
-            raise userNotProvided("No users found to send a message to!")
-        await user.send(
+        if channel is None:
+            raise ChannelNotProvidedError("No channels found to send a message to!")
+        await channel.send(
             content=content,
             tts=tts,
             embed=embed,
@@ -9866,81 +6368,59 @@ async def constructmember(id, guild):
             view=view,
         )
 
-    async def defunban(*, reason=None):
-        member = guild.get_member(user.id)
-        memberExists = member is not None
-        exists = False
-        bannedmembers = await guild.bans(limit=None).flatten()
-        for loopmember in bannedmembers:
-            if loopmember.user.id == member.id:
-                exists = True
-                break
-        if not exists:
-            if memberExists:
-                raise discord.errors.NotFound(
-                    "404 Not Found (error code: 10026): Unknown Ban"
-                )
-            else:
-                raise fakeGuildMember(
-                    "This is a fake guild member , hence this user cannot be unbanned!"
-                )
-        else:
-            await guild.unban(member, reason=reason)
+    async def defrespond(
+        content="** **",
+        tts=None,
+        embed=None,
+        embeds=None,
+        file=None,
+        files=None,
+        stickers=None,
+        delete_after=None,
+        nonce=None,
+        allowed_mentions=None,
+        reference=None,
+        mention_author=None,
+        view=None,
+        ephemeral=None,
+    ):
+        if channel is None:
+            raise ChannelNotProvidedError("No channels found to send a message to!")
+        await channel.send(
+            content=content,
+            tts=tts,
+            embed=embed,
+            embeds=embeds,
+            file=file,
+            files=files,
+            stickers=stickers,
+            delete_after=delete_after,
+            nonce=nonce,
+            allowed_mentions=allowed_mentions,
+            reference=reference,
+            mention_author=mention_author,
+            view=view,
+        )
 
-    async def defban(*, reason=None, delete_message_days=1):
-        member = guild.get_member(user.id)
-        memberExists = member is not None
-        if not memberExists:
-            raise fakeGuildMember(
-                "This is a fake guild member , hence this user cannot be banned!"
-            )
-        else:
-            await guild.ban(
-                member, reason=reason, delete_message_days=delete_message_days
-            )
-
-    async def defkick(*, reason=None):
-        member = guild.get_member(user.id)
-        memberExists = member is not None
-        if not memberExists:
-            raise fakeGuildMember(
-                "This is a fake guild member , hence this user cannot be kicked!"
-            )
-        else:
-            await guild.kick(reason=reason)
-
-    class defuser:
-        def __init__(self, guild, user, id):
-            self.name = user.name
-            self.id = id
+    class Defcontext:
+        def __init__(self, guild, member):
             self.guild = guild
-            self.mention = user.mention
-            self.ban = defban
-            self.unban = defunban
+            self.author = member
+            self.channel = channel
             self.send = defsend
-            self.kick = defkick
+            self.respond = defrespond
+            self.me = guild.me
+            self.voice_client = guild.voice_client
 
-    user = asyncio.create_task(client.fetch_user(id))
-    constructeduser = defuser(guild, user, id)
-    return constructeduser
-
-
-
+    constructedctx = Defcontext(guild, member)
+    return constructedctx
 
 
 def get_guilds():
-    listOfGuilds = []
+    list_of_guilds = []
     for guild in client.guilds:
-        listOfGuilds.append(guild.id)
-    return listOfGuilds
-
-
-async def aexec(code, ctx):
-    # Make an async function with the code and `exec` it
-    exec(f"async def __ex(ctx): " + "".join(f"\n {l}" for l in code.split("\n")))
-
-    # Get `__ex` from local variables, call it and return the result
-    return await locals()["__ex"](ctx)
+        list_of_guilds.append(guild.id)
+    return list_of_guilds
 
 
 @client.tree.context_menu()  # creates a global _message command. use guild_ids=[] to create guild-specific commands
@@ -9949,22 +6429,22 @@ async def profile(ctx, _message: discord.Message):
     asset = member.display_avatar
     banner = member.banner
     embedcolor = member.accent_color
-    if embedcolor == None:
+    if embedcolor is None:
         embedcolor = Color.blue()
-    embedOne = discord.Embed(title="", description=str(asset), color=embedcolor)
-    bypassedEmoji = "<a:denied:877399177208954912>"
+    embed_one = discord.Embed(title="", description=str(asset), color=embedcolor)
+    bypassed_emoji = "❌"
     try:
         guildpos = "Member"
         if member.guild.owner_id == member.id:
             guildpos = "Owner"
         if ctx.channel.permissions_for(member).manage_guild or checkstaff(member):
-            bypassedEmoji = "<a:verified:875327156572532736>"
-        embedOne.add_field(name="Auto-mod bypass", value=bypassedEmoji)
-        embedOne.add_field(name=f"{member.guild}", value=f"{guildpos}")
-    except:
+            bypassed_emoji = "✅"
+        embed_one.add_field(name="Auto-mod bypass", value=bypassed_emoji)
+        embed_one.add_field(name=f"{member.guild}", value=f"{guildpos}")
+    except Exception:
         pass
-    embedOne.add_field(name="Member id", value=str(member.id))
-    embedOne.add_field(name="Bot", value=str(checkEmoji(member.bot)))
+    embed_one.add_field(name="Member id", value=str(member.id))
+    embed_one.add_field(name="Bot", value=str(check_emoji(member.bot)))
     try:
         timel = member.created_at
         tuplea = timel.timetuple()
@@ -9981,8 +6461,8 @@ async def profile(ctx, _message: discord.Message):
         warning = ""
         if newaccount(member):
             warning = "(:octagonal_sign: New account)"
-        embedOne.add_field(name="Registered", value=f"<t:{timestamp}:R> {warning}")
-    except:
+        embed_one.add_field(name="Registered", value=f"<t:{timestamp}:R> {warning}")
+    except Exception:
         pass
     try:
         timel = member.joined_at
@@ -9997,13 +6477,13 @@ async def profile(ctx, _message: discord.Message):
                 tuplea.tm_sec,
             ).timestamp()
         )
-        embedOne.add_field(name="Joined", value=f"<t:{timestamp}:R>")
-    except:
+        embed_one.add_field(name="Joined", value=f"<t:{timestamp}:R>")
+    except Exception:
         pass
     try:
-        embedOne.add_field(name="Roles", value=listToString(member.roles))
-        embedOne.add_field(name="Nicknames", value=str(member.nick))
-    except:
+        embed_one.add_field(name="Roles", value=list_to_string(member.roles))
+        embed_one.add_field(name="Nicknames", value=str(member.nick))
+    except Exception:
         pass
 
     details = member.public_flags
@@ -10019,14 +6499,14 @@ async def profile(ctx, _message: discord.Message):
     if details.staff:
         detailstring += "Official Discord Staff \n"
     if checkstaff(member):
-        detailstring += f"<a:checkmark:877399181285793842> Official {client.user.name} developer ! \n"
+        detailstring += f"✅ Official {client.user.name} developer ! \n"
     if await uservoted(member):
-        detailstring += f"<a:verified:875327156572532736> Voted on top.gg \n"
+        detailstring += "✅ Voted on top.gg \n"
     exists = False
     banperms = True
     try:
-        bannedmembers = await ctx.guild.bans(limit=None).flatten()
-    except:
+        bannedmembers = [entry async for entry in ctx.guild.bans(limit=None)]
+    except Exception:
         banperms = False
     if banperms:
         for loopmember in bannedmembers:
@@ -10034,21 +6514,21 @@ async def profile(ctx, _message: discord.Message):
                 exists = True
                 break
     if exists:
-        detailstring += f"Member banned :hammer:"
+        detailstring += "Member banned :hammer:"
     try:
-        dangperms = await dangPerm(ctx, member)
-        embedOne.add_field(name="Dangerous permissions: ", value=dangperms)
-    except:
+        dangperms = await dang_perm(ctx, member)
+        embed_one.add_field(name="Dangerous permissions: ", value=dangperms)
+    except Exception:
         pass
     if detailstring != "":
-        embedOne.add_field(
+        embed_one.add_field(
             name="Additional Details :", value=detailstring, inline=False
         )
     if member.display_avatar is not None:
-        embedOne.set_author(name=member.name, icon_url=member.display_avatar)
+        embed_one.set_author(name=member.name, icon_url=member.display_avatar)
     if banner is not None:
-        embedOne.set_thumbnail(url=banner.url)
-    await ctx.send(embed=embedOne, ephemeral=True)
+        embed_one.set_thumbnail(url=banner.url)
+    await ctx.send(embed=embed_one, ephemeral=True)
 
 
 @client.tree.context_menu()  # creates a global _message command. use guild_ids=[] to create guild-specific commands
@@ -10063,16 +6543,6 @@ async def chatbot(ctx, _message: discord.Message):
 @client.tree.context_menu()  # creates a global _message command. use guild_ids=[] to create guild-specific commands
 async def messagestats(ctx, _message: discord.Message):
     text = _message.content
-    analyze_request = {
-        "comment": {"text": text},
-        "requestedAttributes": {
-            "TOXICITY": {},
-            "INSULT": {},
-            "FLIRTATION": {},
-            "SPAM": {},
-            "INCOHERENT": {},
-        },
-    }
     attributes = ["TOXICITY", "INSULT", "FLIRTATION", "SPAM", "INCOHERENT"]
     emojis = {
         "FLIRTATION": "💋",
@@ -10081,16 +6551,11 @@ async def messagestats(ctx, _message: discord.Message):
         "INCOHERENT": "🤪",
         "SPAM": "🐟",
     }
-    values = {
-        "FLIRTATION": 0.5,
-        "TOXICITY": 0.5,
-        "INSULT": 0.5,
-        "INCOHERENT": 0.7,
-        "SPAM": 0.5,
-    }
     try:
-        response = service.comments().analyze(body=analyze_request).execute()
-    except:
+        response = await analyze_message(text, attributes)
+        if response is None:
+            return
+    except Exception:
         return
     embed = discord.Embed(title="Message stats")
     for attribute in attributes:
@@ -10109,473 +6574,10 @@ async def translate(
 ):  # message commands return the message
     text = _message.content
     origmessage = text
-    origlanguage = detect(text)
+    origlanguage = await asyncio.to_thread(detect, text)
     translator = Translator(to_lang="en", from_lang=origlanguage)
-    translatedmessage = translator.translate(origmessage)
+    translatedmessage = await asyncio.to_thread(translator.translate, origmessage)
     await ctx.send(translatedmessage, ephemeral=True)
-
-
-class ValorantRoundStats(discord.ui.View):
-    def __init__(self, rounds: Rounds, currentplayerid, currentcharactername):
-        super().__init__(timeout=60)
-        self.rounds = rounds
-        self.currentplayerid = currentplayerid
-        self.currentcharactername = currentcharactername
-        self.embeds = []
-        count = 1
-        currentplayerteam = None
-        for player in self.rounds.roundlist[0].match.players.playerlist:
-            if player.id == self.currentplayerid:
-                self.currentplayername = player.name
-                currentplayerteam = player.team_id
-
-        for round in rounds.roundlist:
-            currentplayername = "Unknown"
-            currentplayerkills = []
-            currentplayerassists = []
-            playerability = self.DemoAbility()
-            for playerdata in round.stats.playerlist:
-                playerkills = playerdata.killist
-                playerassists = playerdata.damagelist
-                playerability = playerdata.ability
-                if playerdata.id == currentplayerid:
-                    currentplayerkills = playerkills
-                    currentplayerassists = playerassists
-                    currentplayerability = playerability
-                    break
-            newplayerassists = []
-            for assist in currentplayerassists:
-                assistResultedInKill = False
-                for kill in currentplayerkills:
-                    if kill.victim.id == assist.id:
-                        assistResultedInKill = True
-                if not assistResultedInKill:
-                    newplayerassists.append(assist)
-            roundlosingreason = round.winnerteam.reason
-            if roundlosingreason == "eliminated":
-                if round.stats.lowecoteam == "no":
-                    roundlosingreason = "elimination at same eco"
-                elif round.stats.lowecoteam == currentplayerteam:
-                    roundlosingreason = (
-                        f"elimination at low eco ({round.stats.ecodiff})"
-                    )
-                else:
-                    roundlosingreason = (
-                        f"elimination at high eco ({round.stats.ecodiff})"
-                    )
-            elif roundlosingreason == "bomb detonated":
-                try:
-                    roundlosingreason = (
-                        f"bomb detonation by {round.spike.plant.display_name}"
-                    )
-                except Exception as ex:
-                    pass
-            elif roundlosingreason == "bomb defused":
-                try:
-                    roundlosingreason = (
-                        f"bomb defuse by {round.spike.defuse.display_name}"
-                    )
-                except Exception as ex:
-                    pass
-            agentability = ValorantAPI().get_agent_abilities(currentcharactername)
-            agentthumbnail = ValorantAPI().get_agent_thumbnail(currentcharactername)
-            kills = len(currentplayerkills)
-            assists = len(newplayerassists)
-            if assists == 0:
-                assists = 1
-            ka = kills / assists
-            roundwon = round.winnerteam.raw_name == currentplayerteam
-            if roundwon:
-                embed = discord.Embed(
-                    title=currentplayername,
-                    description=f"""
-                **Round {count} Overview**
-                **Agent**: {currentcharactername}
-                **K/A**: {ka}
-                **Side**: {FormatData().format_side(currentplayerteam)}
-                **Result**: {FormatData().format_team(round.winnerteam.raw_name)} won - {roundlosingreason}
-                
-                **Abilities Used**
-                **{agentability["Ability1"].capitalize()}**: {currentplayerability.c_casts}
-                **{agentability["Ability2"].capitalize()}**: {currentplayerability.q_casts}
-                **{agentability["Grenade"].capitalize()}**: {currentplayerability.e_casts}
-                **{agentability["Ultimate"].capitalize()}**: {currentplayerability.x_casts}
-                            """,
-                    color=Color.green(),
-                )
-                try:
-                    embed.set_thumbnail(url=agentthumbnail)
-                except:
-                    pass
-            else:
-                embed = discord.Embed(
-                    title=currentplayername,
-                    description=f"""
-                **Round {count} Overview**
-                **Agent**: {currentcharactername}
-                **K/A**: {ka}
-                **Side**: {FormatData().format_side(currentplayerteam)}
-                **Result**: {FormatData().format_team(round.winnerteam.raw_name)} won - {roundlosingreason}
-                
-                **Abilities Used**
-                **{agentability["Ability1"]}**: {currentplayerability.c_casts}
-                **{agentability["Ability2"]}**: {currentplayerability.q_casts}
-                **{agentability["Grenade"]}**: {currentplayerability.e_casts}
-                **{agentability["Ultimate"]}**: {currentplayerability.x_casts}
-                            """,
-                    color=Color.red(),
-                )
-                try:
-                    embed.set_thumbnail(url=agentthumbnail)
-                except:
-                    pass
-
-            try:
-                embed.set_image(url=f"attachment://{round.mapinfo.filename}")
-            except:
-                pass
-            count += 1
-            self.embeds.append(embed)
-        self.currentround = 0
-        self.embed = self.embeds[self.currentround]
-        self.round = self.rounds.roundlist[self.currentround]
-        self.limit = len(self.embeds) - 1
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
-
-    class DemoAbility:
-        def __init__(self):
-            self.c_casts = 0
-            self.q_casts = 0
-            self.e_casts = 0
-            self.ultimate_casts = 0
-            self.x_casts = 0
-
-    @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.green)
-    async def leftmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if not self.currentround == 0:
-            self.currentround = self.currentround - 1
-        self.embed = self.embeds[self.currentround]
-        self.round = self.rounds.roundlist[self.currentround]
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except:
-            pass
-
-    @discord.ui.button(emoji="🛑", style=discord.ButtonStyle.green)
-    async def stopmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if isinstance(self._message, discord.InteractionResponse):
-            try:
-                await self._message.edit_message(view=None)
-            except:
-                pass
-        elif isinstance(self._message, discord.Interaction):
-            await self._message.delete_original_message()
-        else:
-            await self._message.edit(view=None)
-        self.stop()
-
-    @discord.ui.button(emoji="➡️", style=discord.ButtonStyle.green)
-    async def rightmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if not self.currentround == self.limit:
-            self.currentround = self.currentround + 1
-        self.embed = self.embeds[self.currentround]
-        self.round = self.rounds.roundlist[self.currentround]
-        if isinstance(self._message, discord.InteractionResponse):
-            await self._message.edit_message(embed=self.embed)
-        elif isinstance(self._message, discord.Interaction):
-            await self._message.edit_original_response(embed=self.embed)
-        else:
-            await self._message.edit(embed=self.embed)
-
-
-class ValorantStats(discord.ui.View):
-    def __init__(self, matches: Matches, currentplayerid):
-        super().__init__(timeout=60)
-        self.matches = matches
-        self.currentplayerid = currentplayerid
-        self.embeds = []
-        self.playerinfoembeds = []
-        firstmatch = True
-        for match in matches.matchlist:
-            playerinfoembed = discord.Embed(
-                title=f"{match.mode} {match.name} Players", description=f""
-            )
-            ct = 0
-            for player in match.players.playerlist:
-                ct += 1
-                if player.id == currentplayerid and firstmatch:
-                    self.currentcharactername = player.character.name
-                playerinfoembed.add_field(
-                    name=f"{ct}. {player.name}\n({player.character.name})",
-                    value=player.currenttier,
-                )
-            playerinfoembed.set_thumbnail(url=match.thumbnail)
-            self.playerinfoembeds.append(playerinfoembed)
-            firstmatch = False
-        for match in matches.matchlist:
-            embed = discord.Embed(title=f"{match.mode}", description=f"")
-            for player in match.players.playerlist:
-                if player.id == currentplayerid:
-                    agentability = ValorantAPI().get_agent_abilities(
-                        player.character.name
-                    )
-                    embed.description = f"""
-                    **Map**: {match.name}
-                    **Character**: {player.character.name}
-                    **K/D/A** : {player.stats.kills}/{player.stats.deaths}/{player.stats.assists}
-
-                    **Abilities Used**
-                    **{agentability["Ability1"].capitalize()}**: {player.ability_stats.c_casts}
-                    **{agentability["Ability2"].capitalize()}**: {player.ability_stats.q_casts}
-                    **{agentability["Grenade"].capitalize()}**: {player.ability_stats.e_casts}
-                    **{agentability["Ultimate"].capitalize()}**: {player.ability_stats.x_casts}
-                    """
-                    try:
-                        embed.set_thumbnail(url=player.icon)
-                    except:
-                        pass
-                    self.embeds.append(embed)
-        self.currentmatch = 0
-        self.playerinfoembed = self.playerinfoembeds[self.currentmatch]
-        self.embed = self.embeds[self.currentmatch]
-        self.match = self.matches.matchlist[self.currentmatch]
-        self.limit = len(self.embeds) - 1
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
-
-    @discord.ui.button(emoji="🙌", style=discord.ButtonStyle.green)
-    async def playerinfostats(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.send_message(
-            embed=self.playerinfoembed, ephemeral=True
-        )
-
-    @discord.ui.button(emoji="📄", style=discord.ButtonStyle.green)
-    async def roundstats(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        currentmatch = self.match
-        valoview = ValorantRoundStats(
-            currentmatch.rounds, self.currentplayerid, self.currentcharactername
-        )
-        valoview.set_message(
-            await interaction.response.send_message(
-                view=valoview, embed=valoview.embeds[0], ephemeral=True
-            )
-        )
-
-    @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.green)
-    async def leftmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if not self.currentmatch == 0:
-            self.currentmatch = self.currentmatch - 1
-        self.embed = self.embeds[self.currentmatch]
-        self.match = self.matches.matchlist[self.currentmatch]
-        self.playerinfoembed = self.playerinfoembeds[self.currentmatch]
-        for player in self.match.players.playerlist:
-            if player.id == self.currentplayerid:
-                self.currentcharactername = player.character.name
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except:
-            pass
-
-    @discord.ui.button(emoji="🛑", style=discord.ButtonStyle.green)
-    async def stopmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if isinstance(self._message, discord.InteractionResponse):
-            try:
-                await self._message.edit_message(view=None)
-            except:
-                pass
-        elif isinstance(self._message, discord.Interaction):
-            await self._message.delete_original_message()
-        else:
-            await self._message.edit(view=None)
-        self.stop()
-
-    @discord.ui.button(emoji="➡️", style=discord.ButtonStyle.green)
-    async def rightmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if not self.currentmatch == self.limit:
-            self.currentmatch = self.currentmatch + 1
-        self.embed = self.embeds[self.currentmatch]
-        self.match = self.matches.matchlist[self.currentmatch]
-        self.playerinfoembed = self.playerinfoembeds[self.currentmatch]
-        for player in self.match.players.playerlist:
-            if player.id == self.currentplayerid:
-                self.currentcharactername = player.character.name
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except:
-            pass
-
-
-class ValorantControls(discord.ui.View):
-    def __init__(self, matches: Matches, currentplayerid, ctx):
-        super().__init__(timeout=60)
-        self.matches = matches
-        self.currentplayerid = currentplayerid
-        self.ctx = ctx
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
-
-    @discord.ui.button(label="View recent matches", style=discord.ButtonStyle.green)
-    async def roundstats(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        valoview = ValorantStats(self.matches, self.currentplayerid)
-        valoview.set_message(
-            await self.ctx.send(embed=valoview.embeds[0], view=valoview, ephemeral=True)
-        )
-        button.disabled = True
-        await interaction.response.edit_message(view=self)
-
-    @discord.ui.button(label="View detailed stats", style=discord.ButtonStyle.green)
-    async def completestats(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        embed = discord.Embed(
-            title="Detailed Stats",
-            description="""
-        1️⃣ Most used weapons
-        2️⃣ Most kills with weapon
-        3️⃣ Common round losing reasons
-        """,
-        )
-        view = ValorantDetailedStats(self.matches, self.currentplayerid)
-        view.set_message(
-            await self.ctx.send(
-                embed=embed,
-                view=view,
-                ephemeral=True,
-            )
-        )
-        button.disabled = True
-        await interaction.response.edit_message(view=self)
-
-
-class ValorantDetailedStats(discord.ui.View):
-    def __init__(self, matches: Matches, currentplayerid):
-        super().__init__(timeout=60)
-        self.matches = matches
-        self.currentplayerid = currentplayerid
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
-
-    @discord.ui.button(emoji="1️⃣", style=discord.ButtonStyle.green)
-    async def mostusedweapons(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        embed = discord.Embed(title="Most Used Weapons", description="")
-        weaponjson = FormatData().get_freq_weapon(
-            self.matches.matchlist, self.currentplayerid
-        )
-        for weapon in weaponjson:
-            embed.description += f"{weapon['name']} - {weapon['uses']} times.\n"
-        await interaction.response.edit_message(embed=embed)
-
-    @discord.ui.button(emoji="2️⃣", style=discord.ButtonStyle.green)
-    async def mostkillswithweapon(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        embed = discord.Embed(title="Most Kills With Weapon", description="")
-        killsjson = FormatData().get_most_kills_weapon(
-            self.matches.matchlist, self.currentplayerid
-        )
-        for weapon in killsjson:
-            embed.description += f"{weapon['name']} - {weapon['kills']} kills.\n"
-        embed.description = embed.description[:4096]
-        await interaction.response.edit_message(embed=embed)
-
-    @discord.ui.button(emoji="3️⃣", style=discord.ButtonStyle.green)
-    async def roundlosingreasons(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        embed = discord.Embed(title="Common Round Losing Reasons", description="")
-        roundlosingreasonsjson = FormatData().get_round_losing_reason(
-            self.matches.matchlist, self.currentplayerid
-        )
-        ct = 1
-
-        def ordinal(n):
-            try:
-                return "%d%s" % (
-                    n,
-                    "tsnrhtdd"[(n // 10 % 10 != 1) * (n % 10 < 4) * n % 10 :: 4],
-                )
-            except:
-                return ""
-
-        for reason in roundlosingreasonsjson:
-            embed.description += f"{reason['name']} was the {ordinal(ct)} common reason for losing a round.\n"
-            ct += 1
-        await interaction.response.edit_message(embed=embed)
 
 
 class Minecraftpvp(discord.ui.View):
@@ -10622,7 +6624,7 @@ class Minecraftpvp(discord.ui.View):
     async def surrender(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        if not interaction.user.id in self.memberids:
+        if interaction.user.id not in self.memberids:
             await interaction.response.send_message(
                 "You are not participating in this pvp fight!",
                 ephemeral=True,
@@ -10634,16 +6636,16 @@ class Minecraftpvp(discord.ui.View):
                     f"You surrendered to {self.membertwoname} .", ephemeral=True
                 )
                 _message = interaction.message
-                if not _message is None:
+                if _message is not None:
                     embed = _message.embeds[0]
                     embed.description = f"`{self.memberonename} surrendered against {self.membertwoname}`"
                     embed.set_field_at(
                         index=0,
                         name=f"{self.memberonename} surrendered!",
-                        value=f"🧧Tie",
+                        value="🧧Tie",
                     )
                     embed.set_field_at(
-                        index=1, name=f"{self.membertwoname}", value=f"🧧Tie"
+                        index=1, name=f"{self.membertwoname}", value="🧧Tie"
                     )
                     await _message.edit(content="** **", embed=embed, view=None)
             elif interaction.user.id == self.membertwoid:
@@ -10651,16 +6653,16 @@ class Minecraftpvp(discord.ui.View):
                     f"You surrendered to {self.memberonename} .", ephemeral=True
                 )
                 _message = interaction.message
-                if not _message is None:
+                if _message is not None:
                     embed = _message.embeds[0]
                     embed.description = f"`{self.membertwoname} surrendered against {self.memberonename}`"
                     embed.set_field_at(
-                        index=0, name=f"{self.memberonename}", value=f"🧧Tie"
+                        index=0, name=f"{self.memberonename}", value="🧧Tie"
                     )
                     embed.set_field_at(
                         index=1,
                         name=f"{self.membertwoname} surrendered!",
-                        value=f"🧧Tie",
+                        value="🧧Tie",
                     )
                     await _message.edit(content="** **", embed=embed, view=None)
             try:
@@ -10669,7 +6671,7 @@ class Minecraftpvp(discord.ui.View):
                 self.vc.play(
                     discord.FFmpegPCMAudio("./resources/pvp/Event_raidhorn4.ogg")
                 )
-            except:
+            except Exception:
                 pass
             self.stop()
 
@@ -10679,7 +6681,7 @@ class Minecraftpvp(discord.ui.View):
         custom_id="minecraftpvp:defend",
     )
     async def defend(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.id in self.memberids:
+        if interaction.user.id not in self.memberids:
             await interaction.response.send_message(
                 "You are not participating in this pvp fight!",
                 ephemeral=True,
@@ -10715,7 +6717,7 @@ class Minecraftpvp(discord.ui.View):
                     )
                     return
             _message = interaction.message
-            if not _message is None:
+            if _message is not None:
                 embed = _message.embeds[0]
                 try:
                     if self.vc.is_playing():
@@ -10723,7 +6725,7 @@ class Minecraftpvp(discord.ui.View):
                     self.vc.play(
                         discord.FFmpegPCMAudio("./resources/pvp/Equip_netherite4.ogg")
                     )
-                except:
+                except Exception:
                     pass
                 embed.description = f"`{interaction.user.name} has equipped the shields and its on cooldown for the next move!`"
                 await _message.edit(
@@ -10766,7 +6768,7 @@ class Minecraftpvp(discord.ui.View):
             "was poked to death by a sweet berry bush whilst trying to escape ",
             "withered away whilst fighting ",
         ]
-        if not interaction.user.id in self.memberids:
+        if interaction.user.id not in self.memberids:
             await interaction.response.send_message(
                 "You are not participating in this pvp fight!",
                 ephemeral=True,
@@ -10814,17 +6816,17 @@ class Minecraftpvp(discord.ui.View):
                                 "./resources/pvp/Critical_attack1.ogg"
                             )
                         )
-                except:
+                except Exception:
                     pass
                 _message = interaction.message
                 if self.membertwo_healthpoint <= 0:
-                    if not _message is None:
+                    if _message is not None:
                         embed = _message.embeds[0]
                         embed.description = f"`{self.membertwoname} {random.choice(winmessage)}{self.memberonename}`"
                         embed.set_field_at(
                             index=0,
                             name=f"{self.memberonename}",
-                            value=f"🎊Won +50 Currency",
+                            value="🎊Won +50 Currency",
                         )
                         try:
                             if self.vc.is_playing():
@@ -10834,22 +6836,22 @@ class Minecraftpvp(discord.ui.View):
                                     "./resources/pvp/Player_hurt1.ogg"
                                 )
                             )
-                        except:
+                        except Exception:
                             pass
-                        await addmoney(interaction.channel,self.memberoneid, 50)
+                        await addmoney(interaction.channel, self.memberoneid, 50)
                         embed.set_field_at(
                             index=1,
                             name=f"{self.membertwoname}",
-                            value=f"🧧Defeated +5 Currency",
+                            value="🧧Defeated +5 Currency",
                         )
                         statement = """INSERT INTO leaderboard (mention) VALUES($1);"""
-                        async with pool.acquire() as con:
+                        async with client.database.pool.acquire() as con:
                             await con.execute(statement, str(self.memberoneid))
                         await addmoney(interaction.channel, self.membertwoid, 5)
                         await _message.edit(embed=embed, view=None)
                         self.stop()
                         return
-                if not _message is None:
+                if _message is not None:
                     lastmessage = " ."
                     if shielddisabled:
                         try:
@@ -10860,7 +6862,7 @@ class Minecraftpvp(discord.ui.View):
                                     "./resources/pvp/Shield_block5.ogg"
                                 )
                             )
-                        except:
+                        except Exception:
                             pass
                         lastmessage = " and disabled the shields!"
                     embed = _message.embeds[0]
@@ -10868,7 +6870,7 @@ class Minecraftpvp(discord.ui.View):
                     embed.set_field_at(
                         index=1,
                         name=f"{self.membertwoname}'s health ",
-                        value=getProgress(
+                        value=get_progress(
                             int(
                                 (
                                     self.membertwo_healthpoint
@@ -10922,23 +6924,23 @@ class Minecraftpvp(discord.ui.View):
                                 "./resources/pvp/Critical_attack1.ogg"
                             )
                         )
-                except:
+                except Exception:
                     pass
                 _message = interaction.message
                 if self.memberone_healthpoint <= 0:
-                    if not _message is None:
+                    if _message is not None:
                         embed = _message.embeds[0]
                         embed.description = f"`{self.memberonename} {random.choice(winmessage)}{self.membertwoname}`"
                         embed.set_field_at(
                             index=0,
                             name=f"{self.memberonename}",
-                            value=f"🧧Defeated +5 Currency",
+                            value="🧧Defeated +5 Currency",
                         )
                         await addmoney(interaction.channel, self.membertwoid, 50)
                         embed.set_field_at(
                             index=1,
                             name=f"{self.membertwoname}",
-                            value=f"🎊Won +50 Currency",
+                            value="🎊Won +50 Currency",
                         )
                         try:
                             if self.vc.is_playing():
@@ -10948,16 +6950,16 @@ class Minecraftpvp(discord.ui.View):
                                     "./resources/pvp/Player_hurt1.ogg"
                                 )
                             )
-                        except:
+                        except Exception:
                             pass
                         statement = """INSERT INTO leaderboard (mention) VALUES($1);"""
-                        async with pool.acquire() as con:
+                        async with client.database.pool.acquire() as con:
                             await con.execute(statement, str(self.membertwoid))
                         await addmoney(interaction.channel, self.memberoneid, 5)
                         await _message.edit(embed=embed, view=None)
                         self.stop()
                         return
-                if not _message is None:
+                if _message is not None:
                     lastmessage = " ."
                     if shielddisabled:
                         try:
@@ -10968,7 +6970,7 @@ class Minecraftpvp(discord.ui.View):
                                     "./resources/pvp/Shield_block5.ogg"
                                 )
                             )
-                        except:
+                        except Exception:
                             pass
                         lastmessage = " and disabled the shields!"
                     embed = _message.embeds[0]
@@ -10976,7 +6978,7 @@ class Minecraftpvp(discord.ui.View):
                     embed.set_field_at(
                         index=0,
                         name=f"{self.memberonename}'s health ",
-                        value=getProgress(
+                        value=get_progress(
                             int(
                                 (
                                     self.memberone_healthpoint
@@ -11008,7 +7010,7 @@ class ConfirmPrivate(discord.ui.View):
         custom_id="confirmprivate:green",
     )
     async def green(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.id in self.memberids and not checkstaff(
+        if interaction.user.id not in self.memberids and not checkstaff(
             interaction.user
         ):
             await interaction.response.send_message(
@@ -11023,228 +7025,264 @@ class ConfirmPrivate(discord.ui.View):
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-def is_guild(provguild, provname):
+def is_custom_command(command_name):
+    """Check whether the invoking guild owns a named custom command."""
+
     async def predicate(ctx):
-        async with pool.acquire() as con:
-            customcommandlist = await con.fetch(
-                f"SELECT * FROM customcommands WHERE commandname = '{provname}'"
+        if ctx.guild is None:
+            return False
+        async with client.database.pool.acquire() as con:
+            exists = await con.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM customcommands
+                    WHERE guildid = $1 AND commandname = $2
+                )
+                """,
+                ctx.guild.id,
+                command_name,
             )
-        commandAcq = False
-        for customcommand in customcommandlist:
-            if customcommand[0] == provguild.id:
-                commandAcq = True
-                break
-        return commandAcq
+        return bool(exists)
 
     return commands.check(predicate)
 
 
 class CustomCommands(commands.Cog):
-    """Guild custom commands"""
+    """Create and run server-specific text response commands."""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self._loader_task = None
 
     async def cog_load(self):
-        await client.wait_until_ready()
-        global customCog
-        customCog = self
-        for guild in client.guilds:
-            async with pool.acquire() as con:
-                customlist = await con.fetch(
-                    f"SELECT * FROM customcommands WHERE guildid = {guild.id}"
+        self._loader_task = asyncio.create_task(
+            self._load_custom_commands(), name="aestron-custom-command-loader"
+        )
+
+    async def cog_unload(self):
+        if self._loader_task is not None:
+            self._loader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._loader_task
+
+    def _build_custom_command(self, command_name):
+        @commands.cooldown(1, 30, BucketType.member)
+        @commands.command(
+            name=command_name,
+            brief="Send this server's configured custom response.",
+            description="Send the response configured for this server's custom command.",
+            usage="",
+            extras={"aestron_custom_command": True},
+        )
+        @is_custom_command(command_name)
+        async def custom_command(_cog, ctx):
+            async with client.database.pool.acquire() as con:
+                output = await con.fetchval(
+                    """
+                    SELECT commandoutput FROM customcommands
+                    WHERE guildid = $1 AND commandname = $2
+                    """,
+                    ctx.guild.id,
+                    ctx.command.name,
                 )
-            if customlist is not None:
-                for custom in customlist:
+            if output is None:
+                await send_generic_error_embed(
+                    ctx, error_data="This custom command no longer exists."
+                )
+                return
+            replacements = {
+                "{user}": ctx.author.mention,
+                "{member}": ctx.author.mention,
+                "{channel}": ctx.channel.mention,
+                "{guild}": str(ctx.guild),
+            }
+            for placeholder, value in replacements.items():
+                output = output.replace(placeholder, value)
+            embed = discord.Embed(
+                title=f"{ctx.command.name} command", description=output
+            )
+            embed.set_footer(text=f"{ctx.guild}'s custom command")
+            await ctx.send(embed=embed)
 
-                    @commands.cooldown(1, 30, BucketType.member)
-                    @commands.command(
-                        name=custom[1],
-                        brief="This command outputs your custom provided output.",
-                        description="This command outputs your custom provided output.",
-                        usage="",
-                    )
-                    @commands.check_any(is_guild(guild, custom[1]))
-                    async def cmd(self, ctx):
-                        try:
-                            async with pool.acquire() as con:
-                                customlist = await con.fetchrow(
-                                    f"SELECT * FROM customcommands WHERE guildid = {ctx.guild.id} AND commandname = '{custom[1]}'"
-                                )
-                        except:
-                            customlist = None
-                        if customlist is not None:
-                            output = customlist[2]
-                            output = output.replace("{user}", str(ctx.author.mention))
-                            output = output.replace("{member}", str(ctx.author.mention))
-                            output = output.replace(
-                                "{channel}", str(ctx.channel.mention)
-                            )
-                            output = output.replace("{guild}", str(ctx.guild))
-                            embed = discord.Embed(
-                                title=f"{ctx.command.name} command", description=output
-                            )
-                            embed.set_footer(text=f"{ctx.guild}'s custom command")
-                            await ctx.send(embed=embed)
-                        else:
-                            output = "Welp looks like this command has been erased from our databases <:offline:886434154412113961>."
-                            embed = discord.Embed(
-                                title=f"{ctx.command.name} command", description=output
-                            )
-                            embed.set_footer(
-                                text=f"{ctx.guild}'s custom command (ERASED)"
-                            )
-                            await ctx.send(embed=embed)
+        custom_command.cog = self
+        return custom_command
 
-                    cmd.cog = self
-                    # And add it to the cog and the bot
-                    self.__cog_commands__ = self.__cog_commands__ + (cmd,)
-                    try:
-                        client.add_command(cmd)
-                    except Exception as ex:
-                        logging.log(logging.ERROR, f"Custom commands error in {customlist[1]}: {get_traceback(ex)}")
-                        async with pool.acquire() as con:
-                            await con.execute(
-                                f"DELETE FROM customcommands WHERE guildid = {guild.id} AND commandname = '{custom[1]}'"
-                            )
+    def _register_custom_command(self, command_name):
+        if not isinstance(command_name, str) or not re.fullmatch(
+            r"[a-z0-9_-]{1,32}", command_name
+        ):
+            LOGGER.warning("Skipped invalid custom command name=%r", command_name)
+            return False
+        existing = self.bot.get_command(command_name)
+        if existing is not None:
+            return bool(existing.extras.get("aestron_custom_command"))
+        command = self._build_custom_command(command_name)
+        self.__cog_commands__ += (command,)
+        self.bot.add_command(command)
+        normalize_command_metadata(self.bot)
+        LOGGER.info("Registered custom command name=%s", command_name)
+        return True
+
+    async def _load_custom_commands(self):
+        await self.bot.wait_until_ready()
+        async with client.database.pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT DISTINCT commandname FROM customcommands ORDER BY commandname"
+            )
+        for row in rows:
+            command_name = row["commandname"]
+            if not self._register_custom_command(command_name):
+                LOGGER.warning(
+                    "Skipped custom command %r because its name is already registered",
+                    command_name,
+                )
 
     @commands.cooldown(1, 120, BucketType.member)
     @commands.command(
-        brief="This command can be used to check the custom commands in this guild.",
-        description="This command can be used to check the custom commands in this guild.",
+        brief="List this server's custom commands.",
+        description="List every custom response command configured in this server.",
         usage="",
     )
     @commands.guild_only()
-    @commands.cooldown(1, 120, BucketType.member)
     async def customcommands(self, ctx):
-        async with pool.acquire() as con:
-            customlist = await con.fetch(
-                f"SELECT * FROM customcommands WHERE guildid = {ctx.guild.id}"
+        async with client.database.pool.acquire() as con:
+            rows = await con.fetch(
+                """
+                SELECT commandname FROM customcommands
+                WHERE guildid = $1 ORDER BY commandname
+                """,
+                ctx.guild.id,
             )
         embed = discord.Embed(
             title=f"{ctx.guild.name}'s custom commands",
-            description="These custom commands can be added by *addcommand command*!",
+            description="Use `addcommand <name> <response>` to create one.",
         )
-        nocommands = True
-        for command in customlist:
-            nocommands = False
-            embed.add_field(name=command["commandname"], value="** **")
-        if nocommands:
-            embed.add_field(
-                name=":no_entry: Nothing to see there , add a command by a!addcommand.",
-                value="** **",
+        if rows:
+            embed.description += "\n\n" + "\n".join(
+                f"`{row['commandname']}`" for row in rows
             )
+        else:
+            embed.description += "\n\nNo custom commands are configured."
         await ctx.send(embed=embed)
 
     @commands.command(
-        brief="This command can be used to add your own commands with a custom response.",
-        description="This command can be used to add your own commands with a custom response(requires manage guild).",
-        usage="commandname output",
+        brief="Create or update a custom response command.",
+        description=(
+            "Create or update a server-specific custom response. Requires Manage Server."
+        ),
+        usage="<command_name> <response...>",
         aliases=["addcustomcommand"],
     )
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def addcommand(self, ctx, cmdname: str, *, cmdoutput: str):
-        try:
-            async with pool.acquire() as con:
-                customlist = await con.fetchrow(
-                    f"SELECT * FROM customcommands WHERE guildid = {ctx.guild.id} AND commandname = '{cmdname}'"
+    async def addcommand(self, ctx, command_name: str, *, response: str):
+        command_name = command_name.casefold().strip()
+        if not re.fullmatch(r"[a-z0-9_-]{1,32}", command_name):
+            await send_generic_error_embed(
+                ctx,
+                error_data=(
+                    "Command names must be 1-32 lowercase letters, numbers, `_`, or `-`."
+                ),
+            )
+            return
+        if len(response) > 4000:
+            await send_generic_error_embed(
+                ctx, error_data="Custom responses must be at most 4000 characters."
+            )
+            return
+        existing = self.bot.get_command(command_name)
+        if existing is not None and not existing.extras.get("aestron_custom_command"):
+            await send_generic_error_embed(
+                ctx, error_data="That name is already used by a built-in command."
+            )
+            return
+
+        async with client.database.pool.acquire() as con:
+            exists = await con.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM customcommands
+                    WHERE guildid = $1 AND commandname = $2
                 )
-        except:
-            customlist = None
-        if customlist is None:
-            results = f"INSERT INTO customcommands (guildid,commandname,commandoutput) VALUES($1, $2, $3);"
-            async with pool.acquire() as con:
-                await con.execute(results, ctx.guild.id, cmdname, cmdoutput)
-        else:
-            async with pool.acquire() as con:
+                """,
+                ctx.guild.id,
+                command_name,
+            )
+            if exists:
                 await con.execute(
-                    f"UPDATE customcommands VALUES SET commandoutput = '{cmdoutput}' WHERE guildid = {ctx.guild.id} AND commandname = '{cmdname}'"
+                    """
+                    UPDATE customcommands SET commandoutput = $3
+                    WHERE guildid = $1 AND commandname = $2
+                    """,
+                    ctx.guild.id,
+                    command_name,
+                    response,
                 )
-
-        @commands.cooldown(1, 30, BucketType.member)
-        @commands.command(
-            name=cmdname,
-            brief="This command outputs your custom provided output.",
-            description="This command outputs your custom provided output.",
-            usage="",
-        )
-        @commands.check_any(is_guild(ctx.guild, cmdname))
-        async def cmd(self, ctx):
-            try:
-                async with pool.acquire() as con:
-                    customlist = await con.fetchrow(
-                        f"SELECT * FROM customcommands WHERE guildid = {ctx.guild.id} AND commandname = '{ctx.command.name}'"
-                    )
-            except:
-                customlist = None
-            if customlist is not None:
-                output = customlist[2]
-                output = output.replace("{user}", str(ctx.author.mention))
-                output = output.replace("{member}", str(ctx.author.mention))
-                output = output.replace("{channel}", str(ctx.channel.mention))
-                output = output.replace("{guild}", str(ctx.guild))
-                embed = discord.Embed(
-                    title=f"{ctx.command.name} command", description=output
-                )
-                embed.set_footer(text=f"{ctx.guild}'s custom command")
-                await ctx.send(embed=embed)
             else:
-                output = "Welp looks like this command has been erased from our databases <:offline:886434154412113961>."
-                embed = discord.Embed(
-                    title=f"{ctx.command.name} command", description=output
+                await con.execute(
+                    """
+                    INSERT INTO customcommands (guildid, commandname, commandoutput)
+                    VALUES ($1, $2, $3)
+                    """,
+                    ctx.guild.id,
+                    command_name,
+                    response,
                 )
-                embed.set_footer(text=f"{ctx.guild}'s custom command (ERASED)")
-                await ctx.send(embed=embed)
-
-        cmd.cog = self
-        # And add it to the cog and the bot
-        self.__cog_commands__ = self.__cog_commands__ + (cmd,)
-        try:
-            client.add_command(cmd)
-        except:
-            pass
-        await ctx.send(f"Successfully added a command called {cmdname}")
+        self._register_custom_command(command_name)
+        await ctx.send(f"Saved the custom command `{command_name}`.")
 
     @commands.cooldown(1, 240, BucketType.member)
     @commands.command(
-        brief="This command can be used to remove your custom command.",
-        description="This command can be used to remove your custom command(requires manage guild).",
-        usage="commandname",
+        brief="Remove a custom response command.",
+        description="Remove this server's custom response. Requires Manage Server.",
+        usage="<command_name>",
         aliases=["removecustomcommand"],
     )
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def removecommand(self, ctx, cmdname: str):
-        # Make sure it's actually a custom command, to avoid removing a real command
-        async with pool.acquire() as con:
-            customcommandlist = await con.fetch(
-                f"SELECT * FROM customcommands WHERE guildid = {ctx.guild.id}"
+    async def removecommand(self, ctx, command_name: str):
+        command_name = command_name.casefold().strip()
+        async with client.database.pool.acquire() as con:
+            status = await con.execute(
+                """
+                DELETE FROM customcommands
+                WHERE guildid = $1 AND commandname = $2
+                """,
+                ctx.guild.id,
+                command_name,
             )
-        commandAcq = False
-        for customcommand in customcommandlist:
-            if customcommand[1] == cmdname:
-                commandAcq = True
-                break
-        if not commandAcq:
-            return await ctx.send(f"There is no custom command called {cmdname}")
-        async with pool.acquire() as con:
-            customlist = await con.fetchrow(
-                f"DELETE FROM customcommands WHERE guildid = {ctx.guild.id} AND commandname = '{cmdname}'"
+            remaining = await con.fetchval(
+                "SELECT COUNT(*) FROM customcommands WHERE commandname = $1",
+                command_name,
             )
-        await ctx.send(f"Successfully removed a command called {cmdname}")
+        if status == "DELETE 0":
+            await send_generic_error_embed(
+                ctx, error_data=f"There is no custom command named `{command_name}`."
+            )
+            return
+        if remaining == 0:
+            command = self.bot.get_command(command_name)
+            if command is not None and command.extras.get("aestron_custom_command"):
+                self.bot.remove_command(command_name)
+                self.__cog_commands__ = tuple(
+                    item for item in self.__cog_commands__ if item is not command
+                )
+        await ctx.send(f"Removed the custom command `{command_name}`.")
 
 
 @client.event
 async def on_raw_reaction_add(payload):
-    global maintenancemodestatus
     if payload.user_id == client.user.id:
         return
-    if maintenancemodestatus:
-        logging.log(logging.DEBUG, 
-            f"Guild {payload.guild_id} channel {payload.channel_id} message {payload.message_id} reaction {payload.emoji} event_type {payload.event_type}."
+    if client.runtime_state.maintenance_mode:
+        logging.log(
+            logging.DEBUG,
+            f"Guild {payload.guild_id} channel {payload.channel_id} message {payload.message_id} reaction {payload.emoji} event_type {payload.event_type}.",
         )
     try:
         if payload.event_type == "REACTION_REMOVE":
-            async with pool.acquire() as con:
-                polllist = await con.fetch(f"SELECT messageid FROM polls")
+            async with client.database.pool.acquire() as con:
+                polllist = await con.fetch("SELECT messageid FROM polls")
             selectid = payload.message_id
             exists = False
             for poll in polllist:
@@ -11256,17 +7294,21 @@ async def on_raw_reaction_add(payload):
                 _message = await channel.fetch_message(payload.message_id)
                 embed = _message.embeds[0]
                 # embed.add_field(name="Total count ",value="0")
-                # embed.add_field(name="Percentage of votes <a:verified:875327156572532736>/<a:denied:877399177208954912>",value="0/0 %")
+                # embed.add_field(name="Percentage of votes ✅/❌",value="0/0 %")
                 if len(_message.reactions) >= 2:
-                    deniedreactions = await _message.reactions[1].users().flatten()
+                    deniedreactions = [
+                        user async for user in _message.reactions[1].users()
+                    ]
                     try:
                         deniedreactions.pop(deniedreactions.index(client.user))
-                    except:
+                    except Exception:
                         pass
-                    verifiedreactions = await _message.reactions[0].users().flatten()
+                    verifiedreactions = [
+                        user async for user in _message.reactions[0].users()
+                    ]
                     try:
                         verifiedreactions.pop(verifiedreactions.index(client.user))
-                    except:
+                    except Exception:
                         pass
                     deniedcount = len(deniedreactions)
                     verifiedcount = len(verifiedreactions)
@@ -11276,7 +7318,7 @@ async def on_raw_reaction_add(payload):
                     embed.set_field_at(index=0, name="Total users", value=totalcount)
                     embed.set_field_at(
                         index=1,
-                        name="Percentage of votes <a:verified:875327156572532736>/<a:denied:877399177208954912>",
+                        name="Percentage of votes ✅/❌",
                         value=f"{round(verifiedpercent)}/{round(deniedpercent)} %",
                     )
                     statusmsg = f"Tie {verifiedcount}/{totalcount}"
@@ -11287,8 +7329,8 @@ async def on_raw_reaction_add(payload):
                     embed.set_footer(text=statusmsg)
                     await _message.edit(embed=embed)
             return
-        async with pool.acquire() as con:
-            polllist = await con.fetch(f"SELECT messageid FROM polls")
+        async with client.database.pool.acquire() as con:
+            polllist = await con.fetch("SELECT messageid FROM polls")
         selectid = payload.message_id
         exists = False
         for poll in polllist:
@@ -11300,17 +7342,19 @@ async def on_raw_reaction_add(payload):
             _message = await channel.fetch_message(payload.message_id)
             embed = _message.embeds[0]
             # embed.add_field(name="Total count ",value="0")
-            # embed.add_field(name="Percentage of votes <a:verified:875327156572532736>/<a:denied:877399177208954912>",value="0/0 %")
+            # embed.add_field(name="Percentage of votes ✅/❌",value="0/0 %")
             if len(_message.reactions) >= 2:
-                deniedreactions = await _message.reactions[1].users().flatten()
+                deniedreactions = [user async for user in _message.reactions[1].users()]
                 try:
                     deniedreactions.pop(deniedreactions.index(client.user))
-                except:
+                except Exception:
                     pass
-                verifiedreactions = await _message.reactions[0].users().flatten()
+                verifiedreactions = [
+                    user async for user in _message.reactions[0].users()
+                ]
                 try:
                     verifiedreactions.pop(verifiedreactions.index(client.user))
-                except:
+                except Exception:
                     pass
                 deniedcount = len(deniedreactions)
                 verifiedcount = len(verifiedreactions)
@@ -11320,7 +7364,7 @@ async def on_raw_reaction_add(payload):
                 embed.set_field_at(index=0, name="Total users", value=totalcount)
                 embed.set_field_at(
                     index=1,
-                    name="Percentage of votes <a:verified:875327156572532736>/<a:denied:877399177208954912>",
+                    name="Percentage of votes ✅/❌",
                     value=f"{round(verifiedpercent)}/{round(deniedpercent)} %",
                 )
                 statusmsg = f"Tie {verifiedcount}/{totalcount}"
@@ -11330,11 +7374,11 @@ async def on_raw_reaction_add(payload):
                     statusmsg = f"Accepted({verifiedcount}/{totalcount}) users"
                 embed.set_footer(text=statusmsg)
                 await _message.edit(embed=embed)
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             ticketlist = await con.fetchrow(
-                f"SELECT * FROM ticketchannels WHERE messageid = {payload.message_id}"
+                "SELECT * FROM ticketchannels WHERE messageid = $1", payload.message_id
             )
-        if not ticketlist == None:
+        if ticketlist is not None:
             supportroleid = ticketlist["roleid"]
             guild = client.get_guild(payload.guild_id)
             channel = guild.get_channel(payload.channel_id)
@@ -11343,39 +7387,26 @@ async def on_raw_reaction_add(payload):
             await _message.remove_reaction(payload.emoji, user)
             await createticket(user, guild, channel.category, channel, supportroleid)
     except Exception as error:
-        logging.log(logging.ERROR, f" on_raw_reaction_add: {get_traceback(error)}")
-
-
-@client.event
-async def on_guild_remove(guild):
-    global guildids
-    try:
-        guildids.remove(guild.id)
-    except:
-        pass
+        logging.log(logging.ERROR, f" on_raw_reaction_add: {format_exception(error)}")
 
 
 @client.event
 async def on_guild_join(guild):
-    global guildids
     try:
         chars = ""
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             prefixeslist = await con.fetchrow(
-                f"SELECT * FROM prefixes WHERE guildid = {guild.id}"
+                "SELECT * FROM prefixes WHERE guildid = $1", guild.id
             )
         if prefixeslist is None:
             statement = """INSERT INTO prefixes (guildid,prefix) VALUES($1,$2);"""
-            async with pool.acquire() as con:
-                await con.execute(statement, guild.id, "a!")
-            chars = "a!"
+            async with client.database.pool.acquire() as con:
+                await con.execute(statement, guild.id, SETTINGS.default_prefix)
+            chars = SETTINGS.default_prefix
         else:
             chars = prefixeslist["prefix"]
-        if not guild.id in guildids:
-            guildids.append(guild.id)
-        guildids.append(guild.id)
         prefix = chars
-        embedOne = discord.Embed(
+        embed_one = discord.Embed(
             title="Walkthrough Guide ",
             description=f"Prefix {prefix}",
             color=Color.green(),
@@ -11385,13 +7416,13 @@ async def on_guild_join(guild):
                 channel.type == discord.ChannelType.text
                 and channel.permissions_for(guild.me).send_messages
             ):
-                embedOne.add_field(
+                embed_one.add_field(
                     name=f"Invoke our bot by sending {prefix}help in a channel in which bot has permissions to read.",
                     value="** **",
                     inline=False,
                 )
 
-                embedOne.add_field(
+                embed_one.add_field(
                     name="Thanks for inviting "
                     + client.user.name
                     + " to "
@@ -11399,18 +7430,19 @@ async def on_guild_join(guild):
                     value="** **",
                     inline=False,
                 )
-                embedOne.add_field(
-                    name="Support server : https://discord.gg/TZDYSHSZgg",
-                    value="** **",
-                    inline=False,
-                )
+                if SETTINGS.support_server_invite:
+                    embed_one.add_field(
+                        name="Support server",
+                        value=SETTINGS.support_server_invite,
+                        inline=False,
+                    )
                 try:
-                    await channel.send(embed=embedOne)
-                except:
+                    await channel.send(embed=embed_one)
+                except Exception:
                     raise commands.BotMissingPermissions(["embed_links"])
                 break
     except Exception as error:
-        logging.log(logging.ERROR, f" on_guild_join: {get_traceback(error)}")
+        logging.log(logging.ERROR, f" on_guild_join: {format_exception(error)}")
 
 
 @client.event
@@ -11435,17 +7467,17 @@ async def on_raw_message_delete(payload):
                 embeddict = payload.cached_message.embeds[0].to_dict()
             else:
                 embeddict = {1: True}
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 snipelist = await con.fetchrow(
-                    f"SELECT * FROM snipelog WHERE channelid = {channelid}"
+                    "SELECT * FROM snipelog WHERE channelid = $1", channelid
                 )
             if snipelist is not None:
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(
-                        f"DELETE FROM snipelog WHERE channelid = {channelid}"
+                        "DELETE FROM snipelog WHERE channelid = $1", channelid
                     )
                 statement = """INSERT INTO snipelog (channelid,username,content,embeds,timedeletion) VALUES($1,$2,$3,$4,$5);"""
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(
                         statement,
                         channelid,
@@ -11456,7 +7488,7 @@ async def on_raw_message_delete(payload):
                     )
             else:
                 statement = """INSERT INTO snipelog (channelid,username,content,embeds,timedeletion) VALUES($1,$2,$3,$4,$5);"""
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(
                         statement,
                         channelid,
@@ -11467,120 +7499,34 @@ async def on_raw_message_delete(payload):
                     )
 
     except Exception as error:
-        logging.log(logging.ERROR, f" on_raw_message_delete: {get_traceback(error)}")
-
-
-@client.event
-async def on_member_join(member):
-    async with pool.acquire() as con:
-        blacklistedlist = await con.fetchrow(
-            f"SELECT * FROM blacklistedusers where userid = {member.id} AND guildid = {member.guild.id}"
-        )
-    if blacklistedlist is not None:
-        guild = member.guild
-        blacklistrole = discord.utils.get(guild.roles, name="blacklisted")
-        if blacklistrole is None:
-            perms = discord.Permissions(send_messages=False, read_messages=False)
-            try:
-                await guild.create_role(name="blacklisted", permissions=perms)
-            except:
-                raise commands.BotMissingPermissions(["manage_roles"])
-            blacklistrole = discord.utils.get(guild.roles, name="blacklisted")
-            for channelloop in guild.channels:
-                await channelloop.set_permissions(blacklistrole, view_channel=False)
-        else:
-            perms = discord.Permissions(send_messages=False, read_messages=False)
-            try:
-                await blacklistrole.edit(permissions=perms)
-            except:
-                raise commands.BotMissingPermissions(["manage_roles"])
-            for channelloop in guild.channels:
-                await channelloop.set_permissions(blacklistrole, view_channel=False)
-        try:
-            await member.add_roles(blacklistrole)
-        except:
-            pass
-    async with pool.acquire() as con:
-        mutedlist = await con.fetchrow(
-            f"SELECT * FROM mutedusers where userid = {member.id} AND guildid = {member.guild.id}"
-        )
-    if mutedlist is not None:
-        guild = member.guild
-        muterole = discord.utils.get(guild.roles, name="muted")
-        if muterole is None:
-            perms = discord.Permissions(
-                send_messages=False,
-                add_reactions=False,
-                connect=False,
-                change_nickname=False,
-            )
-            try:
-                await guild.create_role(name="muted", permissions=perms)
-            except:
-                raise commands.BotMissingPermissions(["manage_roles"])
-            muterole = discord.utils.get(guild.roles, name="muted")
-            for channelloop in guild.channels:
-                if channelloop.type == discord.ChannelType.text:
-                    await channelloop.set_permissions(
-                        muterole,
-                        read_messages=None,
-                        send_messages=False,
-                        add_reactions=False,
-                        create_public_threads=False,
-                        create_private_threads=False,
-                    )
-                elif channelloop.type == discord.ChannelType.voice:
-                    await channelloop.set_permissions(muterole, view_channel=False)
-        else:
-            perms = discord.Permissions(
-                send_messages=False,
-                add_reactions=False,
-                connect=False,
-                change_nickname=False,
-            )
-            try:
-                await muterole.edit(permissions=perms)
-            except:
-                raise commands.BotMissingPermissions(["manage_roles"])
-            for channelloop in guild.channels:
-                if channelloop.type == discord.ChannelType.text:
-                    await channelloop.set_permissions(
-                        muterole,
-                        read_messages=None,
-                        send_messages=False,
-                        add_reactions=False,
-                        create_public_threads=False,
-                        create_private_threads=False,
-                    )
-                elif channelloop.type == discord.ChannelType.voice:
-                    await channelloop.set_permissions(muterole, view_channel=False)
-        try:
-            await member.add_roles(muterole)
-        except:
-            pass
+        logging.log(logging.ERROR, f" on_raw_message_delete: {format_exception(error)}")
 
 
 @client.event
 async def on_message_edit(before, _message):
-    global maintenancemodestatus, disabledChannels
-    if conn is None:
-        logging.log(logging.ERROR, f"Could not process _message {_message.id} because of db problems!")
+    if not client.database.connected:
+        logging.log(
+            logging.ERROR,
+            f"Could not process _message {_message.id} because of db problems!",
+        )
         return
     try:
-        if maintenancemodestatus:
+        if client.runtime_state.maintenance_mode:
             if not checkstaff(_message.author):
                 return
-            logging.log(logging.debug, 
-                f" {_message.author} edited {before.content} -> {_message.content} in {_message.channel} ."
+            logging.log(
+                logging.DEBUG,
+                f" {_message.author} edited {before.content} -> {_message.content} in {_message.channel} .",
             )
         if _message.author.bot:
             return
 
         origmessage = _message.content
         if _message.guild:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 linklist = await con.fetchrow(
-                    f"SELECT * FROM linkchannels WHERE channelid = {_message.channel.id}"
+                    "SELECT * FROM linkchannels WHERE channelid = $1",
+                    _message.channel.id,
                 )
             if (
                 linklist is not None
@@ -11592,22 +7538,21 @@ async def on_message_edit(before, _message):
                 listofwords = convertwords(listofsentence)
                 for word in listofwords:
                     serverinvitecheck = re.compile(
-                        "(?:https?://)?discord(?:app)?\.(?:com/invite|gg)/[a-zA-Z0-9]+/?"
+                        r"(?:https?://)?discord(?:app)?\.(?:com/invite|gg)/[a-zA-Z0-9]+/?"
                     )
                     if serverinvitecheck.match(word):
                         try:
                             await _message.delete()
-                        except:
-                            automodembedOne = discord.Embed(
+                        except Exception:
+                            automodembed_one = discord.Embed(
                                 title="Automod Error",
                                 description="I don't have `manage messages` permission.",
                             )
-                            if not _message.channel.id in disabledChannels:
-                                messagesent = await _message.channel.send(
-                                    embed=automodembedOne
-                                )
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
+                            messagesent = await _message.channel.send(
+                                embed=automodembed_one
+                            )
+                            await asyncio.sleep(2)
+                            await messagesent.delete()
                         automodembed = discord.Embed(
                             title="Automod (Message edit)", description="Server invite"
                         )
@@ -11615,12 +7560,9 @@ async def on_message_edit(before, _message):
                             value=f"Hey {_message.author.mention} server invites are not allowed here.",
                             name="** **",
                         )
-                        if not _message.channel.id in disabledChannels:
-                            messagesent = await _message.channel.send(
-                                embed=automodembed
-                            )
-                            await asyncio.sleep(2)
-                            await messagesent.delete()
+                        messagesent = await _message.channel.send(embed=automodembed)
+                        await asyncio.sleep(2)
+                        await messagesent.delete()
                         return
                     if not word.startswith("http:") and not word.startswith("https:"):
                         wordone = "http://" + word
@@ -11628,17 +7570,16 @@ async def on_message_edit(before, _message):
                         if validurl(wordone) or validurl(wordtwo):
                             try:
                                 await _message.delete()
-                            except:
-                                automodembedOne = discord.Embed(
+                            except Exception:
+                                automodembed_one = discord.Embed(
                                     title="Automod Error",
                                     description="I don't have `manage messages` permission.",
                                 )
-                                if not _message.channel.id in disabledChannels:
-                                    messagesent = await _message.channel.send(
-                                        embed=automodembedOne
-                                    )
-                                    await asyncio.sleep(2)
-                                    await messagesent.delete()
+                                messagesent = await _message.channel.send(
+                                    embed=automodembed_one
+                                )
+                                await asyncio.sleep(2)
+                                await messagesent.delete()
                             automodembed = discord.Embed(
                                 title="Automod (Message edit)",
                                 description="Website link",
@@ -11647,28 +7588,26 @@ async def on_message_edit(before, _message):
                                 value=f"Hey {_message.author.mention} links are not allowed here.",
                                 name="** **",
                             )
-                            if not _message.channel.id in disabledChannels:
-                                messagesent = await _message.channel.send(
-                                    embed=automodembed
-                                )
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
+                            messagesent = await _message.channel.send(
+                                embed=automodembed
+                            )
+                            await asyncio.sleep(2)
+                            await messagesent.delete()
                             return
                     else:
                         if validurl(word):
                             try:
                                 await _message.delete()
-                            except:
-                                automodembedOne = discord.Embed(
+                            except Exception:
+                                automodembed_one = discord.Embed(
                                     title="Automod Error",
                                     description="I don't have `manage messages` permission.",
                                 )
-                                if not _message.channel.id in disabledChannels:
-                                    messagesent = await _message.channel.send(
-                                        embed=automodembedOne
-                                    )
-                                    await asyncio.sleep(2)
-                                    await messagesent.delete()
+                                messagesent = await _message.channel.send(
+                                    embed=automodembed_one
+                                )
+                                await asyncio.sleep(2)
+                                await messagesent.delete()
                             automodembed = discord.Embed(
                                 title="Automod (Message edit)",
                                 description="Website link",
@@ -11677,17 +7616,17 @@ async def on_message_edit(before, _message):
                                 value=f"Hey {_message.author.mention} links are not allowed here.",
                                 name="** **",
                             )
-                            if not _message.channel.id in disabledChannels:
-                                messagesent = await _message.channel.send(
-                                    embed=automodembed
-                                )
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
+                            messagesent = await _message.channel.send(
+                                embed=automodembed
+                            )
+                            await asyncio.sleep(2)
+                            await messagesent.delete()
                             return
         if _message.guild:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 profanelist = await con.fetchrow(
-                    f"SELECT * FROM profanechannels WHERE channelid = {_message.channel.id}"
+                    "SELECT * FROM profanechannels WHERE channelid = $1",
+                    _message.channel.id,
                 )
             if (
                 profanelist is not None
@@ -11695,82 +7634,78 @@ async def on_message_edit(before, _message):
                 and not checkstaff(_message.author)
                 and not ismuted(_message, _message.author)
             ):
-                if checkProfane(origmessage):
-                    if not _message.channel.id in disabledChannels:
-                        try:
-                            await _message.delete()
-                        except:
-                            automodembedOne = discord.Embed(
-                                title="Automod Error",
-                                description="I don't have `manage messages` permission.",
-                            )
-                            if not _message.channel.id in disabledChannels:
-                                messagesent = await _message.channel.send(
-                                    embed=automodembedOne
-                                )
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
-                        automodembed = discord.Embed(
-                            title="Automod", description="Profane message edit"
+                if await check_profane(origmessage):
+                    try:
+                        await _message.delete()
+                    except Exception:
+                        automodembed_one = discord.Embed(
+                            title="Automod Error",
+                            description="I don't have `manage messages` permission.",
                         )
-                        automodembed.add_field(
-                            value=f"Hey {_message.author.mention} don't send offensive messages.",
-                            name="** **",
+                        messagesent = await _message.channel.send(
+                            embed=automodembed_one
                         )
-                        if not _message.channel.id in disabledChannels:
-                            messagesent = await _message.channel.send(
-                                embed=automodembed
-                            )
-                            await asyncio.sleep(2)
-                            await messagesent.delete()
-                elif checkCaps(origmessage):
-                    if not _message.channel.id in disabledChannels:
-                        try:
-                            await _message.delete()
-                        except:
-                            automodembedOne = discord.Embed(
-                                title="Automod Error",
-                                description="I don't have `manage messages` permission.",
-                            )
-                            if not _message.channel.id in disabledChannels:
-                                messagesent = await _message.channel.send(
-                                    embed=automodembedOne
-                                )
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
-                        automodembed = discord.Embed(
-                            title="Automod", description="Caps message edit"
+                        await asyncio.sleep(2)
+                        await messagesent.delete()
+                    automodembed = discord.Embed(
+                        title="Automod", description="Profane message edit"
+                    )
+                    automodembed.add_field(
+                        value=f"Hey {_message.author.mention} don't send offensive messages.",
+                        name="** **",
+                    )
+                    messagesent = await _message.channel.send(embed=automodembed)
+                    await asyncio.sleep(2)
+                    await messagesent.delete()
+                elif check_caps(origmessage):
+                    try:
+                        await _message.delete()
+                    except Exception:
+                        automodembed_one = discord.Embed(
+                            title="Automod Error",
+                            description="I don't have `manage messages` permission.",
                         )
-                        automodembed.add_field(
-                            value=f"Hey {_message.author.mention} don't send full caps messages.",
-                            name="** **",
+                        messagesent = await _message.channel.send(
+                            embed=automodembed_one
                         )
-                        if not _message.channel.id in disabledChannels:
-                            messagesent = await _message.channel.send(
-                                embed=automodembed
-                            )
-                            await asyncio.sleep(2)
-                            await messagesent.delete()
+                        await asyncio.sleep(2)
+                        await messagesent.delete()
+                    automodembed = discord.Embed(
+                        title="Automod", description="Caps message edit"
+                    )
+                    automodembed.add_field(
+                        value=f"Hey {_message.author.mention} don't send full caps messages.",
+                        name="** **",
+                    )
+                    messagesent = await _message.channel.send(embed=automodembed)
+                    await asyncio.sleep(2)
+                    await messagesent.delete()
     except Exception as error:
-        logging.log(logging.ERROR, f" on_message_edit: {get_traceback(error)}")
+        logging.log(logging.ERROR, f" on_message_edit: {format_exception(error)}")
 
 
 @client.event
 async def on_command(ctx):
-    requests = None
-    async with pool.acquire() as con:
-        requests = await con.fetch("SELECT * FROM debugCommand")
-    if requests:
-        logging.log(logging.DEBUG, 
-            f"{ctx.author}({ctx.author.id}) attempted {ctx.command} in {ctx.guild}({ctx.guild.id}) in {ctx.channel}({ctx.channel.id})."
-        )
+    if not LOGGER.isEnabledFor(logging.DEBUG):
+        return
+    guild_id = ctx.guild.id if ctx.guild is not None else None
+    LOGGER.debug(
+        "Command attempted author=%s author_id=%s command=%s guild_id=%s channel_id=%s",
+        ctx.author,
+        ctx.author.id,
+        ctx.command,
+        guild_id,
+        ctx.channel.id,
+    )
 
 
 async def restricttimer(timecount, guildid, memberid):
     await asyncio.sleep(timecount)
-    async with pool.acquire() as con:
-        restrict = await con.fetch(
-            f"DELETE FROM restrictedUsers WHERE memberid = {memberid} AND guildid = {guildid}"
+    async with client.database.pool.acquire() as con:
+        await con.execute(
+            "DELETE FROM restrictedUsers WHERE memberid = $1 AND guildid = $2",
+            memberid,
+            guildid,
         )
 
 
@@ -11781,7 +7716,7 @@ async def restrict(guild, channel, member):
     statement = (
         """INSERT INTO restrictedUsers (guildid,memberid,epochtime) VALUES($1,$2,$3);"""
     )
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         await con.execute(statement, guild.id, member.id, epochtime)
     embed = discord.Embed(
         title="Commands Restriction",
@@ -11789,163 +7724,46 @@ async def restrict(guild, channel, member):
     )
     try:
         await channel.send(embed=embed)
-    except:
+    except Exception:
         pass
-    asyncio.ensure_future(restricttimer(300, guild.id, member.id))
+    client.create_background_task(
+        restricttimer(300, guild.id, member.id), name="command-restriction-expiry"
+    )
 
 
 @client.event
 async def on_message(_message):
-    global maintenancemodestatus, maintenancemodereason, debugCode, yourCode, retryDebug, disabledChannels
     try:
-        if pool is None:
-            while client.start_status != BotStartStatus.COMPLETED:
-                await asyncio.sleep(0.5)
-            await on_message(_message)
+        if not client.database.connected:
             return
-        if maintenancemodestatus and not onlystaffaccess:
-            if ("<@!1061480715172200498>" in _message.content) or (
-                "<@1061480715172200498>" in _message.content
-            ):
+        if client.runtime_state.maintenance_mode:
+            if client.user in _message.mentions:
                 await _message.reply(
-                    f"The bot is currently in maintainence , {maintenancemodereason}"
+                    f"The bot is currently in maintenance: "
+                    f"{client.runtime_state.maintenance_reason}"
                 )
             if not checkstaff(_message.author):
                 return
-            logging.log(logging.DEBUG, f" {_message.author} sent {_message.content} in {_message.channel} .")
+            logging.log(
+                logging.DEBUG,
+                f" {_message.author} sent {_message.content} in {_message.channel} .",
+            )
         ctx = await client.get_context(_message)
-        if (
-            _message.channel.id == 846696676214308904
-            and not _message.author == ctx.guild.me
-            and _message.author.bot
-        ):
-            dashboardtype = "NA"
-            codeexec = False
-            if _message.author.name.startswith("git-"):
-                dashboardtype = "github"
-            elif _message.author.name.startswith("riot-"):
-                dashboardtype = "riot"
-            errorOcc = False
-            if codeexec:
-                str_obj = io.StringIO()  # Retrieves a stream of data
-                errorOcc = False
-                try:
-                    with contextlib.redirect_stdout(str_obj):
-                        code = _message.content
-                        await aexec(code, ctx)
-                        output = str_obj.getvalue()
-                except Exception as ex:
-                    errOutput = f"{ex}"
-                    errorOcc = True
-                    etype = type(ex)
-                    trace = ex.__traceback__
-                    # 'traceback' is the stdlib module, `import traceback`.
-                    lines = traceback.format_exception(etype, ex, trace)
-                    # format_exception returns a list with line breaks embedded in the lines, so let's just stitch the elements together
-                    traceback_text = "".join(lines)
-                    await _message.reply(f"Code ERROR : {traceback_text}")
-            if dashboardtype == "github":
-                reqid = str(_message.content)
-                game = discord.Game(reqid)
-                await client.change_presence(status=discord.Status.idle, activity=game)
-                messages = (
-                    client.get_channel(CHANNEL_GIT_LOGGING_ID)
-                    .history(limit=1)
-                    .flatten()
-                )
-                bottommessage = messages[0]
-                embed = bottommessage.embeds[0]
-                if reqid.split()[1] in embed.description:
-                    try:
-                        await bottommessage.add_reaction("✔️")
-                    except:
-                        pass
-            if dashboardtype == "riot":
-                reqid = str(_message.author.name)
-                reqid = int(reqid.removeprefix("riot-"))
-                reqjson = str(_message.content)
-                reqjson = reqjson.replace("'", '"')
-                reqjson = json.loads(reqjson)
-                access_token = reqjson["access_token"]
-                authheader = {"Authorization": f"Bearer  {access_token}"}
-                session = client.session
-                async with session.get(
-                    "https://asia.api.riotgames.com/riot/account/v1/accounts/me",
-                    headers=authheader,
-                ) as resp:
-                    if resp.status == 200:
-                        jsonGot = await resp.json()
-                        accountpuuid = jsonGot["puuid"]
-                        accountname = jsonGot["gameName"]
-                        accounttag = jsonGot["tagLine"]
-                        statement = (
-                            """SELECT * FROM riotaccount WHERE discorduserid = $1;"""
-                        )
-                        async with pool.acquire() as con:
-                            riotaccount = await con.fetchrow(statement, reqid)
-                        if riotaccount is not None:
-                            statement = """UPDATE riotaccount SET accountpuuid = $1, accountname = $2, accounttag = $3 WHERE discorduserid = $4;"""
-                            async with pool.acquire() as con:
-                                await con.execute(
-                                    statement,
-                                    accountpuuid,
-                                    accountname,
-                                    accounttag,
-                                    reqid,
-                                )
-                        else:
-                            statement = """INSERT INTO riotaccount (discorduserid,accountpuuid,accountname,accounttag) VALUES($1,$2,$3,$4);"""
-                            async with pool.acquire() as con:
-                                await con.execute(
-                                    statement,
-                                    reqid,
-                                    accountpuuid,
-                                    accountname,
-                                    accounttag,
-                                )
-
-                        await _message.reply(
-                            f"Account {accountname} with tag {accounttag} and puuid {accountpuuid} has been added to the database."
-                        )
-                        await _message.add_reaction("✔️")
         if _message.author == client.user:
             return
-        async with pool.acquire() as con:
+        async with client.database.pool.acquire() as con:
             restrictlist = await con.fetchrow(
-                f"SELECT * FROM restrictedUsers WHERE memberid = {ctx.author.id}"
+                "SELECT * FROM restrictedUsers WHERE memberid = $1", ctx.author.id
             )
         if restrictlist is not None and ctx.valid:
             return
-        if (
-            ctx.author.id == 270904126974590976
-            and _message.type == discord.MessageType.application_command
-            and _message.interaction.name == "trivia"
-        ):
-            embed = _message.embeds[0]
-            jsonGot = embed.to_dict()
-            title = _message.interaction.user
-            question = jsonGot["description"].split("\n")[0]
-            labels = ""
-            for cm in _message.components:
-                for btn in cm.children:
-                    labels = labels + "," + str(btn.label)
-            labels = labels.removeprefix(",")
-            question = question + " among " + labels
-            question = question.replace("*", "")
-            question = question.replace(" ", "%2b")
-            googleurl = f"https://www.google.com/search?q={question}"
-            embed = discord.Embed(
-                title="Google result",
-                description=f"Scraping results for {title}",
-            )
-            scrn = await take_quick_screenshot(ctx, url=googleurl)
-            await ctx.send(file=scrn, embed=embed)
 
         if ctx.valid:
-            logging.log(logging.DEBUG, 
-                f"Command {ctx.command} received from {ctx.author}({ctx.author.id}) in {ctx.guild}"
+            logging.log(
+                logging.DEBUG,
+                f"Command {ctx.command} received from {ctx.author}({ctx.author.id}) in {ctx.guild}",
             )
-            bucket = bot.cmdcooldownvar.get_bucket(_message)
+            bucket = client.rate_limits.command_spam.get_bucket(_message)
             retry_after = bucket.update_rate_limit()
             if retry_after:
                 await restrict(ctx.guild, ctx.channel, ctx.author)
@@ -11955,96 +7773,112 @@ async def on_message(_message):
         if _message.guild:
             if ctx.valid:
                 currcommand = ctx.command.name
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     commandlist = await con.fetchrow(
-                        f"SELECT * FROM commandguildstatus WHERE guildid = {_message.guild.id} and commandname = '{currcommand}'"
+                        "SELECT * FROM commandguildstatus WHERE guildid = $1 and commandname = $2",
+                        _message.guild.id,
+                        currcommand,
                     )
                 if commandlist is not None:
                     if not _message.channel.permissions_for(
                         _message.author
                     ).administrator and not checkstaff(_message.author):
-                        await send_generic_error_embed(ctx, error_data="You cannot use that command in this server as it is disabled!")
+                        await send_generic_error_embed(
+                            ctx,
+                            error_data="You cannot use that command in this server as it is disabled!",
+                        )
                         return
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 verifylist = await con.fetchrow(
-                    f"SELECT * FROM verifychannels WHERE channelid = {_message.channel.id}"
+                    "SELECT * FROM verifychannels WHERE channelid = $1",
+                    _message.channel.id,
                 )
             if verifylist is not None:
                 if not ctx.valid:
                     try:
                         await ctx.message.delete()
-                    except:
+                    except Exception:
                         pass
                     return
                 elif not ctx.command.name == "verify":
                     try:
                         await ctx.message.delete()
-                    except:
+                    except Exception:
                         pass
                     return
                 await client.process_commands(_message)
                 return
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 warninglist = await con.fetchrow(
-                    f"SELECT * FROM levelsettings WHERE channelid = {_message.channel.id}"
+                    "SELECT * FROM levelsettings WHERE channelid = $1",
+                    _message.channel.id,
                 )
             if warninglist is None:
                 statement = (
                     """INSERT INTO levelsettings (channelid,setting) VALUES($1,$2);"""
                 )
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(statement, _message.channel.id, False)
 
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     warninglist = await con.fetchrow(
-                        f"SELECT * FROM levelsettings WHERE channelid = {_message.channel.id}"
+                        "SELECT * FROM levelsettings WHERE channelid = $1",
+                        _message.channel.id,
                     )
                 # await ctx.send(
                 #    f"Alert: leveling was automatically disabled in this channel, do {_message.guild.me.mention}leveltoggle to turn on leveling!",
                 #    delete_after=5,
                 # )
             if warninglist["setting"]:
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     levelconfiglist = await con.fetchrow(
-                        f"SELECT * FROM levelconfig WHERE channelid = {_message.channel.id}"
+                        "SELECT * FROM levelconfig WHERE channelid = $1",
+                        _message.channel.id,
                     )
                 if levelconfiglist is None:
                     statement = """INSERT INTO levelconfig (channelid,messagecount) VALUES($1,$2);"""
-                    async with pool.acquire() as con:
+                    async with client.database.pool.acquire() as con:
                         await con.execute(statement, _message.channel.id, 25)
-                    async with pool.acquire() as con:
+                    async with client.database.pool.acquire() as con:
                         levelconfiglist = await con.fetchrow(
-                            f"SELECT * FROM levelconfig WHERE channelid = {_message.channel.id}"
+                            "SELECT * FROM levelconfig WHERE channelid = $1",
+                            _message.channel.id,
                         )
                 levelmsgcount = levelconfiglist["messagecount"]
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     levellist = await con.fetchrow(
-                        f"SELECT * FROM leveling WHERE guildid = {_message.guild.id} AND memberid = {_message.author.id}"
+                        "SELECT * FROM leveling WHERE guildid = $1 AND memberid = $2",
+                        _message.guild.id,
+                        _message.author.id,
                     )
                 if levellist is not None:
-                    messageNew = levellist["messagecount"] + 1
-                    currentLevel = messageNew // levelmsgcount
-                    if messageNew % levelmsgcount == 0:
+                    message_new = levellist["messagecount"] + 1
+                    current_level = message_new // levelmsgcount
+                    if message_new % levelmsgcount == 0:
                         try:
                             await _message.channel.send(
-                                f" Hey {_message.author} congrats on reaching level {currentLevel} ."
+                                f" Hey {_message.author} congrats on reaching level {current_level} ."
                             )
-                        except:
+                        except Exception:
                             pass
-                    async with pool.acquire() as con:
+                    async with client.database.pool.acquire() as con:
                         await con.execute(
-                            f"UPDATE leveling VALUES SET messagecount = {messageNew} WHERE guildid = {_message.guild.id} AND memberid = {_message.author.id}"
+                            "UPDATE leveling SET messagecount = $1 WHERE guildid = $2 AND memberid = $3",
+                            message_new,
+                            _message.guild.id,
+                            _message.author.id,
                         )
                 else:
                     statement = """INSERT INTO leveling (guildid,memberid,messagecount) VALUES($1,$2,$3);"""
-                    async with pool.acquire() as con:
+                    async with client.database.pool.acquire() as con:
                         await con.execute(
                             statement, _message.guild.id, _message.author.id, 1
                         )
         if _message.guild:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 linklist = await con.fetchrow(
-                    f"SELECT * FROM linkchannels WHERE channelid = {_message.channel.id}"
+                    "SELECT * FROM linkchannels WHERE channelid = $1",
+                    _message.channel.id,
                 )
             if (
                 linklist is not None
@@ -12056,7 +7890,7 @@ async def on_message(_message):
                 listofwords = convertwords(listofsentence)
                 for word in listofwords:
                     serverinvitecheck = re.compile(
-                        "(?:https?://)?discord(?:app)?\.(?:com/invite|gg)/[a-zA-Z0-9]+/?"
+                        r"(?:https?://)?discord(?:app)?\.(?:com/invite|gg)/[a-zA-Z0-9]+/?"
                     )
                     try:
                         tenorgifcheck = re.compile(
@@ -12064,17 +7898,17 @@ async def on_message(_message):
                         )
                         if tenorgifcheck.match(word):
                             continue
-                    except:
+                    except Exception:
                         pass
                     if serverinvitecheck.match(word):
                         try:
                             await _message.delete()
-                        except:
-                            automodembedOne = discord.Embed(
+                        except Exception:
+                            automodembed_one = discord.Embed(
                                 title="Automod Error",
                                 description="I don't have `manage messages` permission.",
                             )
-                            messagesent = await ctx.send(embed=automodembedOne)
+                            messagesent = await ctx.send(embed=automodembed_one)
                             await asyncio.sleep(2)
                             await messagesent.delete()
                         # TODO replace mute -> timeout
@@ -12087,11 +7921,13 @@ async def on_message(_message):
                             await cmd(
                                 await client.get_context(_message),
                                 _message.author,
-                                timenum="5m",
+                                duration="5m",
                                 reason=f"{guildmsg}'s server invite posted",
                             )
                         except Exception as ex:
-                            logging.log(logging.ERROR, f"Exception in mute automod {ex}")
+                            logging.log(
+                                logging.ERROR, f"Exception in mute automod {ex}"
+                            )
                             automodembed = discord.Embed(
                                 title="Automod Error", description="Server invite"
                             )
@@ -12099,10 +7935,9 @@ async def on_message(_message):
                                 value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
                                 name="** **",
                             )
-                            if not _message.channel.id in disabledChannels:
-                                messagesent = await ctx.send(embed=automodembed)
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
+                            messagesent = await ctx.send(embed=automodembed)
+                            await asyncio.sleep(2)
+                            await messagesent.delete()
                         return
                     if not word.startswith("http:") and not word.startswith("https:"):
                         wordone = "http://" + word
@@ -12110,12 +7945,12 @@ async def on_message(_message):
                         if validurl(wordone) or validurl(wordtwo):
                             try:
                                 await _message.delete()
-                            except:
-                                automodembedOne = discord.Embed(
+                            except Exception:
+                                automodembed_one = discord.Embed(
                                     title="Automod Error",
                                     description="I don't have `manage messages` permission.",
                                 )
-                                messagesent = await ctx.send(embed=automodembedOne)
+                                messagesent = await ctx.send(embed=automodembed_one)
                                 await asyncio.sleep(2)
                                 await messagesent.delete()
                             # TODO replace mute -> timeout
@@ -12124,11 +7959,13 @@ async def on_message(_message):
                                 await cmd(
                                     await client.get_context(_message),
                                     _message.author,
-                                    timenum="5m",
+                                    duration="5m",
                                     reason=f"links posted in {_message.channel.mention}",
                                 )
                             except Exception as ex:
-                                logging.log(logging.ERROR, f"Exception in mute automod {ex}")
+                                logging.log(
+                                    logging.ERROR, f"Exception in mute automod {ex}"
+                                )
                                 automodembed = discord.Embed(
                                     title="Automod Error", description="Website link"
                                 )
@@ -12136,21 +7973,20 @@ async def on_message(_message):
                                     value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
                                     name="** **",
                                 )
-                                if not _message.channel.id in disabledChannels:
-                                    messagesent = await ctx.send(embed=automodembed)
-                                    await asyncio.sleep(2)
-                                    await messagesent.delete()
+                                messagesent = await ctx.send(embed=automodembed)
+                                await asyncio.sleep(2)
+                                await messagesent.delete()
                             return
                     else:
                         if validurl(word):
                             try:
                                 await _message.delete()
-                            except:
-                                automodembedOne = discord.Embed(
+                            except Exception:
+                                automodembed_one = discord.Embed(
                                     title="Automod Error",
                                     description="I don't have `manage messages` permission.",
                                 )
-                                messagesent = await ctx.send(embed=automodembedOne)
+                                messagesent = await ctx.send(embed=automodembed_one)
                                 await asyncio.sleep(2)
                                 await messagesent.delete()
                             # TODO replace mute -> timeout
@@ -12159,11 +7995,13 @@ async def on_message(_message):
                                 await cmd(
                                     await client.get_context(_message),
                                     _message.author,
-                                    timenum="5m",
+                                    duration="5m",
                                     reason=f"links posted in {_message.channel.mention}",
                                 )
                             except Exception as ex:
-                                logging.log(logging.ERROR, f"Exception in mute automod {ex}")
+                                logging.log(
+                                    logging.ERROR, f"Exception in mute automod {ex}"
+                                )
                                 automodembed = discord.Embed(
                                     title="Automod Error", description="Website link"
                                 )
@@ -12171,52 +8009,32 @@ async def on_message(_message):
                                     value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
                                     name="** **",
                                 )
-                                if not _message.channel.id in disabledChannels:
-                                    messagesent = await ctx.send(embed=automodembed)
-                                    await asyncio.sleep(2)
-                                    await messagesent.delete()
+                                messagesent = await ctx.send(embed=automodembed)
+                                await asyncio.sleep(2)
+                                await messagesent.delete()
                             return
-        isAfk = True
-        try:
-            isAfk = afkrecent[_message.author.id]
-        except:
-            isAfk = False
-        if isAfk:
-            del afkrecent[_message.author.id]
-        for mentioned in _message.mentions:
-            isAfk = True
-            try:
-                isAfk = afkrecent[mentioned.id]
-            except:
-                isAfk = False
-            if isAfk:
-                await _message.reply(
-                    f"{mentioned.name}#{mentioned.discriminator} has gone afk due to {afkrecent[mentioned.id]}."
-                )
-
-        if (
-            ("<@!1061480715172200498>" in _message.content)
-            or ("<@1061480715172200498>" in _message.content)
-        ) and not (ctx.valid):
+        if client.user in _message.mentions and not ctx.valid:
             if _message.guild:
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     prefixeslist = await con.fetchrow(
-                        f"SELECT * FROM prefixes WHERE guildid = {_message.guild.id}"
+                        "SELECT * FROM prefixes WHERE guildid = $1", _message.guild.id
                     )
                 if prefixeslist is None:
                     statement = (
                         """INSERT INTO prefixes (guildid,prefix) VALUES($1,$2);"""
                     )
-                    async with pool.acquire() as con:
-                        await con.execute(statement, _message.guild.id, "a!")
-                    chars = "a!"
+                    async with client.database.pool.acquire() as con:
+                        await con.execute(
+                            statement, _message.guild.id, SETTINGS.default_prefix
+                        )
+                    chars = SETTINGS.default_prefix
                 else:
                     chars = prefixeslist["prefix"]
                 try:
                     await _message.reply(
                         f"My {_message.guild} prefix is `{chars}`, do setprefix to change prefixes."
                     )
-                except:
+                except Exception:
                     await _message.author.send(
                         "I could not send it in the channel, I don't have send messages permission."
                     )
@@ -12225,58 +8043,13 @@ async def on_message(_message):
                     )
             else:
                 await _message.reply("My default dm prefix is `a!`.")
-        if debugCode:
-            str_obj = io.StringIO()  # Retrieves a stream of data
-            try:
-                with contextlib.redirect_stdout(str_obj):
-                    await aexec(yourCode, ctx)
-                    output = str_obj.getvalue()
-                    length = len(str(output))
-                    if length >= 1000:
-                        listofembed = wrap(str(output), 1000)
-                    else:
-                        listofembed = [str(output)]
-                    embedtwo = discord.Embed(
-                        title="",
-                        description=(f"{client.user.name} executed your command."),
-                        color=Color.green(),
-                    )
-                    try:
-                        if checkstaff(ctx.author):
-                            await ctx.message.add_reaction("✔️")
-                    except:
-                        pass
-                    for i in listofembed:
-                        # i = i.replace(".", ".\n\n")
-                        embedtwo.add_field(
-                            name="Output :", value=i + "** **", inline=False
-                        )
-                        if checkstaff(ctx.author):
-                            await ctx.send(embed=embedtwo)
-                        embedtwo = discord.Embed(
-                            title="", description=("** **"), color=Color.green()
-                        )
-            except Exception as e:
-                embedone = discord.Embed(
-                    title=(f"```{e.__class__.__name__}: {e}```"),
-                    description=(
-                        f"{client.user.name} could not execute an invalid command ."
-                    ),
-                    color=Color.red(),
-                )
-                try:
-                    if checkstaff(ctx.author):
-                        await ctx.message.add_reaction("❌")
-                except:
-                    pass
-                if checkstaff(ctx.author):
-                    await ctx.send(embed=embedone)
-        bucket = bot.cooldownvar.get_bucket(_message)
+        bucket = client.rate_limits.message_spam.get_bucket(_message)
         retry_after = bucket.update_rate_limit()
         if retry_after and _message.guild:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 spamlist = await con.fetchrow(
-                    f"SELECT * FROM spamchannels WHERE channelid = {_message.channel.id}"
+                    "SELECT * FROM spamchannels WHERE channelid = $1",
+                    _message.channel.id,
                 )
             if (
                 spamlist is not None
@@ -12286,22 +8059,21 @@ async def on_message(_message):
             ):
                 try:
                     await _message.delete()
-                except:
-                    automodembedOne = discord.Embed(
+                except Exception:
+                    automodembed_one = discord.Embed(
                         title="Automod Error",
                         description="I don't have `manage messages` permission.",
                     )
-                    if not _message.channel.id in disabledChannels:
-                        messagesent = await ctx.send(embed=automodembedOne)
-                        await asyncio.sleep(2)
-                        await messagesent.delete()
+                    messagesent = await ctx.send(embed=automodembed_one)
+                    await asyncio.sleep(2)
+                    await messagesent.delete()
                 # TODO replace mute -> timeout
                 cmd = client.get_command("mute")
                 try:
                     await cmd(
                         await client.get_context(_message),
                         _message.author,
-                        timenum="5m",
+                        duration="5m",
                         reason=f"spamming in {_message.channel.mention}",
                     )
                 except Exception as ex:
@@ -12313,14 +8085,14 @@ async def on_message(_message):
                         value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
                         name="** **",
                     )
-                    if not _message.channel.id in disabledChannels:
-                        messagesent = await ctx.send(embed=automodembed)
-                        await asyncio.sleep(2)
-                        await messagesent.delete()
+                    messagesent = await ctx.send(embed=automodembed)
+                    await asyncio.sleep(2)
+                    await messagesent.delete()
         if _message.guild:
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 profanelist = await con.fetchrow(
-                    f"SELECT * FROM profanechannels WHERE channelid = {_message.channel.id}"
+                    "SELECT * FROM profanechannels WHERE channelid = $1",
+                    _message.channel.id,
                 )
             if (
                 profanelist is not None
@@ -12328,13 +8100,13 @@ async def on_message(_message):
                 and not checkstaff(ctx.author)
                 and not ismuted(ctx, ctx.author)
             ):
-                if checkProfane(origmessage):
-                    warnbucket = bot.cooldowntwo.get_bucket(_message)
+                if await check_profane(origmessage):
+                    warnbucket = client.rate_limits.warning_repeat.get_bucket(_message)
                     warnretry_after = warnbucket.update_rate_limit()
                     if not warnretry_after:
                         try:
                             await _message.delete()
-                        except:
+                        except Exception:
                             pass
                         await ctx.send(
                             f"{_message.author.mention} You are being warned as a rare offender, further continuation will result in a mute."
@@ -12342,12 +8114,12 @@ async def on_message(_message):
                         return
                     try:
                         await _message.delete()
-                    except:
-                        automodembedOne = discord.Embed(
+                    except Exception:
+                        automodembed_one = discord.Embed(
                             title="Automod Error",
                             description="I don't have `manage messages` permission.",
                         )
-                        messagesent = await ctx.send(embed=automodembedOne)
+                        messagesent = await ctx.send(embed=automodembed_one)
                         await asyncio.sleep(2)
                         await messagesent.delete()
                     # TODO replace mute -> timeout
@@ -12356,7 +8128,7 @@ async def on_message(_message):
                         await cmd(
                             await client.get_context(_message),
                             _message.author,
-                            timenum="5m",
+                            duration="5m",
                             reason=f"profane messages sent in {_message.channel.mention}",
                         )
                     except Exception as ex:
@@ -12368,18 +8140,17 @@ async def on_message(_message):
                             value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
                             name="** **",
                         )
-                        if not _message.channel.id in disabledChannels:
-                            messagesent = await ctx.send(embed=automodembed)
-                            await asyncio.sleep(2)
-                            await messagesent.delete()
+                        messagesent = await ctx.send(embed=automodembed)
+                        await asyncio.sleep(2)
+                        await messagesent.delete()
                     return
-                elif checkCaps(origmessage) and len(origmessage) >= 4:
-                    warnbucket = bot.cooldowntwo.get_bucket(_message)
+                elif check_caps(origmessage) and len(origmessage) >= 4:
+                    warnbucket = client.rate_limits.warning_repeat.get_bucket(_message)
                     warnretry_after = warnbucket.update_rate_limit()
                     if not warnretry_after:
                         try:
                             await _message.delete()
-                        except:
+                        except Exception:
                             pass
                         await ctx.send(
                             f"{_message.author.mention} You are being warned as a rare offender , further continuation will result in a mute."
@@ -12387,12 +8158,12 @@ async def on_message(_message):
                         return
                     try:
                         await _message.delete()
-                    except:
-                        automodembedOne = discord.Embed(
+                    except Exception:
+                        automodembed_one = discord.Embed(
                             title="Automod Error",
                             description="I don't have `manage messages` permission.",
                         )
-                        messagesent = await ctx.send(embed=automodembedOne)
+                        messagesent = await ctx.send(embed=automodembed_one)
                         await asyncio.sleep(2)
                         await messagesent.delete()
                     # TODO replace mute -> timeout
@@ -12401,7 +8172,7 @@ async def on_message(_message):
                         await cmd(
                             await client.get_context(_message),
                             _message.author,
-                            timenum="5m",
+                            duration="5m",
                             reason=f"full caps messages sent in {_message.channel.mention}",
                         )
                     except Exception as ex:
@@ -12413,14 +8184,13 @@ async def on_message(_message):
                             value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
                             name="** **",
                         )
-                        if not _message.channel.id in disabledChannels:
-                            messagesent = await ctx.send(embed=automodembed)
-                            await asyncio.sleep(2)
-                            await messagesent.delete()
+                        messagesent = await ctx.send(embed=automodembed)
+                        await asyncio.sleep(2)
+                        await messagesent.delete()
                     return
         await client.process_commands(_message)
     except Exception as error:
-        logging.log(logging.ERROR, f" on_message: {get_traceback(error)}")
+        logging.log(logging.ERROR, f" on_message: {format_exception(error)}")
 
 
 @client.event
@@ -12428,13 +8198,13 @@ async def on_guild_channel_create(channel):
     logguild = channel.guild
     logchannel = None
     antiraidchannel = None
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         antiraidchannellist = await con.fetchrow(
-            f"SELECT * FROM antiraid WHERE guildid = {logguild.id}"
+            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
         )
     if logchannellist:
         channelid = logchannellist["channelid"]
@@ -12449,15 +8219,17 @@ async def on_guild_channel_create(channel):
                 mod = logguild.get_member(entry.user.id)
             try:
                 embed = discord.Embed(
-                    title=f"Channel creation",
+                    title="Channel creation",
                     description=channel.mention,
                     color=Color.green(),
                 )
                 embed.add_field(name="Category", value=channel.category)
-                embed.add_field(name=f"Moderator", value=f"{mod.mention}")
+                embed.add_field(name="Moderator", value=f"{mod.mention}")
                 await logchannel.send(embed=embed)
             except Exception as ex:
-                logging.log(logging.ERROR, f" on_guild_channel_create: {get_traceback(ex)}")
+                logging.log(
+                    logging.ERROR, f" on_guild_channel_create: {format_exception(ex)}"
+                )
     if antiraidchannellist:
         channelid = antiraidchannellist["channelid"]
         antiraidchannel = logguild.get_channel(channelid)
@@ -12473,12 +8245,12 @@ async def on_guild_channel_create(channel):
             _message = constructmsg(logguild, mod)
             ctx = constructctx(logguild, mod, antiraidchannel)
             ctx.bot = client
-            bucket = bot.channel_createcooldown.get_bucket(_message)
+            bucket = client.rate_limits.channel_create.get_bucket(_message)
             retry_after = bucket.update_rate_limit()
             if retry_after:
                 # TODO replace mute -> timeout
                 statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(statement, logguild.id)
                 await removeguildcaution(logguild.id)
                 return
@@ -12489,13 +8261,13 @@ async def on_guild_channel_delete(channel):
     logguild = channel.guild
     logchannel = None
     antiraidchannel = None
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         antiraidchannellist = await con.fetchrow(
-            f"SELECT * FROM antiraid WHERE guildid = {logguild.id}"
+            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
         )
     if logchannellist:
         channelid = logchannellist["channelid"]
@@ -12510,15 +8282,17 @@ async def on_guild_channel_delete(channel):
                 mod = logguild.get_member(entry.user.id)
             try:
                 embed = discord.Embed(
-                    title=f"Channel deletion",
+                    title="Channel deletion",
                     description=channel.mention,
                     color=Color.green(),
                 )
                 embed.add_field(name="Category", value=channel.category)
-                embed.add_field(name=f"Moderator", value=f"{mod.mention}")
+                embed.add_field(name="Moderator", value=f"{mod.mention}")
                 await logchannel.send(embed=embed)
             except Exception as ex:
-                logging.log(logging.ERROR, f" on_guild_channel_delete: {get_traceback(ex)}")
+                logging.log(
+                    logging.ERROR, f" on_guild_channel_delete: {format_exception(ex)}"
+                )
     if antiraidchannellist:
         channelid = antiraidchannellist["channelid"]
         antiraidchannel = logguild.get_channel(channelid)
@@ -12534,12 +8308,12 @@ async def on_guild_channel_delete(channel):
             _message = constructmsg(logguild, mod)
             ctx = constructctx(logguild, mod, antiraidchannel)
             ctx.bot = client
-            bucket = bot.channel_deletecooldown.get_bucket(_message)
+            bucket = client.rate_limits.channel_delete.get_bucket(_message)
             retry_after = bucket.update_rate_limit()
             if retry_after:
                 # TODO replace mute -> timeout
                 statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-                async with pool.acquire() as con:
+                async with client.database.pool.acquire() as con:
                     await con.execute(statement, logguild.id)
                 await removeguildcaution(logguild.id)
                 return
@@ -12547,20 +8321,16 @@ async def on_guild_channel_delete(channel):
 
 @client.event
 async def on_guild_channel_update(before, after):
-    global beforechannelupdate, afterchannelupdate
     logguild = before.guild
-    if logguild.id == 811864132470571038:
-        beforechannelupdate.append(before)
-        afterchannelupdate.append(after)
     logchannel = None
     antiraidchannel = None
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         antiraidchannellist = await con.fetchrow(
-            f"SELECT * FROM antiraid WHERE guildid = {logguild.id}"
+            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
         )
     if logchannellist:
         channelid = logchannellist["channelid"]
@@ -12582,7 +8352,7 @@ async def on_guild_channel_update(before, after):
             attrafter = getattr(after, a)
             if not hasattr(attrbefore, a):
                 continue
-        except:
+        except Exception:
             continue
         if attrbefore != attrafter:
             changedetected = True
@@ -12610,12 +8380,12 @@ async def on_guild_channel_update(before, after):
     currententry = ut[0]
     modid = currententry.user.id
     mod = None
-    if not modid == 1061480715172200498:
+    if modid != client.user.id:
         mod = logguild.get_member(modid)
         _message = constructmsg(logguild, mod)
         ctx = constructctx(logguild, mod, antiraidchannel)
         ctx.bot = client
-        bucket = bot.channel_updatecooldown.get_bucket(_message)
+        bucket = client.rate_limits.channel_update.get_bucket(_message)
         retry_after = bucket.update_rate_limit()
         if retry_after:
             # TODO replace mute -> timeout
@@ -12624,17 +8394,16 @@ async def on_guild_channel_update(before, after):
                 await cmd(
                     ctx,
                     str(mod),
-                    reason=(f"""AUTO-MOD for exceeding channel update limit."""),
+                    reason=("""AUTO-MOD for exceeding channel update limit."""),
                 )
             except Exception as ex:
                 logging.log(logging.ERROR, f"on_guild_channel_update error {ex}")
             statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, logguild.id)
             await removeguildcaution(logguild.id)
             return
     try:
-
         changes = ""
         if before.category != after.category:
             changes = (
@@ -12646,339 +8415,340 @@ async def on_guild_channel_update(before, after):
                 changes + f"The name changed from {before.name} to {after.name}.\n"
             )
         if before.overwrites != after.overwrites:
-            beforePerms = before.overwrites
-            afterPerms = after.overwrites
+            before_perms = before.overwrites
+            after_perms = after.overwrites
             for role in logguild.roles:
                 try:
-                    roleBef = beforePerms[role]
-                    roleAft = afterPerms[role]
-                except:
+                    role_bef = before_perms[role]
+                    role_aft = after_perms[role]
+                except Exception:
                     continue
-                permOne = []
-                permOne.append((roleBef.add_reactions))
+                perm_one = []
+                perm_one.append(role_bef.add_reactions)
                 # if (myPerms.administrator ):
                 # _message=("Does user have administrator privilleges **:**")
-                permOne.append((roleBef.administrator))
+                perm_one.append(role_bef.administrator)
                 # if (myPerms.attach_files ):
                 # _message=("Can user send file attachments in messages **:**")
-                permOne.append((roleBef.attach_files))
+                perm_one.append(role_bef.attach_files)
                 # if (myPerms.ban_members ):
                 # _message=("Can user ban other members from the guild **:**")
-                permOne.append((roleBef.ban_members))
+                perm_one.append(role_bef.ban_members)
                 # if (myPerms.change_nickname ):
                 # _message=("Can user change their nicknames in the guild **:**")
-                permOne.append((roleBef.change_nickname))
+                perm_one.append(role_bef.change_nickname)
                 # if (myPerms.connect ):
                 # _message=("Can user connect to any voice channels **:**")
-                permOne.append((roleBef.connect))
+                perm_one.append(role_bef.connect)
                 # if (myPerms.create_instant_invite ):
                 # _message=("Can user invite other members by generating an invite link **:**")
-                permOne.append((roleBef.create_instant_invite))
+                perm_one.append(role_bef.create_instant_invite)
                 # if (myPerms.deafen_members ):
                 # _message=("Can user server deafen other members in a voice channel **:**")
-                permOne.append((roleBef.deafen_members))
+                perm_one.append(role_bef.deafen_members)
                 # if (myPerms.embed_links ):
                 # _message=("Can user send embedded content in a channel **:**")
-                permOne.append((roleBef.embed_links))
+                perm_one.append(role_bef.embed_links)
                 # if (myPerms.external_emojis ):
                 # _message=("Can user send emojis created in other guilds **:**")
-                permOne.append((roleBef.external_emojis))
+                perm_one.append(role_bef.external_emojis)
                 # if (myPerms.kick_members ):
                 # _message=("Can user kick other members from the guild **:**")
-                permOne.append((roleBef.kick_members))
+                perm_one.append(role_bef.kick_members)
                 # if (myPerms.manage_channels ):
                 # _message=("Can user edit , create or delete any channels **:**")
-                permOne.append((roleBef.manage_channels))
+                perm_one.append(role_bef.manage_channels)
                 # if (myPerms.manage_emojis ):
                 # _message=("Can user edit , create or delete any emojis **:**")
-                permOne.append((roleBef.manage_emojis))
+                perm_one.append(role_bef.manage_emojis)
                 # if (myPerms.manage_guild ):
                 # _message=("Can user edit guild settings and invite bots **:**")
-                permOne.append((roleBef.manage_guild))
+                perm_one.append(role_bef.manage_guild)
                 # if (myPerms.manage_messages ):
                 # _message=("Can user delete messages sent by other members in a channel **:**")
-                permOne.append((roleBef.manage_messages))
+                perm_one.append(role_bef.manage_messages)
                 # if (myPerms.manage_nicknames):
                 # _message=("Can user change other member's nicknames **:**")
-                permOne.append((roleBef.manage_nicknames))
+                perm_one.append(role_bef.manage_nicknames)
                 # if (myPerms.manage_permissions ):
                 # _message=("Can user edit , create or delete role's permissions below their highest role **:**")
-                permOne.append((roleBef.manage_permissions))
+                perm_one.append(role_bef.manage_permissions)
                 # if (myPerms.manage_roles ):
                 # _message=("Can user edit , create or delete roles below their highest role **:**")
-                permOne.append((roleBef.manage_roles))
+                perm_one.append(role_bef.manage_roles)
                 # if (myPerms.manage_webhooks ):
                 # _message=("Can user  edit , create or delete webhooks of a channel **:**")
-                permOne.append((roleBef.manage_webhooks))
+                perm_one.append(role_bef.manage_webhooks)
                 # if (myPerms.mention_everyone ):
                 # _message=("Can user mention everyone in a channel **:**")
-                permOne.append((roleBef.mention_everyone))
+                perm_one.append(role_bef.mention_everyone)
                 # if (myPerms.move_members ):
                 # _message=("Can user move other members to other voice channels **:**")
-                permOne.append((roleBef.move_members))
+                perm_one.append(role_bef.move_members)
                 # if (myPerms.mute_members ):
                 # _message=("Can user can server mute other members in a voice channel **:**")
-                permOne.append((roleBef.mute_members))
+                perm_one.append(role_bef.mute_members)
                 # if (myPerms.priority_speaker ):
                 # _message=("Will user be given priority when speaking in a voice channel **:**")
-                permOne.append((roleBef.priority_speaker))
+                perm_one.append(role_bef.priority_speaker)
                 # if (myPerms.read_message_history ):
                 # _message=("Can user read messages channel's previous messages **:**")
-                permOne.append((roleBef.read_message_history))
+                perm_one.append(role_bef.read_message_history)
                 # if (myPerms.read_messages ):
                 # _message=("Can user read messages from all or any channel **:**")
-                permOne.append((roleBef.read_messages))
+                perm_one.append(role_bef.read_messages)
                 # if (myPerms.request_to_speak ):
                 # _message=("Can user request to speak in a stage channel **:**")
-                permOne.append((roleBef.request_to_speak))
+                perm_one.append(role_bef.request_to_speak)
                 # if (myPerms.send_messages ):
                 # _message=("Can user can send messages from all or specific text channels **:**")
-                permOne.append((roleBef.add_reactions))
+                perm_one.append(role_bef.add_reactions)
                 # if (myPerms.send_tts_messages ):
                 # _message=("Can user can send messages TTS(which get converted to speech) from all or specific text channels **:**")
-                permOne.append((roleBef.add_reactions))
+                perm_one.append(role_bef.add_reactions)
                 # if (myPerms.speak ):
                 # _message=("Can user can unmute and speak in a voice channel **:**")
-                permOne.append((roleBef.speak))
+                perm_one.append(role_bef.speak)
                 # if (myPerms.stream ):
                 # _message=("Can user can share their computer screen in a voice channel **:**")
-                permOne.append((roleBef.stream))
+                perm_one.append(role_bef.stream)
                 # if (myPerms.use_external_emojis ):
                 # _message=("Can user send emojis created in other guilds **:**")
-                permOne.append((roleBef.use_external_emojis))
+                perm_one.append(role_bef.use_external_emojis)
                 # if (myPerms.use_slash_command ):
                 # _message=("Can user use slash commands in a channel **:**")
-                permOne.append((roleBef.use_slash_command))
+                perm_one.append(role_bef.use_slash_command)
                 # if (myPerms.use_voice_activation ):
                 # _message=("Can user use voice activation in a voice channel **:**")
-                permOne.append((roleBef.use_voice_activation))
+                perm_one.append(role_bef.use_voice_activation)
                 # if (myPerms.view_audit_log ):
                 # _message=("Can user view guild's audit log **:**")
-                permOne.append((roleBef.view_audit_log))
+                perm_one.append(role_bef.view_audit_log)
                 # if (myPerms.view_channel ):
                 # _message=("Can user view all or specific channels **:**")
-                permOne.append((roleBef.view_channel))
+                perm_one.append(role_bef.view_channel)
                 # if (myPerms.view_guild_insights ):
                 # _message=("Can user view the guild insights **:**")
-                permOne.append((roleBef.view_guild_insights))
-                permTwo = []
-                messageList = []
-                messageList.append(" Add reactions to messages **:**".capitalize())
-                permTwo.append((roleAft.add_reactions))
+                perm_one.append(role_bef.view_guild_insights)
+                perm_two = []
+                message_list = []
+                message_list.append(" Add reactions to messages **:**".capitalize())
+                perm_two.append(role_aft.add_reactions)
                 # if (myPerms.administrator ):
-                messageList.append(" Administrator privilleges **:**".capitalize())
-                permTwo.append((roleAft.administrator))
+                message_list.append(" Administrator privilleges **:**".capitalize())
+                perm_two.append(role_aft.administrator)
                 # if (myPerms.attach_files ):
-                messageList.append(
+                message_list.append(
                     " Send file attachments in messages **:**".capitalize()
                 )
-                permTwo.append((roleAft.attach_files))
+                perm_two.append(role_aft.attach_files)
                 # if (myPerms.ban_members ):
-                messageList.append(
+                message_list.append(
                     " Ban other members from the guild **:**".capitalize()
                 )
-                permTwo.append((roleAft.ban_members))
+                perm_two.append(role_aft.ban_members)
                 # if (myPerms.change_nickname ):
-                messageList.append(
+                message_list.append(
                     " Change their nicknames in the guild **:**".capitalize()
                 )
-                permTwo.append((roleAft.change_nickname))
+                perm_two.append(role_aft.change_nickname)
                 # if (myPerms.connect ):
-                messageList.append(" Connect to any voice channels **:**".capitalize())
-                permTwo.append((roleAft.connect))
+                message_list.append(" Connect to any voice channels **:**".capitalize())
+                perm_two.append(role_aft.connect)
                 # if (myPerms.create_instant_invite ):
-                messageList.append(
+                message_list.append(
                     " Invite other members by generating an invite link **:**".capitalize()
                 )
-                permTwo.append((roleAft.create_instant_invite))
+                perm_two.append(role_aft.create_instant_invite)
                 # if (myPerms.deafen_members ):
-                messageList.append(
+                message_list.append(
                     " Server deafen other members in a voice channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.deafen_members))
+                perm_two.append(role_aft.deafen_members)
                 # if (myPerms.embed_links ):
-                messageList.append(
+                message_list.append(
                     " Send embedded content in a channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.embed_links))
+                perm_two.append(role_aft.embed_links)
                 # if (myPerms.external_emojis ):
-                messageList.append(
+                message_list.append(
                     " Send emojis created in other guilds **:**".capitalize()
                 )
-                permTwo.append((roleAft.external_emojis))
+                perm_two.append(role_aft.external_emojis)
                 # if (myPerms.kick_members ):
-                messageList.append(
+                message_list.append(
                     " Kick other members from the guild **:**".capitalize()
                 )
-                permTwo.append((roleAft.kick_members))
+                perm_two.append(role_aft.kick_members)
                 # if (myPerms.manage_channels ):
-                messageList.append(
+                message_list.append(
                     " Edit , create or delete any channels **:**".capitalize()
                 )
-                permTwo.append((roleAft.manage_channels))
+                perm_two.append(role_aft.manage_channels)
                 # if (myPerms.manage_emojis ):
-                messageList.append(
+                message_list.append(
                     " Edit , create or delete any emojis **:**".capitalize()
                 )
-                permTwo.append((roleAft.manage_emojis))
+                perm_two.append(role_aft.manage_emojis)
                 # if (myPerms.manage_guild ):
-                messageList.append(
+                message_list.append(
                     " Edit guild settings and invite bots **:**".capitalize()
                 )
-                permTwo.append((roleAft.manage_guild))
+                perm_two.append(role_aft.manage_guild)
                 # if (myPerms.manage_messages ):
-                messageList.append(
+                message_list.append(
                     " Delete messages sent by other members in a channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.manage_messages))
+                perm_two.append(role_aft.manage_messages)
                 # if (myPerms.manage_nicknames):
-                messageList.append(
+                message_list.append(
                     " Change other member's nicknames **:**".capitalize()
                 )
-                permTwo.append((roleAft.manage_nicknames))
+                perm_two.append(role_aft.manage_nicknames)
                 # if (myPerms.manage_permissions ):
-                messageList.append(
+                message_list.append(
                     " Edit , create or delete role's permissions below their highest role **:**".capitalize()
                 )
-                permTwo.append((roleAft.manage_permissions))
+                perm_two.append(role_aft.manage_permissions)
                 # if (myPerms.manage_roles ):
-                messageList.append(
+                message_list.append(
                     " Edit , create or delete roles below their highest role **:**".capitalize()
                 )
-                permTwo.append((roleAft.manage_roles))
+                perm_two.append(role_aft.manage_roles)
                 # if (myPerms.manage_webhooks ):
-                messageList.append(
+                message_list.append(
                     "  Edit , create or delete webhooks of a channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.manage_webhooks))
+                perm_two.append(role_aft.manage_webhooks)
                 # if (myPerms.mention_everyone ):
-                messageList.append(" Mention everyone in a channel **:**".capitalize())
-                permTwo.append((roleAft.mention_everyone))
+                message_list.append(" Mention everyone in a channel **:**".capitalize())
+                perm_two.append(role_aft.mention_everyone)
                 # if (myPerms.move_members ):
-                messageList.append(
+                message_list.append(
                     " Move other members to other voice channels **:**".capitalize()
                 )
-                permTwo.append((roleAft.move_members))
+                perm_two.append(role_aft.move_members)
                 # if (myPerms.mute_members ):
-                messageList.append(
+                message_list.append(
                     " Mute other members in a voice channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.mute_members))
+                perm_two.append(role_aft.mute_members)
                 # if (myPerms.priority_speaker ):
-                messageList.append(
+                message_list.append(
                     " Given priority in a voice channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.priority_speaker))
+                perm_two.append(role_aft.priority_speaker)
                 # if (myPerms.read_message_history ):
-                messageList.append(
+                message_list.append(
                     " Read messages channel's previous messages **:**".capitalize()
                 )
-                permTwo.append((roleAft.read_message_history))
+                perm_two.append(role_aft.read_message_history)
                 # if (myPerms.read_messages ):
-                messageList.append(
+                message_list.append(
                     " Read messages from all or any channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.read_messages))
+                perm_two.append(role_aft.read_messages)
                 # if (myPerms.request_to_speak ):
-                messageList.append(
+                message_list.append(
                     " Request to speak in a stage channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.request_to_speak))
+                perm_two.append(role_aft.request_to_speak)
                 # if (myPerms.send_messages ):
-                messageList.append(
+                message_list.append(
                     " Can send messages from all or specific text channels **:**".capitalize()
                 )
-                permTwo.append((roleAft.add_reactions))
+                perm_two.append(role_aft.add_reactions)
                 # if (myPerms.send_tts_messages ):
-                messageList.append(
+                message_list.append(
                     " Can send messages TTS(which get converted to speech) from all or specific text channels **:**".capitalize()
                 )
-                permTwo.append((roleAft.add_reactions))
+                perm_two.append(role_aft.add_reactions)
                 # if (myPerms.speak ):
-                messageList.append(
+                message_list.append(
                     " Can unmute and speak in a voice channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.speak))
+                perm_two.append(role_aft.speak)
                 # if (myPerms.stream ):
-                messageList.append(
+                message_list.append(
                     " Can share their computer screen in a voice channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.stream))
+                perm_two.append(role_aft.stream)
                 # if (myPerms.use_external_emojis ):
-                messageList.append(
+                message_list.append(
                     " Send emojis created in other guilds **:**".capitalize()
                 )
-                permTwo.append((roleAft.use_external_emojis))
+                perm_two.append(role_aft.use_external_emojis)
                 # if (myPerms.use_slash_command ):
-                messageList.append(
+                message_list.append(
                     " Use slash commands in a channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.use_slash_command))
+                perm_two.append(role_aft.use_slash_command)
                 # if (myPerms.use_voice_activation ):
-                messageList.append(
+                message_list.append(
                     " Use voice activation in a voice channel **:**".capitalize()
                 )
-                permTwo.append((roleAft.use_voice_activation))
+                perm_two.append(role_aft.use_voice_activation)
                 # if (myPerms.view_audit_log ):
-                messageList.append(" View guild's audit log **:**".capitalize())
-                permTwo.append((roleAft.view_audit_log))
+                message_list.append(" View guild's audit log **:**".capitalize())
+                perm_two.append(role_aft.view_audit_log)
                 # if (myPerms.view_channel ):
-                messageList.append(" View all or specific channels **:**".capitalize())
-                permTwo.append((roleAft.view_channel))
+                message_list.append(" View all or specific channels **:**".capitalize())
+                perm_two.append(role_aft.view_channel)
                 # if (myPerms.view_guild_insights ):
-                messageList.append(" View the guild insights **:**".capitalize())
-                permTwo.append((roleAft.view_guild_insights))
-                roleChanges = ""
-                for i in range(len(permOne)):
-                    if permOne[i] != permTwo[i]:
-                        roleChanges = (
-                            roleChanges
-                            + messageList[i]
+                message_list.append(" View the guild insights **:**".capitalize())
+                perm_two.append(role_aft.view_guild_insights)
+                role_changes = ""
+                for i in range(len(perm_one)):
+                    if perm_one[i] != perm_two[i]:
+                        role_changes = (
+                            role_changes
+                            + message_list[i]
                             + " "
-                            + checkEmoji(permTwo[i])
+                            + check_emoji(perm_two[i])
                             + "\n"
                         )
 
-                if not roleChanges == "":
+                if not role_changes == "":
                     changes = (
                         changes
                         + f" The role {role.mention} permissions has changed **:**\n"
                     )
-                    changes = changes + roleChanges
+                    changes = changes + role_changes
         if before.permissions_synced != after.permissions_synced:
             if after.permissions_synced:
                 changes = (
                     changes
-                    + f"The permissions of the channel are now synced with the channel category.\n"
+                    + "The permissions of the channel are now synced with the channel category.\n"
                 )
             else:
                 changes = (
                     changes
-                    + f"The permissions of the channel are now not synced with the channel category.\n"
+                    + "The permissions of the channel are now not synced with the channel category.\n"
                 )
         if not changes == "":
             embed = discord.Embed(
-                title=f"Channel update", description=before.mention, color=Color.blue()
+                title="Channel update", description=before.mention, color=Color.blue()
             )
-            embed.add_field(name=f"** **", value=changes)
+            embed.add_field(name="** **", value=changes)
             embed.add_field(name="Moderator", value=f"{mod.mention}")
             await logchannel.send(embed=embed)
 
     except Exception as ex:
-        logging.log(logging.ERROR, f" on_guild_channel_update: {get_traceback(ex)}")
+        logging.log(logging.ERROR, f" on_guild_channel_update: {format_exception(ex)}")
+
 
 @client.event
 async def on_guild_update(before, after):
     logguild = before
     logchannel = None
     antiraidchannel = None
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         antiraidchannellist = await con.fetchrow(
-            f"SELECT * FROM antiraid WHERE guildid = {logguild.id}"
+            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
         )
     if logchannellist:
         channelid = logchannellist["channelid"]
@@ -12999,12 +8769,12 @@ async def on_guild_update(before, after):
         currententry = entry
     modid = currententry.user.id
     mod = None
-    if not modid == 1061480715172200498:
+    if modid != client.user.id:
         mod = logguild.get_member(modid)
         _message = constructmsg(logguild, mod)
         ctx = constructctx(logguild, mod, antiraidchannel)
         ctx.bot = client
-        bucket = bot.guild_updatecooldown.get_bucket(_message)
+        bucket = client.rate_limits.guild_update.get_bucket(_message)
         retry_after = bucket.update_rate_limit()
         if retry_after:
             # TODO replace mute -> timeout
@@ -13013,12 +8783,12 @@ async def on_guild_update(before, after):
                 await cmd(
                     ctx,
                     str(mod),
-                    reason=(f"""AUTO-MOD for exceeding guild update limit."""),
+                    reason=("""AUTO-MOD for exceeding guild update limit."""),
                 )
             except Exception as ex:
                 logging.log(logging.ERROR, f"on_guild_update Blacklist error {ex}")
             statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, logguild.id)
             await removeguildcaution(logguild.id)
             return
@@ -13048,19 +8818,19 @@ async def on_guild_update(before, after):
                 + f" The afk timeout changed from {before.afk_timeout} to {after.afk_timeout}.\n"
             )
         if before.mfa_level != after.mfa_level:
-            beforeLevel = ""
+            before_level = ""
             if before.mfa_level == 0:
-                beforeLevel = "not required"
+                before_level = "not required"
             else:
-                beforeLevel = "required"
-            afterLevel = ""
+                before_level = "required"
+            after_level = ""
             if after.mfa_level == 0:
-                afterLevel = "not required"
+                after_level = "not required"
             else:
-                afterLevel = "required"
+                after_level = "required"
             changes = (
                 changes
-                + f" The 2fa requirements changed from {beforeLevel} to {afterLevel}.\n"
+                + f" The 2fa requirements changed from {before_level} to {after_level}.\n"
             )
         if before.verification_level != after.verification_level:
             changes = (
@@ -13069,13 +8839,13 @@ async def on_guild_update(before, after):
             )
         if not changes == "":
             embed = discord.Embed(
-                title=(f"Guild update"), description=before.name, color=Color.blue()
+                title=("Guild update"), description=before.name, color=Color.blue()
             )
-            embed.add_field(name=f"** **", value=changes)
+            embed.add_field(name="** **", value=changes)
             embed.add_field(name="Moderator", value=f"{mod.mention}")
             await logchannel.send(embed=embed)
     except Exception as ex:
-        logging.log(logging.ERROR, f" on_guild_update: {get_traceback(ex)}")
+        logging.log(logging.ERROR, f" on_guild_update: {format_exception(ex)}")
 
 
 @client.event
@@ -13083,13 +8853,13 @@ async def on_guild_role_create(role):
     logguild = role.guild
     logchannel = None
     antiraidchannel = None
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         antiraidchannellist = await con.fetchrow(
-            f"SELECT * FROM antiraid WHERE guildid = {logguild.id}"
+            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
         )
     if logchannellist:
         channelid = logchannellist["channelid"]
@@ -13110,12 +8880,12 @@ async def on_guild_role_create(role):
         currententry = entry
     modid = currententry.user.id
     mod = None
-    if not modid == 1061480715172200498:
+    if modid != client.user.id:
         mod = logguild.get_member(modid)
         _message = constructmsg(logguild, mod)
         ctx = constructctx(logguild, mod, antiraidchannel)
         ctx.bot = client
-        bucket = bot.role_createcooldown.get_bucket(_message)
+        bucket = client.rate_limits.role_create.get_bucket(_message)
         retry_after = bucket.update_rate_limit()
         if retry_after:
             # TODO replace mute -> timeout
@@ -13124,12 +8894,12 @@ async def on_guild_role_create(role):
                 await cmd(
                     ctx,
                     str(mod),
-                    reason=(f"""AUTO-MOD for exceeding role create limit."""),
+                    reason=("""AUTO-MOD for exceeding role create limit."""),
                 )
             except Exception as ex:
                 logging.log(logging.ERROR, f"on_guild_role_create Blacklist error {ex}")
             statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, logguild.id)
             await removeguildcaution(logguild.id)
             return
@@ -13142,27 +8912,28 @@ async def on_guild_role_create(role):
             mentionablemsg = "mentionable"
         changes = f"The {role.mention} was created with color {role.color.r},{role.color.g},{role.color.b} and is {hoistmsg} and {mentionablemsg}."
         embed = discord.Embed(
-            title=(f"Role creation"), description=role.mention, color=Color.green()
+            title=("Role creation"), description=role.mention, color=Color.green()
         )
-        embed.add_field(name=f"** **", value=changes)
+        embed.add_field(name="** **", value=changes)
         embed.add_field(name="Moderator", value=f"{mod.mention}")
         await logchannel.send(embed=embed)
 
     except Exception as ex:
-        logging.log(logging.ERROR, f" on_guild_role_create: {get_traceback(ex)}")
+        logging.log(logging.ERROR, f" on_guild_role_create: {format_exception(ex)}")
+
 
 @client.event
 async def on_guild_role_delete(role):
     logguild = role.guild
     logchannel = None
     antiraidchannel = None
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         antiraidchannellist = await con.fetchrow(
-            f"SELECT * FROM antiraid WHERE guildid = {logguild.id}"
+            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
         )
     if logchannellist:
         channelid = logchannellist["channelid"]
@@ -13183,12 +8954,12 @@ async def on_guild_role_delete(role):
         currententry = entry
     modid = currententry.user.id
     mod = None
-    if not modid == 1061480715172200498:
+    if modid != client.user.id:
         mod = logguild.get_member(modid)
         _message = constructmsg(logguild, mod)
         ctx = constructctx(logguild, mod, antiraidchannel)
         ctx.bot = client
-        bucket = bot.role_deletecooldown.get_bucket(_message)
+        bucket = client.rate_limits.role_delete.get_bucket(_message)
         retry_after = bucket.update_rate_limit()
         if retry_after:
             # TODO replace mute -> timeout
@@ -13197,36 +8968,39 @@ async def on_guild_role_delete(role):
                 await cmd(
                     ctx,
                     str(mod),
-                    reason=(f"""AUTO-MOD for exceeding role delete limit."""),
+                    reason=("""AUTO-MOD for exceeding role delete limit."""),
                 )
             except Exception as ex:
-                logging.log(logging.ERROR, f" on_guild_role_delete: {get_traceback(ex)}")
+                logging.log(
+                    logging.ERROR, f" on_guild_role_delete: {format_exception(ex)}"
+                )
             statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, logguild.id)
             await removeguildcaution(logguild.id)
             return
     try:
         embed = discord.Embed(
-            title=(f"Role deletion"), description=f"{role}", color=Color.red()
+            title=("Role deletion"), description=f"{role}", color=Color.red()
         )
         embed.add_field(name="Moderator", value=f"{mod.mention}")
         await logchannel.send(embed=embed)
     except Exception as ex:
-        logging.log(logging.ERROR, f" on_guild_role_delete: {get_traceback(ex)}")
+        logging.log(logging.ERROR, f" on_guild_role_delete: {format_exception(ex)}")
+
 
 @client.event
 async def on_guild_role_update(before, after):
     logguild = before.guild
     logchannel = None
     antiraidchannel = None
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         antiraidchannellist = await con.fetchrow(
-            f"SELECT * FROM antiraid WHERE guildid = {logguild.id}"
+            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
         )
     if logchannellist:
         channelid = logchannellist["channelid"]
@@ -13247,12 +9021,12 @@ async def on_guild_role_update(before, after):
         currententry = entry
     modid = currententry.user.id
     mod = None
-    if not modid == 1061480715172200498:
+    if modid != client.user.id:
         mod = logguild.get_member(modid)
         _message = constructmsg(logguild, mod)
         ctx = constructctx(logguild, mod, antiraidchannel)
         ctx.bot = client
-        bucket = bot.role_updatecooldown.get_bucket(_message)
+        bucket = client.rate_limits.role_update.get_bucket(_message)
         retry_after = bucket.update_rate_limit()
         if retry_after:
             # TODO replace mute -> timeout
@@ -13261,12 +9035,12 @@ async def on_guild_role_update(before, after):
                 await cmd(
                     ctx,
                     str(mod),
-                    reason=(f"""AUTO-MOD for exceeding role update limit."""),
+                    reason=("""AUTO-MOD for exceeding role update limit."""),
                 )
             except Exception as ex:
                 logging.log(logging.ERROR, f"on_guild_role_update Blacklist error {ex}")
             statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, logguild.id)
             await removeguildcaution(logguild.id)
             return
@@ -13289,275 +9063,279 @@ async def on_guild_role_update(before, after):
                 mentionablemsg = "mentionable"
             changes = changes + f" The role will be now {mentionablemsg} by users.\n"
         if before.permissions != after.permissions:
-            myPerms = before.permissions
-            myList = []
+            my_perms = before.permissions
+            my_list = []
             # _message=("Can user add reactions to messages **:**")
-            myList.append((myPerms.add_reactions))
+            my_list.append(my_perms.add_reactions)
             # if (myPerms.administrator ):
             # _message=("Does user have administrator privilleges **:**")
-            myList.append((myPerms.administrator))
+            my_list.append(my_perms.administrator)
             # if (myPerms.attach_files ):
             # _message=("Can user send file attachments in messages **:**")
-            myList.append((myPerms.attach_files))
+            my_list.append(my_perms.attach_files)
             # if (myPerms.ban_members ):
             # _message=("Can user ban other members from the guild **:**")
-            myList.append((myPerms.ban_members))
+            my_list.append(my_perms.ban_members)
             # if (myPerms.change_nickname ):
             # _message=("Can user change their nicknames in the guild **:**")
-            myList.append((myPerms.change_nickname))
+            my_list.append(my_perms.change_nickname)
             # if (myPerms.connect ):
             # _message=("Can user connect to any voice channels **:**")
-            myList.append((myPerms.connect))
+            my_list.append(my_perms.connect)
             # if (myPerms.create_instant_invite ):
             # _message=("Can user invite other members by generating an invite link **:**")
-            myList.append((myPerms.create_instant_invite))
+            my_list.append(my_perms.create_instant_invite)
             # if (myPerms.deafen_members ):
             # _message=("Can user server deafen other members in a voice channel **:**")
-            myList.append((myPerms.deafen_members))
+            my_list.append(my_perms.deafen_members)
             # if (myPerms.embed_links ):
             # _message=("Can user send embedded content in a channel **:**")
-            myList.append((myPerms.embed_links))
+            my_list.append(my_perms.embed_links)
             # if (myPerms.external_emojis ):
             # _message=("Can user send emojis created in other guilds **:**")
-            myList.append((myPerms.external_emojis))
+            my_list.append(my_perms.external_emojis)
             # if (myPerms.kick_members ):
             # _message=("Can user kick other members from the guild **:**")
-            myList.append((myPerms.kick_members))
+            my_list.append(my_perms.kick_members)
             # if (myPerms.manage_channels ):
             # _message=("Can user edit , create or delete any channels **:**")
-            myList.append((myPerms.manage_channels))
+            my_list.append(my_perms.manage_channels)
             # if (myPerms.manage_emojis ):
             # _message=("Can user edit , create or delete any emojis **:**")
-            myList.append((myPerms.manage_emojis))
+            my_list.append(my_perms.manage_emojis)
             # if (myPerms.manage_guild ):
             # _message=("Can user edit guild settings and invite bots **:**")
-            myList.append((myPerms.manage_guild))
+            my_list.append(my_perms.manage_guild)
             # if (myPerms.manage_messages ):
             # _message=("Can user delete messages sent by other members in a channel **:**")
-            myList.append((myPerms.manage_messages))
+            my_list.append(my_perms.manage_messages)
             # if (myPerms.manage_nicknames):
             # _message=("Can user change other member's nicknames **:**")
-            myList.append((myPerms.manage_nicknames))
+            my_list.append(my_perms.manage_nicknames)
             # if (myPerms.manage_permissions ):
             # _message=("Can user edit , create or delete role's permissions below their highest role **:**")
-            myList.append((myPerms.manage_permissions))
+            my_list.append(my_perms.manage_permissions)
             # if (myPerms.manage_roles ):
             # _message=("Can user edit , create or delete roles below their highest role **:**")
-            myList.append((myPerms.manage_roles))
+            my_list.append(my_perms.manage_roles)
             # if (myPerms.manage_webhooks ):
             # _message=("Can user  edit , create or delete webhooks of a channel **:**")
-            myList.append((myPerms.manage_webhooks))
+            my_list.append(my_perms.manage_webhooks)
             # if (myPerms.mention_everyone ):
             # _message=("Can user mention everyone in a channel **:**")
-            myList.append((myPerms.mention_everyone))
+            my_list.append(my_perms.mention_everyone)
             # if (myPerms.move_members ):
             # _message=("Can user move other members to other voice channels **:**")
-            myList.append((myPerms.move_members))
+            my_list.append(my_perms.move_members)
             # if (myPerms.mute_members ):
             # _message=("Can user can server mute other members in a voice channel **:**")
-            myList.append((myPerms.mute_members))
+            my_list.append(my_perms.mute_members)
             # if (myPerms.priority_speaker ):
             # _message=("Will user be given priority when speaking in a voice channel **:**")
-            myList.append((myPerms.priority_speaker))
+            my_list.append(my_perms.priority_speaker)
             # if (myPerms.read_message_history ):
             # _message=("Can user read messages channel's previous messages **:**")
-            myList.append((myPerms.read_message_history))
+            my_list.append(my_perms.read_message_history)
             # if (myPerms.read_messages ):
             # _message=("Can user read messages from all or any channel **:**")
-            myList.append((myPerms.read_messages))
+            my_list.append(my_perms.read_messages)
             # if (myPerms.request_to_speak ):
             # _message=("Can user request to speak in a stage channel **:**")
-            myList.append((myPerms.request_to_speak))
+            my_list.append(my_perms.request_to_speak)
             # if (myPerms.send_messages ):
             # _message=("Can user can send messages from all or specific text channels **:**")
-            myList.append((myPerms.add_reactions))
+            my_list.append(my_perms.add_reactions)
             # if (myPerms.send_tts_messages ):
             # _message=("Can user can send messages TTS(which get converted to speech) from all or specific text channels **:**")
-            myList.append((myPerms.add_reactions))
+            my_list.append(my_perms.add_reactions)
             # if (myPerms.speak ):
             # _message=("Can user can unmute and speak in a voice channel **:**")
-            myList.append((myPerms.speak))
+            my_list.append(my_perms.speak)
             # if (myPerms.stream ):
             # _message=("Can user can share their computer screen in a voice channel **:**")
-            myList.append((myPerms.stream))
+            my_list.append(my_perms.stream)
             # if (myPerms.use_external_emojis ):
             # _message=("Can user send emojis created in other guilds **:**")
-            myList.append((myPerms.use_external_emojis))
+            my_list.append(my_perms.use_external_emojis)
             # if (myPerms.use_slash_command ):
             # _message=("Can user use slash commands in a channel **:**")
-            myList.append((myPerms.use_slash_command))
+            my_list.append(my_perms.use_slash_command)
             # if (myPerms.use_voice_activation ):
             # _message=("Can user use voice activation in a voice channel **:**")
-            myList.append((myPerms.use_voice_activation))
+            my_list.append(my_perms.use_voice_activation)
             # if (myPerms.view_audit_log ):
             # _message=("Can user view guild's audit log **:**")
-            myList.append((myPerms.view_audit_log))
+            my_list.append(my_perms.view_audit_log)
             # if (myPerms.view_channel ):
             # _message=("Can user view all or specific channels **:**")
-            myList.append((myPerms.view_channel))
+            my_list.append(my_perms.view_channel)
             # if (myPerms.view_guild_insights ):
             # _message=("Can user view the guild insights **:**")
-            myList.append((myPerms.view_guild_insights))
-            myPerms = after.permissions
-            myList1 = []
-            messageList = []
-            messageList.append(" Add reactions to messages **:**".capitalize())
-            myList1.append((myPerms.add_reactions))
+            my_list.append(my_perms.view_guild_insights)
+            my_perms = after.permissions
+            my_list1 = []
+            message_list = []
+            message_list.append(" Add reactions to messages **:**".capitalize())
+            my_list1.append(my_perms.add_reactions)
             # if (myPerms.administrator ):
-            messageList.append(" Administrator privilleges **:**".capitalize())
-            myList1.append((myPerms.administrator))
+            message_list.append(" Administrator privilleges **:**".capitalize())
+            my_list1.append(my_perms.administrator)
             # if (myPerms.attach_files ):
-            messageList.append(" Send file attachments in messages **:**".capitalize())
-            myList1.append((myPerms.attach_files))
+            message_list.append(" Send file attachments in messages **:**".capitalize())
+            my_list1.append(my_perms.attach_files)
             # if (myPerms.ban_members ):
-            messageList.append(" Ban other members from the guild **:**".capitalize())
-            myList1.append((myPerms.ban_members))
+            message_list.append(" Ban other members from the guild **:**".capitalize())
+            my_list1.append(my_perms.ban_members)
             # if (myPerms.change_nickname ):
-            messageList.append(
+            message_list.append(
                 " Change their nicknames in the guild **:**".capitalize()
             )
-            myList1.append((myPerms.change_nickname))
+            my_list1.append(my_perms.change_nickname)
             # if (myPerms.connect ):
-            messageList.append(" Connect to any voice channels **:**".capitalize())
-            myList1.append((myPerms.connect))
+            message_list.append(" Connect to any voice channels **:**".capitalize())
+            my_list1.append(my_perms.connect)
             # if (myPerms.create_instant_invite ):
-            messageList.append(
+            message_list.append(
                 " Invite other members by generating an invite link **:**".capitalize()
             )
-            myList1.append((myPerms.create_instant_invite))
+            my_list1.append(my_perms.create_instant_invite)
             # if (myPerms.deafen_members ):
-            messageList.append(
+            message_list.append(
                 " Server deafen other members in a voice channel **:**".capitalize()
             )
-            myList1.append((myPerms.deafen_members))
+            my_list1.append(my_perms.deafen_members)
             # if (myPerms.embed_links ):
-            messageList.append(" Send embedded content in a channel **:**".capitalize())
-            myList1.append((myPerms.embed_links))
+            message_list.append(
+                " Send embedded content in a channel **:**".capitalize()
+            )
+            my_list1.append(my_perms.embed_links)
             # if (myPerms.external_emojis ):
-            messageList.append(
+            message_list.append(
                 " Send emojis created in other guilds **:**".capitalize()
             )
-            myList1.append((myPerms.external_emojis))
+            my_list1.append(my_perms.external_emojis)
             # if (myPerms.kick_members ):
-            messageList.append(" Kick other members from the guild **:**".capitalize())
-            myList1.append((myPerms.kick_members))
+            message_list.append(" Kick other members from the guild **:**".capitalize())
+            my_list1.append(my_perms.kick_members)
             # if (myPerms.manage_channels ):
-            messageList.append(
+            message_list.append(
                 " Edit , create or delete any channels **:**".capitalize()
             )
-            myList1.append((myPerms.manage_channels))
+            my_list1.append(my_perms.manage_channels)
             # if (myPerms.manage_emojis ):
-            messageList.append(" Edit , create or delete any emojis **:**".capitalize())
-            myList1.append((myPerms.manage_emojis))
+            message_list.append(
+                " Edit , create or delete any emojis **:**".capitalize()
+            )
+            my_list1.append(my_perms.manage_emojis)
             # if (myPerms.manage_guild ):
-            messageList.append(
+            message_list.append(
                 " Edit guild settings and invite bots **:**".capitalize()
             )
-            myList1.append((myPerms.manage_guild))
+            my_list1.append(my_perms.manage_guild)
             # if (myPerms.manage_messages ):
-            messageList.append(
+            message_list.append(
                 " Delete messages sent by other members in a channel **:**".capitalize()
             )
-            myList1.append((myPerms.manage_messages))
+            my_list1.append(my_perms.manage_messages)
             # if (myPerms.manage_nicknames):
-            messageList.append(" Change other member's nicknames **:**".capitalize())
-            myList1.append((myPerms.manage_nicknames))
+            message_list.append(" Change other member's nicknames **:**".capitalize())
+            my_list1.append(my_perms.manage_nicknames)
             # if (myPerms.manage_permissions ):
-            messageList.append(
+            message_list.append(
                 " Edit , create or delete role's permissions below their highest role **:**".capitalize()
             )
-            myList1.append((myPerms.manage_permissions))
+            my_list1.append(my_perms.manage_permissions)
             # if (myPerms.manage_roles ):
-            messageList.append(
+            message_list.append(
                 " Edit , create or delete roles below their highest role **:**".capitalize()
             )
-            myList1.append((myPerms.manage_roles))
+            my_list1.append(my_perms.manage_roles)
             # if (myPerms.manage_webhooks ):
-            messageList.append(
+            message_list.append(
                 "  Edit , create or delete webhooks of a channel **:**".capitalize()
             )
-            myList1.append((myPerms.manage_webhooks))
+            my_list1.append(my_perms.manage_webhooks)
             # if (myPerms.mention_everyone ):
-            messageList.append(" Mention everyone in a channel **:**".capitalize())
-            myList1.append((myPerms.mention_everyone))
+            message_list.append(" Mention everyone in a channel **:**".capitalize())
+            my_list1.append(my_perms.mention_everyone)
             # if (myPerms.move_members ):
-            messageList.append(
+            message_list.append(
                 " Move other members to other voice channels **:**".capitalize()
             )
-            myList1.append((myPerms.move_members))
+            my_list1.append(my_perms.move_members)
             # if (myPerms.mute_members ):
-            messageList.append(
+            message_list.append(
                 " Mute other members in a voice channel **:**".capitalize()
             )
-            myList1.append((myPerms.mute_members))
+            my_list1.append(my_perms.mute_members)
             # if (myPerms.priority_speaker ):
-            messageList.append(" Given priority in a voice channel **:**".capitalize())
-            myList1.append((myPerms.priority_speaker))
+            message_list.append(" Given priority in a voice channel **:**".capitalize())
+            my_list1.append(my_perms.priority_speaker)
             # if (myPerms.read_message_history ):
-            messageList.append(
+            message_list.append(
                 " Read messages channel's previous messages **:**".capitalize()
             )
-            myList1.append((myPerms.read_message_history))
+            my_list1.append(my_perms.read_message_history)
             # if (myPerms.read_messages ):
-            messageList.append(
+            message_list.append(
                 " Read messages from all or any channel **:**".capitalize()
             )
-            myList1.append((myPerms.read_messages))
+            my_list1.append(my_perms.read_messages)
             # if (myPerms.request_to_speak ):
-            messageList.append(
+            message_list.append(
                 " Request to speak in a stage channel **:**".capitalize()
             )
-            myList1.append((myPerms.request_to_speak))
+            my_list1.append(my_perms.request_to_speak)
             # if (myPerms.send_messages ):
-            messageList.append(
+            message_list.append(
                 " Can send messages from all or specific text channels **:**".capitalize()
             )
-            myList1.append((myPerms.add_reactions))
+            my_list1.append(my_perms.add_reactions)
             # if (myPerms.send_tts_messages ):
-            messageList.append(
+            message_list.append(
                 " Can send messages TTS(which get converted to speech) from all or specific text channels **:**".capitalize()
             )
-            myList1.append((myPerms.add_reactions))
+            my_list1.append(my_perms.add_reactions)
             # if (myPerms.speak ):
-            messageList.append(
+            message_list.append(
                 " Can unmute and speak in a voice channel **:**".capitalize()
             )
-            myList1.append((myPerms.speak))
+            my_list1.append(my_perms.speak)
             # if (myPerms.stream ):
-            messageList.append(
+            message_list.append(
                 " Can share their computer screen in a voice channel **:**".capitalize()
             )
-            myList1.append((myPerms.stream))
+            my_list1.append(my_perms.stream)
             # if (myPerms.use_slash_command ):
-            messageList.append(" Use slash commands in a channel **:**".capitalize())
-            myList1.append((myPerms.use_slash_command))
+            message_list.append(" Use slash commands in a channel **:**".capitalize())
+            my_list1.append(my_perms.use_slash_command)
             # if (myPerms.use_voice_activation ):
-            messageList.append(
+            message_list.append(
                 " Use voice activation in a voice channel **:**".capitalize()
             )
-            myList1.append((myPerms.use_voice_activation))
+            my_list1.append(my_perms.use_voice_activation)
             # if (myPerms.view_audit_log ):
-            messageList.append(" View guild's audit log **:**".capitalize())
-            myList1.append((myPerms.view_audit_log))
+            message_list.append(" View guild's audit log **:**".capitalize())
+            my_list1.append(my_perms.view_audit_log)
             # if (myPerms.view_channel ):
-            messageList.append(" View all or specific channels **:**".capitalize())
-            myList1.append((myPerms.view_channel))
+            message_list.append(" View all or specific channels **:**".capitalize())
+            my_list1.append(my_perms.view_channel)
             # if (myPerms.view_guild_insights ):
-            messageList.append(" View the guild insights **:**".capitalize())
-            myList1.append((myPerms.view_guild_insights))
-            roleChanges = ""
-            for i in range(len(myList1)):
-                if myList[i] != myList1[i]:
-                    roleChanges = (
-                        roleChanges
-                        + messageList[i]
+            message_list.append(" View the guild insights **:**".capitalize())
+            my_list1.append(my_perms.view_guild_insights)
+            role_changes = ""
+            for i in range(len(my_list1)):
+                if my_list[i] != my_list1[i]:
+                    role_changes = (
+                        role_changes
+                        + message_list[i]
                         + " "
-                        + checkEmoji(myList1[i])
+                        + check_emoji(my_list1[i])
                         + "\n"
                     )
-            if not roleChanges == "":
-                changes = changes + f" The role permissions has changed **:**\n"
-                changes = changes + roleChanges
+            if not role_changes == "":
+                changes = changes + " The role permissions has changed **:**\n"
+                changes = changes + role_changes
         if before.name != after.name:
             changes = (
                 changes
@@ -13565,26 +9343,27 @@ async def on_guild_role_update(before, after):
             )
         if not changes == "":
             embed = discord.Embed(
-                title=(f"Role update"), description=after.mention, color=Color.blue()
+                title=("Role update"), description=after.mention, color=Color.blue()
             )
-            embed.add_field(name=f"** **", value=changes)
+            embed.add_field(name="** **", value=changes)
             embed.add_field(name="Moderator", value=f"{mod.mention}")
             await logchannel.send(embed=embed)
     except Exception as ex:
-        logging.log(logging.ERROR, f" on_guild_role_update: {get_traceback(ex)}")
+        logging.log(logging.ERROR, f" on_guild_role_update: {format_exception(ex)}")
+
 
 @client.event
 async def on_member_ban(guild, member):
     logguild = guild
     logchannel = None
     antiraidchannel = None
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         antiraidchannellist = await con.fetchrow(
-            f"SELECT * FROM antiraid WHERE guildid = {logguild.id}"
+            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
         )
     if logchannellist:
         channelid = logchannellist["channelid"]
@@ -13603,12 +9382,12 @@ async def on_member_ban(guild, member):
         currententry = entry
     modid = currententry.user.id
     mod = None
-    if not modid == 1061480715172200498:
+    if modid != client.user.id:
         mod = logguild.get_member(modid)
         _message = constructmsg(logguild, mod)
         ctx = constructctx(logguild, mod, antiraidchannel)
         ctx.bot = client
-        bucket = bot.member_bancooldown.get_bucket(_message)
+        bucket = client.rate_limits.member_ban.get_bucket(_message)
         retry_after = bucket.update_rate_limit()
         if retry_after:
             # TODO replace mute -> timeout
@@ -13617,18 +9396,18 @@ async def on_member_ban(guild, member):
                 await cmd(
                     ctx,
                     str(mod),
-                    reason=(f"""AUTO-MOD for exceeding member ban limit."""),
+                    reason=("""AUTO-MOD for exceeding member ban limit."""),
                 )
             except Exception as ex:
                 logging.log(logging.ERROR, f" on_member_ban Blacklist error {ex}")
             statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, logguild.id)
             await removeguildcaution(logguild.id)
             return
     try:
         embed = discord.Embed(
-            title=(f"Member banned"), description=member.mention, color=Color.red()
+            title=("Member banned"), description=member.mention, color=Color.red()
         )
         embed.add_field(
             name="** **",
@@ -13636,7 +9415,7 @@ async def on_member_ban(guild, member):
         )
         await logchannel.send(embed=embed)
     except Exception as ex:
-        logging.log(logging.ERROR, f" on_member_ban: {get_traceback(ex)}")
+        logging.log(logging.ERROR, f" on_member_ban: {format_exception(ex)}")
 
 
 @client.event
@@ -13644,13 +9423,13 @@ async def on_member_unban(guild, member):
     logguild = guild
     logchannel = None
     antiraidchannel = None
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         antiraidchannellist = await con.fetchrow(
-            f"SELECT * FROM antiraid WHERE guildid = {logguild.id}"
+            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
         )
     if logchannellist:
         channelid = logchannellist["channelid"]
@@ -13671,12 +9450,12 @@ async def on_member_unban(guild, member):
         currententry = entry
     modid = currententry.user.id
     mod = None
-    if not modid == 1061480715172200498:
+    if modid != client.user.id:
         mod = logguild.get_member(modid)
         _message = constructmsg(logguild, mod)
         ctx = constructctx(logguild, mod, antiraidchannel)
         ctx.bot = client
-        bucket = bot.member_unbancooldown.get_bucket(_message)
+        bucket = client.rate_limits.member_unban.get_bucket(_message)
         retry_after = bucket.update_rate_limit()
         if retry_after:
             # TODO replace mute -> timeout
@@ -13685,18 +9464,18 @@ async def on_member_unban(guild, member):
                 await cmd(
                     ctx,
                     str(mod),
-                    reason=(f"""AUTO-MOD for exceeding member unban limit."""),
+                    reason=("""AUTO-MOD for exceeding member unban limit."""),
                 )
             except Exception as ex:
                 logging.log(logging.ERROR, f" on_member_unban Blacklist error {ex}")
             statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with pool.acquire() as con:
+            async with client.database.pool.acquire() as con:
                 await con.execute(statement, logguild.id)
             await removeguildcaution(logguild.id)
             return
     try:
         embed = discord.Embed(
-            title=(f"Member unbanned"), description=member.mention, color=Color.green()
+            title=("Member unbanned"), description=member.mention, color=Color.green()
         )
         embed.add_field(
             name="** **",
@@ -13704,59 +9483,154 @@ async def on_member_unban(guild, member):
         )
         await logchannel.send(embed=embed)
     except Exception as ex:
-        logging.log(logging.ERROR, f" on_member_unban: {get_traceback(ex)}")
+        logging.log(logging.ERROR, f" on_member_unban: {format_exception(ex)}")
 
 
 @client.event
 async def on_invite_create(invite):
     logguild = invite.guild
     logchannel = None
-    async with pool.acquire() as con:
+    async with client.database.pool.acquire() as con:
         logchannellist = await con.fetchrow(
-            f"SELECT * FROM logchannels WHERE guildid = {logguild.id}"
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    if not logchannellist is None:
+    if logchannellist is not None:
         channelid = logchannellist["channelid"]
         logchannel = logguild.get_channel(channelid)
     else:
         return
     try:
-        maxUsemsg = invite.max_uses
-        if maxUsemsg == 0:
-            maxUsemsg = "unlimited"
-        maxAgemsg = invite.max_age
-        if maxAgemsg == 0:
-            maxAgemsg = "unlimited"
-        changes = f" The invite was created by {invite.inviter.mention} in {invite.channel.mention} and can be used a maximum of {maxUsemsg} times for {maxAgemsg} seconds ."
+        max_usemsg = invite.max_uses
+        if max_usemsg == 0:
+            max_usemsg = "unlimited"
+        max_agemsg = invite.max_age
+        if max_agemsg == 0:
+            max_agemsg = "unlimited"
+        changes = f" The invite was created by {invite.inviter.mention} in {invite.channel.mention} and can be used a maximum of {max_usemsg} times for {max_agemsg} seconds ."
         embed = discord.Embed(
-            title=(f"Invite creation"), description=invite.url, color=Color.green()
+            title=("Invite creation"), description=invite.url, color=Color.green()
         )
         embed.add_field(name="** **", value=changes)
         await logchannel.send(embed=embed)
     except Exception as ex:
-        logging.log(logging.ERROR, f" on_invite_create: {get_traceback(ex)}")
+        logging.log(logging.ERROR, f" on_invite_create: {format_exception(ex)}")
 
 
-
-
-
-
-
-
-
-try:
-    client.run(token)
-    # REQUIRES API KEY(BOT TOKEN)
-except Exception as ex:
-    logging.log(logging.DEBUG, get_traceback(ex))
-    logging.log(logging.ERROR, f"Client session {client}")
-    if isinstance(ex, discord.LoginFailure):
-        logging.log(logging.ERROR, 
-            "An improper token has been passed, try logging in again with correct credentials."
+@client.event
+async def on_invite_delete(invite):
+    logguild = invite.guild
+    logchannel = None
+    async with client.database.pool.acquire() as con:
+        logchannellist = await con.fetchrow(
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
         )
-    if isinstance(ex, discord.HTTPException):
-        logging.log(logging.ERROR, 
-            f"Login returned an error code {ex.code} with {ex.text} of {ex.response}."
+    if logchannellist is not None:
+        channelid = logchannellist["channelid"]
+        logchannel = logguild.get_channel(channelid)
+    else:
+        return
+    try:
+        embed = discord.Embed(
+            title=("Invite deletion"), description=invite.url, color=Color.red()
         )
-    if client.is_ws_ratelimited():
-        logging.log(logging.ERROR, "Client is rate limited...")
+        await logchannel.send(embed=embed)
+    except Exception as ex:
+        logging.log(logging.ERROR, f" on_invite_update: {format_exception(ex)}")
+
+
+@client.event
+async def on_voice_state_update(member, before, after):
+    logguild = member.guild
+    logchannel = None
+    async with client.database.pool.acquire() as con:
+        logchannellist = await con.fetchrow(
+            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
+        )
+    if logchannellist is not None:
+        channelid = logchannellist["channelid"]
+        logchannel = logguild.get_channel(channelid)
+    try:
+        changes = ""
+        if before.channel is None:
+            changes = (
+                changes
+                + f" The member {member.mention} connected to the voice channel {after.channel.mention}.\n"
+            )
+        if after.channel is None:
+            changes = (
+                changes
+                + f" The member {member.mention} disconnected from the voice channel {before.channel.mention}.\n"
+            )
+        if before.self_mute != after.self_mute:
+            mic_msg = ""
+            if before.self_mute:
+                mic_msg = f" The member {member.mention} unmuted themselves in the voice channel {before.channel.mention}.\n"
+            else:
+                mic_msg = f" The member {member.mention} muted themselves in the voice channel {before.channel.mention}.\n"
+            changes = changes + mic_msg
+        if before.self_deaf != after.self_deaf:
+            mic_msg = ""
+            if before.self_deaf:
+                mic_msg = f" The member {member.mention} undeafened themselves in the voice channel {before.channel.mention}.\n"
+            else:
+                mic_msg = f" The member {member.mention} deafened themselves in the voice channel {before.channel.mention}.\n"
+            changes = changes + mic_msg
+        if before.mute != after.mute:
+            mic_msg = ""
+            if before.mute:
+                mic_msg = f" The member {member.mention} was unmuted by an admin in the voice channel {before.channel.mention}.\n"
+            else:
+                mic_msg = f" The member {member.mention} was muted by an admin in the voice channel {before.channel.mention}.\n"
+            changes = changes + mic_msg
+        if before.deaf != after.deaf:
+            mic_msg = ""
+            if before.deaf:
+                mic_msg = f" The member {member.mention} was undeafened by an admin in the voice channel {before.channel.mention}.\n"
+            else:
+                mic_msg = f" The member {member.mention} was deafened by an admin in the voice channel {before.channel.mention}.\n"
+            changes = changes + mic_msg
+        if before.self_stream != after.self_stream:
+            mic_msg = ""
+            if before.self_stream:
+                mic_msg = f" The member {member.mention} stopped streaming content in the voice channel {before.channel.mention}.\n"
+            else:
+                mic_msg = f" The member {member.mention} is streaming content in the voice channel {before.channel.mention}.\n"
+            changes = changes + mic_msg
+        if before.self_video != after.self_video:
+            mic_msg = ""
+            if before.self_video:
+                mic_msg = f" The member {member.mention} stopped their video in the voice channel {before.channel.mention}.\n"
+            else:
+                mic_msg = f" The member {member.mention} shared their video in the voice channel {before.channel.mention}.\n"
+            changes = changes + mic_msg
+
+        if not changes == "":
+            if logchannel is not None:
+                embed = discord.Embed(
+                    title=("Voice channel update"),
+                    description=member.mention,
+                    color=Color.blue(),
+                )
+                embed.add_field(name="** **", value=changes)
+                await logchannel.send(embed=embed)
+    except Exception as ex:
+        logging.log(logging.ERROR, f" on_voice_state_update: {format_exception(ex)}")
+
+
+def main():
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN is required in the environment or .env file.")
+    try:
+        client.run(token)
+    except discord.LoginFailure:
+        LOGGER.exception("Discord rejected DISCORD_TOKEN during login")
+        raise
+    except discord.HTTPException:
+        LOGGER.exception("Discord login or gateway startup failed")
+        if client.is_ws_ratelimited():
+            LOGGER.error("The Discord WebSocket is rate limited")
+        raise
+
+
+if __name__ == "__main__":
+    main()

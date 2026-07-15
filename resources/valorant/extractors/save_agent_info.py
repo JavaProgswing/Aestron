@@ -1,25 +1,17 @@
-import requests
-import json
+"""Download current playable Valorant agent metadata."""
 
-api_url = "https://valorant-api.com/v1/agents?isPlayableCharacter=true"
-json_file_path = "agent_info.json"
+import asyncio
 
-try:
-    # Fetch data from the API
-    response = requests.get(api_url)
+from .common import output_path, save_json
 
-    # Check if the request was successful (status code 200)
-    if response.status_code == 200:
-        # Parse JSON response
-        agent_data = response.json()
 
-        # Save data to a JSON file
-        with open(json_file_path, 'w', encoding='utf-8') as json_file:
-            json.dump(agent_data, json_file, ensure_ascii=False, indent=4)
-        
-        print(f"Data successfully fetched and saved to {json_file_path}")
-    else:
-        print(f"Failed to fetch data. Status code: {response.status_code}")
+async def main() -> None:
+    """Save playable agent metadata beside this module."""
+    await save_json(
+        "https://valorant-api.com/v1/agents?isPlayableCharacter=true",
+        output_path("agent_info.json"),
+    )
 
-except Exception as e:
-    print(f"An error occurred: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())

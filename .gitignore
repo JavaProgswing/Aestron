@@ -105,6 +105,7 @@ celerybeat.pid
 .env
 github.env
 database.env
+website.env
 .venv
 env/
 venv/
@@ -137,3 +138,10 @@ dmypy.json
 .iml
 .xml
 .gitignore
+.agents/
+.codex/
+.idea/
+.ruff_cache/
+.playwright-cli/
+output/
+temp/
