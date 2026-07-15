@@ -28,7 +28,6 @@ from discord import Color, app_commands
 from discord.ext import commands
 from discord.ext.commands import BucketType
 from dotenv import load_dotenv
-from googleapiclient import discovery
 from langdetect import detect
 from mcstatus import JavaServer
 from PIL import Image, ImageDraw, ImageFont
@@ -67,6 +66,9 @@ SCRIPT_PATH = str(Path(__file__).resolve())
 SETTINGS = RuntimeSettings.from_environment()
 token = os.getenv("DISCORD_TOKEN")
 dbltoken = os.getenv("DBL_TOKEN")
+PERSPECTIVE_ANALYZE_URL = (
+    "https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze"
+)
 
 mystbin_client = mystbin.Client()
 
@@ -667,21 +669,6 @@ async def run_bot():
     await client.statistics.start(client.database.pool)
     client.session = aiohttp.ClientSession()
     logging.log(logging.DEBUG, f"The session has been set to {client.session}")
-    perspective_api_key = os.getenv("GCOM_TOKEN")
-    if perspective_api_key:
-        try:
-            client.perspective_service = await asyncio.to_thread(
-                discovery.build,
-                "commentanalyzer",
-                "v1alpha1",
-                developerKey=perspective_api_key,
-                cache_discovery=False,
-            )
-        except Exception as ex:
-            logging.log(
-                logging.WARNING,
-                f"Perspective API initialization failed: {ex}",
-            )
     await client.lavalink.start()
     for cog_type in get_cog_types():
         await client.add_cog(cog_type(client))
@@ -820,8 +807,9 @@ class MyBot(commands.Bot):
         super().__init__(*args, **kwargs)
         self.database = DatabaseService()
         self.statistics = BotStatistics()
+        self.session: aiohttp.ClientSession | None = None
         self.lavalink = LavalinkService(self)
-        self.perspective_service = None
+        self.perspective_api_key = os.getenv("GCOM_TOKEN", "").strip() or None
         self.runtime_state = RuntimeState()
         self.rate_limits = RateLimits()
         self.background_tasks = set()
@@ -1255,14 +1243,21 @@ async def analyze_message(_message, attributes):
     analyze_request = {
         "comment": {"text": _message},
         "requestedAttributes": {attribute: {} for attribute in attributes},
+        "doNotStore": True,
     }
-    if client.perspective_service is None:
+    if client.perspective_api_key is None:
         return None
     try:
-        request = client.perspective_service.comments().analyze(body=analyze_request)
-        return await asyncio.to_thread(request.execute)
-    except Exception as ex:
-        logging.log(logging.ERROR, f"Perspective API error: {format_exception(ex)}")
+        async with client.session.post(
+            PERSPECTIVE_ANALYZE_URL,
+            params={"key": client.perspective_api_key},
+            json=analyze_request,
+            timeout=ClientTimeout(total=10),
+        ) as response:
+            response.raise_for_status()
+            return await response.json()
+    except (aiohttp.ClientError, TimeoutError) as error:
+        LOGGER.warning("Perspective API request failed: %s", error)
         return None
 
 
@@ -9621,7 +9616,9 @@ def main():
     if not token:
         raise RuntimeError("DISCORD_TOKEN is required in the environment or .env file.")
     try:
-        client.run(token)
+        # Aestron configures the root logger above. Disabling discord.py's
+        # additional handler prevents every library record being emitted twice.
+        client.run(token, log_handler=None)
     except discord.LoginFailure:
         LOGGER.exception("Discord rejected DISCORD_TOKEN during login")
         raise

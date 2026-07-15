@@ -45,12 +45,12 @@ Use one worker unless the in-memory public feedback limiter is replaced by a
 shared Redis-backed limiter. Do not use `--reload` in production.
 
 ```bash
-if [[ -d .git ]] && [[ "{{AUTO_UPDATE}}" == "1" ]]; then git pull; fi; if [[ ! -z "{{PY_PACKAGES}}" ]]; then pip install -U --prefix .local {{PY_PACKAGES}}; fi; if [[ -f /home/container/${REQUIREMENTS_FILE} ]]; then pip install -U --prefix .local -r ${REQUIREMENTS_FILE}; fi; python -m uvicorn website.main:app --host 0.0.0.0 --port 27009 --env-file website.env --proxy-headers
+if [[ -d .git ]] && [[ "${AUTO_UPDATE}" == "1" ]]; then git pull; fi; pip install -U --prefix .local -r requirements-web.txt; python -m uvicorn website.main:app --host 0.0.0.0 --port 27004 --env-file website.env --proxy-headers
 ```
 
-Set `REQUIREMENTS_FILE=requirements-web.txt`. Configure the reverse proxy for
-HTTPS, WebSocket-capable forwarding, and the original `Host` and
-`X-Forwarded-Proto` headers. Restrict Pterodactyl port 27009 to the reverse proxy
+Configure the reverse proxy for HTTPS, WebSocket-capable forwarding, and the
+original `Host` and `X-Forwarded-Proto` headers. Restrict Pterodactyl port 27004
+to the reverse proxy
 where possible. If the proxy is not local/trusted, set Uvicorn's
 `--forwarded-allow-ips` to the proxy address or CIDR instead of trusting every
 sender.

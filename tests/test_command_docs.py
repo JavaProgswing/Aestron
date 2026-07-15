@@ -26,6 +26,34 @@ def test_usage_is_inferred_from_required_optional_and_keyword_parameters():
     )
 
 
+def test_duplicate_leaf_names_are_valid_in_different_command_groups():
+    @commands.group()
+    async def music(ctx):
+        pass
+
+    @music.command(name="stop")
+    async def music_stop(ctx):
+        pass
+
+    @commands.group()
+    async def diagnostics(ctx):
+        pass
+
+    @diagnostics.command(name="stop")
+    async def diagnostics_stop(ctx):
+        pass
+
+    bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
+    try:
+        bot.add_command(music)
+        bot.add_command(diagnostics)
+        normalize_command_metadata(bot)
+
+        assert audit_command_metadata(bot) == []
+    finally:
+        asyncio.run(bot.close())
+
+
 def test_every_registered_command_has_complete_documentation():
     async def run_test():
         bot = main.MyBot(

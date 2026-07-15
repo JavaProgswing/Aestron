@@ -3,7 +3,6 @@ asyncpg==0.31.0
 beautifulsoup4==4.15.0
 captcha==0.7.1
 discord.py[voice]==2.7.1
-google-api-python-client==2.198.0
 jishaku==2.7.5
 langdetect==1.0.9
 libretranslatepy==2.1.1  # translate 3.8.1 requires this exact version

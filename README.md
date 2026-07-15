@@ -96,7 +96,7 @@ Install `requirements-web.txt` and run the product site separately from the bot:
 
 ```powershell
 .venv\Scripts\python.exe -m pip install -r requirements-web.txt
-.venv\Scripts\python.exe -m uvicorn website.main:app --host 0.0.0.0 --port 27009 --env-file website.env
+.venv\Scripts\python.exe -m uvicorn website.main:app --host 0.0.0.0 --port 27004 --env-file website.env
 ```
 
 The generalized product site is at `/`, the bot overview is `/dashboard`, the

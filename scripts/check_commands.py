@@ -21,6 +21,7 @@ async def check_commands() -> dict[str, int]:
         for cog_type in main.get_cog_types():
             await bot.add_cog(cog_type(bot))
         await bot.add_cog(main.Statistics(bot, bot.statistics))
+        await bot.load_extension("jishaku")
         normalize_command_metadata(bot)
         issues = audit_command_metadata(bot)
         if issues:

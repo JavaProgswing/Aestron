@@ -78,7 +78,7 @@ def normalize_command_metadata(bot: commands.Bot) -> None:
 def audit_command_metadata(bot: commands.Bot) -> list[CommandDocumentationIssue]:
     """Return command metadata problems suitable for tests and startup checks."""
     issues: list[CommandDocumentationIssue] = []
-    seen: dict[str, str] = {}
+    seen: dict[tuple[str, str], str] = {}
     for command in bot.walk_commands():
         qualified_name = command.qualified_name
         for field in ("brief", "description", "help"):
@@ -130,8 +130,15 @@ def audit_command_metadata(bot: commands.Bot) -> list[CommandDocumentationIssue]
                 )
 
         for name in (command.name, *command.aliases):
-            normalized = name.casefold()
-            owner = seen.get(normalized)
+            # Command names only need to be unique among siblings. A top-level
+            # ``stop`` command and ``jishaku voice stop`` are different command
+            # paths, just as ``admin add`` and ``playlist add`` are. Comparing
+            # leaf names globally rejects valid third-party and grouped commands.
+            parent_scope = (
+                command.parent.qualified_name.casefold() if command.parent else ""
+            )
+            key = (parent_scope, name.casefold())
+            owner = seen.get(key)
             if owner is not None and owner != qualified_name:
                 issues.append(
                     CommandDocumentationIssue(
@@ -141,5 +148,5 @@ def audit_command_metadata(bot: commands.Bot) -> list[CommandDocumentationIssue]
                     )
                 )
             else:
-                seen[normalized] = qualified_name
+                seen[key] = qualified_name
     return issues
