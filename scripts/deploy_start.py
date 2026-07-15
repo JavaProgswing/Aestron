@@ -24,6 +24,7 @@ DEPLOYMENT_ENVIRONMENT_KEYS = frozenset(
         "AUTO_UPDATE",
         "DEPLOY_GIT_REMOTE",
         "DEPLOY_GIT_BRANCH",
+        "DEPLOY_DISCARD_LOCAL_CHANGES",
         "DEPLOY_GIT_REMOTE_URL",
         "DEPLOY_INSTALL_DEPENDENCIES",
         "DEPLOY_PIP_PREFIX",
@@ -197,6 +198,30 @@ def _configure_sparse_checkout(service: str) -> None:
     marker.write_text(f"{service}\n", encoding="utf-8")
 
 
+def _ensure_clean_checkout() -> None:
+    """Refuse local edits unless deployment explicitly makes Git authoritative."""
+    status_output = _git(
+        "status", "--porcelain", "--untracked-files=no", label="Git status"
+    )
+    if not status_output:
+        return
+    if not _enabled("DEPLOY_DISCARD_LOCAL_CHANGES", False):
+        raise DeploymentError(
+            "Tracked files are modified. Commit them, restore them, or set "
+            "DEPLOY_DISCARD_LOCAL_CHANGES=1 to make the pinned Git repository "
+            "authoritative on this deployment server."
+        )
+
+    print(
+        "Discarding tracked deployment changes before the Git update; ignored "
+        "environment and runtime files are preserved.",
+        flush=True,
+    )
+    _git("reset", "--hard", "HEAD", label="Git tracked-file reset")
+    if _git("status", "--porcelain", "--untracked-files=no", label="Git status"):
+        raise DeploymentError("Tracked files remain modified after the Git reset.")
+
+
 def _update_repository(service: str) -> tuple[str, str, str, bool]:
     """Fetch and apply only a verified, clean fast-forward update."""
     if not (ROOT / ".git").is_dir():
@@ -216,10 +241,7 @@ def _update_repository(service: str) -> tuple[str, str, str, bool]:
     )
     if current_branch != branch:
         raise DeploymentError(f"The checkout must be on DEPLOY_GIT_BRANCH ({branch}).")
-    if _git("status", "--porcelain", "--untracked-files=no", label="Git status"):
-        raise DeploymentError(
-            "Tracked files are modified; refusing to overwrite local deployment changes."
-        )
+    _ensure_clean_checkout()
     _configure_sparse_checkout(service)
 
     before = _git("rev-parse", "HEAD", label="Git revision lookup")

@@ -18,6 +18,7 @@ AUTO_UPDATE=1
 DEPLOY_GIT_REMOTE=aestron
 DEPLOY_GIT_BRANCH=master
 DEPLOY_GIT_REMOTE_URL=https://github.com/JavaProgswing/aestron
+DEPLOY_DISCARD_LOCAL_CHANGES=1
 DEPLOY_INSTALL_DEPENDENCIES=1
 DEPLOY_PIP_PREFIX=.local
 DEPLOY_REQUIRE_SIGNED_COMMITS=0
@@ -28,6 +29,13 @@ variables are accepted as fallbacks when `DEPLOY_GIT_REMOTE_URL` and
 `DEPLOY_GIT_BRANCH` are not set. Explicit `DEPLOY_*` values take precedence.
 Repository URLs containing embedded usernames, passwords, or tokens remain
 rejected.
+
+`DEPLOY_DISCARD_LOCAL_CHANGES=1` is appropriate for immutable Pterodactyl
+deployments where the pinned Git repository is the source of truth. Before each
+update it resets modified tracked files to the current commit. Git-ignored
+configuration, credentials, installed packages, and runtime state are not
+deleted. Leave this setting at `0` on development checkouts where local source
+edits must stop deployment instead of being overwritten.
 
 `DEPLOY_GIT_REMOTE` must match a name shown by `git remote`, and
 `DEPLOY_GIT_REMOTE_URL` must exactly match `git remote get-url <name>` apart

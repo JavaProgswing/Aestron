@@ -7,6 +7,7 @@ from scripts.deploy_start import (
     DeploymentError,
     _configure_sparse_checkout,
     _enabled,
+    _ensure_clean_checkout,
     _load_deployment_environment,
     _prepare_repository,
     _validate_remote_url,
@@ -157,3 +158,39 @@ def test_sparse_checkout_contains_only_service_files(
     assert included in sparse_set
     assert excluded not in sparse_set
     assert (tmp_path / ".git" / "aestron-service").read_text().strip() == service
+
+
+def test_dirty_checkout_is_rejected_by_default(monkeypatch):
+    monkeypatch.delenv("DEPLOY_DISCARD_LOCAL_CHANGES", raising=False)
+    monkeypatch.setattr(
+        deploy_start,
+        "_git",
+        lambda *arguments, **kwargs: " M scripts/deploy_start.py",
+    )
+
+    with pytest.raises(DeploymentError, match="DEPLOY_DISCARD_LOCAL_CHANGES"):
+        _ensure_clean_checkout()
+
+
+def test_explicit_git_authority_discards_only_tracked_changes(monkeypatch, capsys):
+    monkeypatch.setenv("DEPLOY_DISCARD_LOCAL_CHANGES", "1")
+    dirty = True
+    calls = []
+
+    def fake_git(*arguments, label="Git command"):
+        nonlocal dirty
+        calls.append(arguments)
+        if arguments[:1] == ("status",):
+            return " M scripts/deploy_start.py" if dirty else ""
+        if arguments[:2] == ("reset", "--hard"):
+            dirty = False
+        return ""
+
+    monkeypatch.setattr(deploy_start, "_git", fake_git)
+
+    _ensure_clean_checkout()
+
+    assert ("reset", "--hard", "HEAD") in calls
+    assert (
+        "ignored environment and runtime files are preserved" in capsys.readouterr().out
+    )
