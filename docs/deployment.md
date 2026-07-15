@@ -23,6 +23,12 @@ DEPLOY_PIP_PREFIX=.local
 DEPLOY_REQUIRE_SIGNED_COMMITS=0
 ```
 
+The standard Pterodactyl `GIT_ADDRESS` (Git Repo Address) and `BRANCH`
+variables are accepted as fallbacks when `DEPLOY_GIT_REMOTE_URL` and
+`DEPLOY_GIT_BRANCH` are not set. Explicit `DEPLOY_*` values take precedence.
+Repository URLs containing embedded usernames, passwords, or tokens remain
+rejected.
+
 `DEPLOY_GIT_REMOTE` must match a name shown by `git remote`, and
 `DEPLOY_GIT_REMOTE_URL` must exactly match `git remote get-url <name>` apart
 from a trailing slash. Use a

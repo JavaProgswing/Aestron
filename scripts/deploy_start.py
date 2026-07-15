@@ -29,6 +29,9 @@ DEPLOYMENT_ENVIRONMENT_KEYS = frozenset(
         "DEPLOY_PIP_PREFIX",
         "DEPLOY_REQUIRE_SIGNED_COMMITS",
         "FORWARDED_ALLOW_IPS",
+        "GIT_ADDRESS",
+        "GIT_REPO_ADDRESS",
+        "BRANCH",
         "WEBSITE_PORT",
     }
 )
@@ -151,12 +154,20 @@ def _repository_settings() -> tuple[str, str, str]:
         os.getenv("DEPLOY_GIT_REMOTE", "origin"), "DEPLOY_GIT_REMOTE"
     )
     branch = _validate_name(
-        os.getenv("DEPLOY_GIT_BRANCH", "master"), "DEPLOY_GIT_BRANCH"
+        os.getenv("DEPLOY_GIT_BRANCH", "").strip()
+        or os.getenv("BRANCH", "").strip()
+        or "master",
+        "DEPLOY_GIT_BRANCH/BRANCH",
     )
-    expected_url = os.getenv("DEPLOY_GIT_REMOTE_URL", "").strip()
+    expected_url = (
+        os.getenv("DEPLOY_GIT_REMOTE_URL", "").strip()
+        or os.getenv("GIT_ADDRESS", "").strip()
+        or os.getenv("GIT_REPO_ADDRESS", "").strip()
+    )
     if not expected_url:
         raise DeploymentError(
-            "DEPLOY_GIT_REMOTE_URL is required so startup can pin the trusted remote."
+            "Set DEPLOY_GIT_REMOTE_URL in github.env or the Pterodactyl Git "
+            "Repo Address variable so startup can pin the trusted remote."
         )
     _validate_remote_url(expected_url)
     return remote, branch, expected_url

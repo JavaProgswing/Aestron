@@ -70,6 +70,21 @@ def test_pterodactyl_variables_override_github_env(monkeypatch, tmp_path):
     assert deploy_start.os.environ["DEPLOY_GIT_REMOTE"] == "origin"
 
 
+def test_repository_settings_accept_pterodactyl_git_variables(monkeypatch):
+    monkeypatch.delenv("DEPLOY_GIT_REMOTE", raising=False)
+    monkeypatch.delenv("DEPLOY_GIT_REMOTE_URL", raising=False)
+    monkeypatch.delenv("DEPLOY_GIT_BRANCH", raising=False)
+    monkeypatch.delenv("GIT_REPO_ADDRESS", raising=False)
+    monkeypatch.setenv("GIT_ADDRESS", "https://github.com/example/aestron.git")
+    monkeypatch.setenv("BRANCH", "production")
+
+    remote, branch, repository_url = deploy_start._repository_settings()
+
+    assert remote == "origin"
+    assert branch == "production"
+    assert repository_url == "https://github.com/example/aestron.git"
+
+
 def test_uploaded_release_bootstraps_when_auto_update_has_no_git_data(
     monkeypatch, tmp_path, capsys
 ):
