@@ -363,6 +363,180 @@ def coaching_notes(summary: PlayerSummary) -> list[str]:
     return notes[:3]
 
 
+def stats_overview_embed(
+    account: dict[str, Any], summary: PlayerSummary
+) -> discord.Embed:
+    """Build the interactive VALORANT overview card."""
+    embed = discord.Embed(
+        title=f"{account['accountname']}#{account['accounttag']} · recent form",
+        description=(
+            f"Official post-match data from **{summary.matches} matches** and "
+            f"**{summary.rounds} rounds**. This is not a replacement rank."
+        ),
+        color=discord.Color.red(),
+    )
+    embed.add_field(
+        name="Record",
+        value=f"{summary.wins}W · {summary.win_rate:.1f}%",
+        inline=True,
+    )
+    embed.add_field(
+        name="K / D / A",
+        value=(
+            f"{summary.kills} / {summary.deaths} / {summary.assists}\n"
+            f"K/D {summary.kd_ratio:.2f}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Impact",
+        value=f"ACS {summary.acs:.0f}\nADR {summary.adr:.0f}",
+        inline=True,
+    )
+    embed.add_field(
+        name="Headshot hits", value=f"{summary.headshot_rate:.1f}%", inline=True
+    )
+    embed.add_field(
+        name="Opening duels",
+        value=f"{summary.first_kills} won · {summary.first_deaths} lost",
+        inline=True,
+    )
+    embed.set_footer(text="Opt-in Riot data • Use the controls below for context")
+    return embed
+
+
+def coaching_embed(account: dict[str, Any], summary: PlayerSummary) -> discord.Embed:
+    """Build transparent post-match review prompts."""
+    notes = coaching_notes(summary)
+    embed = discord.Embed(
+        title=f"Review plan · {account['accountname']}#{account['accounttag']}",
+        description="\n\n".join(
+            f"**{index}.** {note}" for index, note in enumerate(notes, start=1)
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text="Post-match reflection only • no live tactical advice")
+    return embed
+
+
+def metrics_guide_embed(account: dict[str, Any]) -> discord.Embed:
+    """Explain the aggregates without implying a hidden skill score."""
+    embed = discord.Embed(
+        title=f"Metrics guide · {account['accountname']}#{account['accounttag']}",
+        description=(
+            "These numbers summarize completed matches. Context such as role, "
+            "economy, team plan, and opponent strength still matters."
+        ),
+        color=0x7C5CFC,
+    )
+    embed.add_field(
+        name="ACS / ADR",
+        value="Combat score and damage averaged across played rounds.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Headshot hits",
+        value="Headshots as a share of recorded head, body, and leg hits.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Opening duels",
+        value="Rounds where this player made or received the first kill.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Review prompts",
+        value="Rule-based observations from displayed aggregates—not AI rank or MMR.",
+        inline=False,
+    )
+    return embed
+
+
+class ValorantStatsView(discord.ui.View):
+    """Interactive overview, coaching, and metric explanations."""
+
+    def __init__(
+        self,
+        *,
+        author_id: int,
+        account: dict[str, Any],
+        summary: PlayerSummary,
+        initial_page: str = "overview",
+    ) -> None:
+        """Create a stats panel restricted to the invoking Discord user."""
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.account = account
+        self.summary = summary
+        self.current_page = initial_page
+        self.message: discord.Message | None = None
+        self._refresh_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Prevent other members from replacing the caller's private panel."""
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "Run this command yourself to inspect a VALORANT profile.", ephemeral=True
+        )
+        return False
+
+    def render(self) -> discord.Embed:
+        """Render the active stats page."""
+        if self.current_page == "coaching":
+            return coaching_embed(self.account, self.summary)
+        if self.current_page == "metrics":
+            return metrics_guide_embed(self.account)
+        return stats_overview_embed(self.account, self.summary)
+
+    def _refresh_buttons(self) -> None:
+        self.overview_button.disabled = self.current_page == "overview"
+        self.coaching_button.disabled = self.current_page == "coaching"
+        self.metrics_button.disabled = self.current_page == "metrics"
+
+    async def _show(self, interaction: discord.Interaction, page: str) -> None:
+        self.current_page = page
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.render(), view=self)
+
+    @discord.ui.button(
+        label="Overview", emoji="📊", style=discord.ButtonStyle.secondary
+    )
+    async def overview_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Show recent aggregate performance."""
+        await self._show(interaction, "overview")
+
+    @discord.ui.button(
+        label="Review plan", emoji="🎯", style=discord.ButtonStyle.primary
+    )
+    async def coaching_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Show post-match coaching prompts."""
+        await self._show(interaction, "coaching")
+
+    @discord.ui.button(
+        label="Metrics guide", emoji="ℹ️", style=discord.ButtonStyle.secondary
+    )
+    async def metrics_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Explain displayed values and their limits."""
+        await self._show(interaction, "metrics")
+
+    async def on_timeout(self) -> None:
+        """Disable expired controls while preserving the displayed data."""
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
 class Valorant(commands.Cog):
     """Opt-in VALORANT match summaries and post-match review tools."""
 
@@ -460,41 +634,12 @@ class Valorant(commands.Cog):
         if loaded is None:
             return
         account, summary = loaded
-        embed = discord.Embed(
-            title=f"{account['accountname']}#{account['accounttag']} · recent form",
-            description=(
-                f"Official post-match data from **{summary.matches} matches** and "
-                f"**{summary.rounds} rounds**. This is not a replacement rank."
-            ),
-            color=discord.Color.red(),
+        view = ValorantStatsView(
+            author_id=ctx.author.id,
+            account=account,
+            summary=summary,
         )
-        embed.add_field(
-            name="Record",
-            value=f"{summary.wins}W · {summary.win_rate:.1f}%",
-            inline=True,
-        )
-        embed.add_field(
-            name="K / D / A",
-            value=f"{summary.kills} / {summary.deaths} / {summary.assists}\nK/D {summary.kd_ratio:.2f}",
-            inline=True,
-        )
-        embed.add_field(
-            name="Impact",
-            value=f"ACS {summary.acs:.0f}\nADR {summary.adr:.0f}",
-            inline=True,
-        )
-        embed.add_field(
-            name="Headshot hits", value=f"{summary.headshot_rate:.1f}%", inline=True
-        )
-        embed.add_field(
-            name="Opening duels",
-            value=f"{summary.first_kills} won · {summary.first_deaths} lost",
-            inline=True,
-        )
-        embed.set_footer(
-            text="Only players who linked through Riot Sign On are analyzed."
-        )
-        await ctx.send(embed=embed, ephemeral=True)
+        view.message = await ctx.send(embed=view.render(), view=view, ephemeral=True)
 
     @commands.hybrid_command(
         brief="Turn recent VALORANT stats into review prompts.",
@@ -514,16 +659,13 @@ class Valorant(commands.Cog):
         if loaded is None:
             return
         account, summary = loaded
-        notes = coaching_notes(summary)
-        embed = discord.Embed(
-            title=f"Review plan · {account['accountname']}#{account['accounttag']}",
-            description="\n\n".join(
-                f"**{index}.** {note}" for index, note in enumerate(notes, start=1)
-            ),
-            color=discord.Color.orange(),
+        view = ValorantStatsView(
+            author_id=ctx.author.id,
+            account=account,
+            summary=summary,
+            initial_page="coaching",
         )
-        embed.set_footer(text="Post-match reflection only · no live tactical advice")
-        await ctx.send(embed=embed, ephemeral=True)
+        view.message = await ctx.send(embed=view.render(), view=view, ephemeral=True)
 
 
 def _ratio(numerator: int | float, denominator: int | float) -> float:

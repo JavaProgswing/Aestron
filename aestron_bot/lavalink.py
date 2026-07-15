@@ -35,6 +35,13 @@ class LavalinkService:
         except ValueError:
             self.reconnect_interval = 30
             LOGGER.warning("Invalid LAVALINK_RECONNECT_INTERVAL; using 30 seconds")
+        try:
+            self.ready_timeout = max(
+                1.0, float(os.getenv("LAVALINK_READY_TIMEOUT", "10"))
+            )
+        except ValueError:
+            self.ready_timeout = 10.0
+            LOGGER.warning("Invalid LAVALINK_READY_TIMEOUT; using 10 seconds")
         self._node: wavelink.Node | None = None
         self._connect_lock = asyncio.Lock()
         self._reconnect_task: asyncio.Task[None] | None = None
@@ -113,11 +120,11 @@ class LavalinkService:
                 LOGGER.exception("Lavalink connection attempt raised an exception")
                 return False
 
-            node = self.node
+            node = await self._wait_until_ready()
             if node is None:
                 self.last_error = (
-                    "Node did not become ready. Verify LAVALINK_URI, "
-                    "LAVALINK_PASSWORD, Lavalink v4, and the YouTube source plugin."
+                    f"Node did not become ready within {self.ready_timeout:g} seconds. "
+                    "Verify LAVALINK_URI, LAVALINK_PASSWORD, and Lavalink v4."
                 )
                 LOGGER.warning("Lavalink is unavailable: %s", self.last_error)
                 return False
@@ -135,6 +142,29 @@ class LavalinkService:
                 self.version or "unknown",
             )
             return True
+
+    async def _wait_until_ready(self) -> wavelink.Node | None:
+        """Wait for Lavalink's ready payload after its WebSocket opens."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.ready_timeout
+
+        while loop.time() < deadline:
+            node = self.node
+            if node is not None:
+                return node
+
+            # Wavelink marks a failed or exhausted connection as disconnected.
+            # Waiting longer cannot make that attempt ready; the reconnect loop
+            # will perform the next attempt at its configured interval.
+            if (
+                self._node is not None
+                and self._node.status is wavelink.NodeStatus.DISCONNECTED
+            ):
+                return None
+
+            await asyncio.sleep(0.1)
+
+        return self.node
 
     async def health(self, *, refresh: bool = False) -> dict[str, Any]:
         """Return a small diagnostic snapshot without blocking the bot loop."""

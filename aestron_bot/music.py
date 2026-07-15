@@ -24,6 +24,97 @@ def _track_extra(track: wavelink.Playable, name: str) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def _track_artwork(track: wavelink.Playable) -> str | None:
+    """Return Lavalink artwork with a safe YouTube fallback."""
+    if track.artwork:
+        return track.artwork
+    if track.source == "youtube" and track.identifier:
+        return f"https://i.ytimg.com/vi/{track.identifier}/hqdefault.jpg"
+    return None
+
+
+def _format_duration(milliseconds: int) -> str:
+    """Format a Lavalink duration without microseconds."""
+    if milliseconds <= 0:
+        return "Live"
+    return str(timedelta(milliseconds=milliseconds)).split(".", maxsplit=1)[0]
+
+
+def _now_playing_embed(
+    player: wavelink.Player,
+    track: wavelink.Playable,
+) -> discord.Embed:
+    """Build Aestron's polished, consistent now-playing card."""
+    requester_id = _track_extra(track, "requester_id")
+    source_names = {
+        "youtube": "YouTube",
+        "spotify": "Spotify",
+        "soundcloud": "SoundCloud",
+    }
+    source = source_names.get(track.source, track.source.title() or "Audio")
+    title = discord.utils.escape_markdown(track.title)
+    author = discord.utils.escape_markdown(track.author or "Unknown artist")
+    track_line = f"[**{title}**]({track.uri})" if track.uri else f"**{title}**"
+    embed = discord.Embed(
+        title="Now playing 🎶",
+        description=f"### {track_line}\nby **{author}**",
+        color=0x7C5CFC,
+    )
+    embed.add_field(name="Duration", value=f"`{_format_duration(track.length)}`")
+    embed.add_field(name="Volume", value=f"`{player.volume}%`")
+    embed.add_field(name="Up next", value=f"`{player.queue.count}` track(s)")
+    if requester_id:
+        embed.add_field(
+            name="Requested by",
+            value=f"<@{requester_id}>",
+            inline=False,
+        )
+    artwork = _track_artwork(track)
+    if artwork:
+        embed.set_image(url=artwork)
+    embed.set_footer(text=f"{source} • Use the controls below to manage playback")
+    return embed
+
+
+class VolumeSelect(discord.ui.Select):
+    """Compact volume presets for the now-playing panel."""
+
+    def __init__(self, player: wavelink.Player) -> None:
+        """Create common volume presets for one player."""
+        self.player = player
+        options = [
+            discord.SelectOption(
+                label=f"{level}%",
+                value=str(level),
+                emoji="🔊" if level >= 75 else "🔉",
+                default=player.volume == level,
+            )
+            for level in (25, 50, 75, 100, 125, 150)
+        ]
+        super().__init__(
+            placeholder=f"Volume • {player.volume}%",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """Apply the selected volume and refresh the playback card."""
+        if self.player.current is None:
+            await interaction.response.send_message(
+                "Nothing is currently playing.", ephemeral=True
+            )
+            return
+        level = int(self.values[0])
+        await self.player.set_volume(level)
+        self.placeholder = f"Volume • {level}%"
+        for option in self.options:
+            option.default = option.value == str(level)
+        embed = _now_playing_embed(self.player, self.player.current)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
 class SongPanel(discord.ui.View):
     """Controls for the currently playing Wavelink track."""
 
@@ -32,6 +123,7 @@ class SongPanel(discord.ui.View):
         super().__init__(timeout=timeout)
         self.player = player
         self.message: discord.Message | None = None
+        self.add_item(VolumeSelect(player))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Restrict controls to listeners and channel managers."""
@@ -101,24 +193,26 @@ class SongPanel(discord.ui.View):
         await self.player.skip(force=True)
         await interaction.response.send_message("Skipped the current track.")
 
-    @discord.ui.button(label="Quieter", emoji="🔉", style=discord.ButtonStyle.secondary)
-    async def volume_down_button(
+    @discord.ui.button(label="Queue", emoji="📜", style=discord.ButtonStyle.secondary)
+    async def queue_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        """Lower playback volume by ten percent."""
-        await self.player.set_volume(max(0, self.player.volume - 10))
+        """Show the active and upcoming tracks privately."""
+        current = self.player.current
+        lines = []
+        if current is not None:
+            lines.append(f"**Now:** [{current.title}]({current.uri})")
+        for index, track in enumerate(list(self.player.queue)[:10], start=1):
+            lines.append(f"**{index}.** [{track.title}]({track.uri})")
+        if self.player.queue.count > 10:
+            lines.append(f"…and {self.player.queue.count - 10} more.")
         await interaction.response.send_message(
-            f"Volume set to {self.player.volume}%.", ephemeral=True
-        )
-
-    @discord.ui.button(label="Louder", emoji="🔊", style=discord.ButtonStyle.secondary)
-    async def volume_up_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        """Raise playback volume by ten percent."""
-        await self.player.set_volume(min(150, self.player.volume + 10))
-        await interaction.response.send_message(
-            f"Volume set to {self.player.volume}%.", ephemeral=True
+            embed=discord.Embed(
+                title="Music queue",
+                description="\n".join(lines) or "The queue is empty.",
+                color=0x7C5CFC,
+            ),
+            ephemeral=True,
         )
 
     @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger)
@@ -139,6 +233,14 @@ class Music(commands.Cog):
         """Initialize per-guild playback locks."""
         self.bot = bot
         self._guild_locks: dict[int, asyncio.Lock] = {}
+        self._announced_track_ids: dict[int, str] = {}
+        try:
+            self.voice_connect_timeout = max(
+                15.0, float(os.getenv("MUSIC_VOICE_CONNECT_TIMEOUT", "30"))
+            )
+        except ValueError:
+            self.voice_connect_timeout = 30.0
+            LOGGER.warning("Invalid MUSIC_VOICE_CONNECT_TIMEOUT; using 30 seconds")
 
     @property
     def lavalink(self) -> LavalinkService:
@@ -217,15 +319,31 @@ class Music(commands.Cog):
         try:
             player = await channel.connect(
                 cls=wavelink.Player,
-                timeout=15.0,
+                timeout=self.voice_connect_timeout,
                 reconnect=True,
                 self_deaf=True,
             )
-        except (
-            TimeoutError,
-            discord.ClientException,
-            wavelink.WavelinkException,
-        ) as error:
+        except TimeoutError:
+            player = await self._recover_connected_player(ctx, channel)
+            if player is None:
+                LOGGER.exception(
+                    "Voice connection timed out guild=%s channel=%s timeout=%s",
+                    ctx.guild.id,
+                    channel.id,
+                    self.voice_connect_timeout,
+                )
+                await self._send_error(
+                    ctx,
+                    "Discord did not finish the voice handshake within "
+                    f"{self.voice_connect_timeout:g} seconds. Please try again.",
+                )
+                return None
+            LOGGER.info(
+                "Recovered music player after voice timeout guild=%s channel=%s",
+                ctx.guild.id,
+                channel.id,
+            )
+        except (discord.ClientException, wavelink.WavelinkException) as error:
             LOGGER.exception(
                 "Could not connect to voice channel guild=%s channel=%s",
                 ctx.guild.id,
@@ -262,6 +380,40 @@ class Music(commands.Cog):
             "Connected music player guild=%s channel=%s", ctx.guild.id, channel.id
         )
         return player
+
+    @staticmethod
+    async def _recover_connected_player(
+        ctx: commands.Context,
+        channel: discord.VoiceChannel | discord.StageChannel,
+    ) -> wavelink.Player | None:
+        """Recover a player whose Discord voice handshake completed late."""
+        if ctx.guild is None:
+            return None
+        for _ in range(20):
+            candidate = ctx.guild.voice_client
+            if (
+                isinstance(candidate, wavelink.Player)
+                and candidate.channel == channel
+                and candidate.connected
+            ):
+                return candidate
+            await asyncio.sleep(0.25)
+        return None
+
+    async def _send_now_playing(
+        self,
+        destination: discord.abc.Messageable,
+        player: wavelink.Player,
+        track: wavelink.Playable,
+    ) -> None:
+        """Send one now-playing card and remember the announced track object."""
+        timeout = min(max((track.length / 1000) + 30, 60), 86_400)
+        panel = SongPanel(player, timeout=timeout)
+        panel.message = await destination.send(
+            embed=_now_playing_embed(player, track),
+            view=panel,
+        )
+        self._announced_track_ids[player.guild.id] = track.identifier
 
     @commands.hybrid_command(
         aliases=["p"],
@@ -336,11 +488,15 @@ class Music(commands.Cog):
                 await player.queue.put_wait(track)
                 description = f"Queued **[{track.title}]({track.uri})**."
 
+            started_track: wavelink.Playable | None = None
             if not player.playing and player.current is None:
                 next_track = player.queue.get()
+                self._announced_track_ids[ctx.guild.id] = next_track.identifier
                 try:
                     await player.play(next_track)
+                    started_track = next_track
                 except wavelink.WavelinkException as error:
+                    self._announced_track_ids.pop(ctx.guild.id, None)
                     player.queue.put_at(0, next_track)
                     LOGGER.exception(
                         "Lavalink rejected playback guild=%s query=%r",
@@ -354,13 +510,24 @@ class Music(commands.Cog):
                     )
                     return
 
-            embed = discord.Embed(
-                title="Added to queue",
-                description=description,
-                color=discord.Color.green(),
-            )
-            embed.set_footer(text=f"Requested by {ctx.author.display_name}")
-            await ctx.send(embed=embed)
+            if started_track is not None:
+                await self._send_now_playing(ctx, player, started_track)
+            else:
+                embed = discord.Embed(
+                    title="Added to queue",
+                    description=description,
+                    color=0x7C5CFC,
+                )
+                avatar = getattr(ctx.author, "display_avatar", None)
+                if avatar:
+                    embed.set_author(
+                        name=ctx.author.display_name,
+                        icon_url=str(avatar),
+                    )
+                else:
+                    embed.set_author(name=ctx.author.display_name)
+                embed.set_footer(text=f"{player.queue.count} track(s) waiting")
+                await ctx.send(embed=embed)
 
     @commands.hybrid_command(
         aliases=["next"],
@@ -553,26 +720,23 @@ class Music(commands.Cog):
             LOGGER.warning("No text channel found for started track %s", track.title)
             return
 
-        embed = discord.Embed(
-            title=track.title,
-            url=track.uri,
-            description=f"By **{track.author or 'Unknown artist'}**",
-            color=discord.Color.green(),
-        )
-        requester_id = _track_extra(track, "requester_id")
-        if requester_id:
-            embed.set_footer(text=f"Requested by user {requester_id}")
-        if track.artwork:
-            embed.set_image(url=track.artwork)
-        timeout = min(max((track.length / 1000) + 30, 60), 86_400)
-        panel = SongPanel(player, timeout=timeout)
-        panel.message = await channel.send(embed=embed, view=panel)
+        if self._announced_track_ids.get(player.guild.id) != track.identifier:
+            await self._send_now_playing(channel, player, track)
         LOGGER.info(
             "Started track guild=%s title=%r source=%s",
             player.guild.id,
             track.title,
             track.source,
         )
+
+    @commands.Cog.listener()
+    async def on_wavelink_track_end(
+        self, payload: wavelink.TrackEndEventPayload
+    ) -> None:
+        """Allow repeated tracks to receive a fresh now-playing panel."""
+        player = payload.player
+        if player is not None:
+            self._announced_track_ids.pop(player.guild.id, None)
 
     @commands.Cog.listener()
     async def on_wavelink_track_exception(

@@ -49,6 +49,11 @@ from aestron_bot import (
 )
 from aestron_bot.calculator import evaluate_expression
 from aestron_bot.feedback import Feedback as ModernFeedback
+from aestron_bot.help_ui import (
+    HelpCategory,
+    InteractiveHelpView,
+    build_command_help_embed,
+)
 from aestron_bot.moderation import Moderation as ModernModeration
 from aestron_bot.music import Music as ModernMusic
 from aestron_bot.valorant import Valorant as ModernValorant
@@ -277,6 +282,7 @@ class MyHelp(commands.HelpCommand):
             color=discord.Color.blurple(),
         )
         command_count = 0
+        categories: list[HelpCategory] = []
         for cog, cog_commands in mapping.items():
             visible = await self.filter_commands(cog_commands, sort=True)
             if not visible:
@@ -286,6 +292,13 @@ class MyHelp(commands.HelpCommand):
             summary = (
                 cog.description if cog is not None else "Other commands"
             ) or "Commands"
+            categories.append(
+                HelpCategory(
+                    name=category,
+                    description=summary,
+                    commands=tuple(visible),
+                )
+            )
             embed.add_field(
                 name=f"{category} ({len(visible)})",
                 value=summary.splitlines()[0][:180],
@@ -299,20 +312,19 @@ class MyHelp(commands.HelpCommand):
             inline=False,
         )
         self.set_footer(embed)
-        await self.context.send(embed=embed)
+        view = InteractiveHelpView(
+            bot=self.context.bot,
+            author_id=getattr(self.context.author, "id", 0),
+            prefix=prefix,
+            home_embed=embed,
+            categories=categories,
+        )
+        view.message = await self.context.send(embed=embed, view=view)
 
     # !help <command>
     async def send_command_help(self, commandname):
         command = commandname
-        embed = discord.Embed(
-            title=f"{command.qualified_name} help",
-            description=command.help or command.description,
-            color=discord.Color.blurple(),
-        )
-        invocation = command_invocation(command, self.context.clean_prefix)
-        aliases = ", ".join(f"`{alias}`" for alias in command.aliases) or "None"
-        embed.add_field(name="Usage", value=f"`{invocation}`", inline=False)
-        embed.add_field(name="Aliases", value=aliases, inline=False)
+        embed = build_command_help_embed(command, self.context.clean_prefix)
         channel = self.get_destination()
         self.set_footer(embed)
         usage_path = Path(f"resources/command_usages/{command.name}.gif")
@@ -332,12 +344,13 @@ class MyHelp(commands.HelpCommand):
     # !help <group>
     async def send_group_help(self, commandname):
         command = commandname
+        visible = await self.filter_commands(command.commands, sort=True)
         embed = discord.Embed(
             title=f"{command.qualified_name} help",
             description=command.help or command.description,
-            color=discord.Color.blurple(),
+            color=0x7C5CFC,
         )
-        for c in command.commands:
+        for c in visible[:8]:
             embed.add_field(
                 name=command_invocation(c, self.context.clean_prefix),
                 value=c.brief,
@@ -345,41 +358,49 @@ class MyHelp(commands.HelpCommand):
             )
         channel = self.get_destination()
         self.set_footer(embed)
-        await channel.send(embed=embed)
+        category = HelpCategory(
+            name=command.qualified_name,
+            description=command.help or command.description,
+            commands=tuple(visible),
+        )
+        view = InteractiveHelpView(
+            bot=self.context.bot,
+            author_id=getattr(self.context.author, "id", 0),
+            prefix=self.context.clean_prefix,
+            home_embed=embed,
+            categories=[category],
+            initial_category=category.name,
+        )
+        view.message = await channel.send(embed=view.render(), view=view)
 
     # !help <cog>
     async def send_cog_help(self, cog):
         visible = await self.filter_commands(cog.get_commands(), sort=True)
-        pages = []
-
-        def new_page():
-            return discord.Embed(
-                title=f"{cog.qualified_name} help",
-                description=cog.description or "Commands in this category.",
-                color=discord.Color.blurple(),
-            )
-
-        embed = new_page()
-        for command in visible:
-            name = command_invocation(command, self.context.clean_prefix)
-            value = command.brief
-            if embed.fields and (
-                len(embed.fields) == 25 or len(embed) + len(name) + len(value) > 5600
-            ):
-                pages.append(embed)
-                embed = new_page()
-            embed.add_field(name=name, value=value, inline=False)
-        if embed.fields:
-            pages.append(embed)
-        for index, embed in enumerate(pages, start=1):
-            self.set_footer(embed, f"Page {index}/{len(pages)}")
-        if not pages:
+        if not visible:
             await self.context.send(
                 "No commands in this category are available to you."
             )
             return
-        for page in pages:
-            await self.context.send(embed=page)
+        category = HelpCategory(
+            name=cog.qualified_name,
+            description=cog.description or "Commands in this category.",
+            commands=tuple(visible),
+        )
+        home_embed = discord.Embed(
+            title=f"{cog.qualified_name} help",
+            description=category.description,
+            color=0x7C5CFC,
+        )
+        self.set_footer(home_embed)
+        view = InteractiveHelpView(
+            bot=self.context.bot,
+            author_id=getattr(self.context.author, "id", 0),
+            prefix=self.context.clean_prefix,
+            home_embed=home_embed,
+            categories=[category],
+            initial_category=category.name,
+        )
+        view.message = await self.context.send(embed=view.render(), view=view)
 
 
 async def addmoney(ctx, userid, money):

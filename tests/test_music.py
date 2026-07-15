@@ -22,6 +22,13 @@ class FakeQueue:
     def put_at(self, index, track):
         self.tracks.insert(index, track)
 
+    def __iter__(self):
+        return iter(self.tracks)
+
+    @property
+    def count(self):
+        return len(self.tracks)
+
 
 def test_play_searches_queues_and_starts_track(monkeypatch):
     async def run_test():
@@ -36,6 +43,11 @@ def test_play_searches_queues_and_starts_track(monkeypatch):
             title="Test Track",
             uri="https://example.com/track",
             extras=None,
+            identifier="test-track",
+            author="Test Artist",
+            source="youtube",
+            length=180_000,
+            artwork="https://example.com/artwork.jpg",
         )
         search = AsyncMock(return_value=[track])
         monkeypatch.setattr(wavelink.Playable, "search", search)
@@ -45,6 +57,8 @@ def test_play_searches_queues_and_starts_track(monkeypatch):
             playing=False,
             current=None,
             play=AsyncMock(),
+            guild=SimpleNamespace(id=123),
+            volume=75,
         )
         cog._get_player = AsyncMock(return_value=player)
         ctx = SimpleNamespace(
@@ -63,6 +77,10 @@ def test_play_searches_queues_and_starts_track(monkeypatch):
         player.play.assert_awaited_once_with(track)
         assert track.extras == {"requester_id": 456, "text_channel_id": 789}
         ctx.send.assert_awaited_once()
+        sent_embed = ctx.send.await_args.kwargs["embed"]
+        assert sent_embed.title == "Now playing 🎶"
+        assert "Test Track" in sent_embed.description
+        assert ctx.send.await_args.kwargs["view"] is not None
 
     asyncio.run(run_test())
 
@@ -97,6 +115,7 @@ def test_play_restores_track_and_reports_lavalink_playback_failure(monkeypatch):
             title="Broken Track",
             uri="https://example.com/broken",
             extras=None,
+            identifier="broken-track",
         )
         monkeypatch.setattr(
             wavelink.Playable, "search", AsyncMock(return_value=[track])
@@ -163,6 +182,39 @@ def test_lavalink_service_reports_an_unready_pool(monkeypatch):
         assert service.connected is False
         assert "did not become ready" in service.last_error
         connect.assert_awaited_once()
+        await service.close()
+
+    asyncio.run(run_test())
+
+
+def test_lavalink_waits_for_ready_payload_after_websocket_connect(monkeypatch):
+    async def run_test():
+        monkeypatch.setenv("LAVALINK_PASSWORD", "test-password")
+        monkeypatch.setenv("LAVALINK_READY_TIMEOUT", "1")
+        await wavelink.Pool.close()
+
+        async def connect(*, nodes, client):
+            node = next(iter(nodes))
+            node._status = wavelink.NodeStatus.CONNECTING
+
+            async def receive_ready_payload():
+                await asyncio.sleep(0.01)
+                node._status = wavelink.NodeStatus.CONNECTED
+
+            asyncio.create_task(receive_ready_payload())
+            return {}
+
+        monkeypatch.setattr(wavelink.Pool, "connect", connect)
+        monkeypatch.setattr(
+            wavelink.Node,
+            "fetch_version",
+            AsyncMock(return_value="4.1.1"),
+        )
+        service = LavalinkService(SimpleNamespace())
+
+        assert await service.ensure_connected() is True
+        assert service.connected is True
+        assert service.version == "4.1.1"
         await service.close()
 
     asyncio.run(run_test())

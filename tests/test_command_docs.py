@@ -12,6 +12,11 @@ from aestron_bot.command_docs import (
     infer_usage,
     normalize_command_metadata,
 )
+from aestron_bot.help_ui import (
+    HelpCategorySelect,
+    HelpCommandSelect,
+    InteractiveHelpView,
+)
 
 
 def test_usage_is_inferred_from_required_optional_and_keyword_parameters():
@@ -105,11 +110,17 @@ def test_every_registered_command_has_complete_documentation():
 
             await help_renderer.send_bot_help(help_renderer.get_bot_mapping())
             bot_help = channel.send.await_args.kwargs["embed"]
+            bot_help_view = channel.send.await_args.kwargs["view"]
             assert bot_help.title == "Aestron help"
             assert any(field.name.startswith("Music") for field in bot_help.fields)
             assert any(field.name.startswith("Statistics") for field in bot_help.fields)
             assert len(bot_help.fields) <= 25
             assert len(bot_help) <= 6000
+            assert isinstance(bot_help_view, InteractiveHelpView)
+            assert any(
+                isinstance(item, HelpCategorySelect)
+                for item in bot_help_view.children
+            )
 
             channel.send.reset_mock()
             await help_renderer.send_command_help(bot.get_command("play"))
@@ -125,6 +136,10 @@ def test_every_registered_command_has_complete_documentation():
                 category_help = call.kwargs["embed"]
                 assert len(category_help.fields) <= 25
                 assert len(category_help) <= 6000
+                assert any(
+                    isinstance(item, HelpCommandSelect)
+                    for item in call.kwargs["view"].children
+                )
 
             custom_cog = bot.get_cog("CustomCommands")
             command_count = len(list(bot.walk_commands()))

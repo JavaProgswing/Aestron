@@ -81,7 +81,7 @@ class WebsiteSettings:
             host.strip()
             for host in values.get(
                 "AESTRON_ALLOWED_HOSTS",
-                "valorant.yashasviallen.is-a.dev,localhost,127.0.0.1,testserver",
+                "aestron.yashasviallen.is-a.dev,localhost,127.0.0.1,testserver",
             ).split(",")
             if host.strip()
         )

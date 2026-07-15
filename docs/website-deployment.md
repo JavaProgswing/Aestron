@@ -6,13 +6,13 @@ The site is one FastAPI service: the generalized Aestron product is served at
 
 ## Public URLs
 
-- Product URL: `https://valorant.yashasviallen.is-a.dev/`
-- Bot dashboard: `https://valorant.yashasviallen.is-a.dev/dashboard`
-- VALORANT product: `https://valorant.yashasviallen.is-a.dev/valorant`
-- VALORANT prototype: `https://valorant.yashasviallen.is-a.dev/valorant/dashboard`
-- API discovery: `https://valorant.yashasviallen.is-a.dev/api/`
-- API documentation: `https://valorant.yashasviallen.is-a.dev/api/docs`
-- Riot redirect URI: `https://valorant.yashasviallen.is-a.dev/auth/riot/callback`
+- Product URL: `https://aestron.yashasviallen.is-a.dev/`
+- Bot dashboard: `https://aestron.yashasviallen.is-a.dev/dashboard`
+- VALORANT product: `https://aestron.yashasviallen.is-a.dev/valorant`
+- VALORANT prototype: `https://aestron.yashasviallen.is-a.dev/valorant/dashboard`
+- API discovery: `https://aestron.yashasviallen.is-a.dev/api/`
+- API documentation: `https://aestron.yashasviallen.is-a.dev/api/docs`
+- Riot redirect URI: `https://aestron.yashasviallen.is-a.dev/auth/riot/callback`
 
 The base product, terms, and privacy policy cover the complete Discord bot.
 Riot-specific consent, policy constraints, and legal text appear in the
@@ -35,7 +35,7 @@ Keep `AESTRON_SITE_BASE_URL` empty in the bot `.env` until the public health,
 privacy, terms, and RSO flow have been verified. After deployment, set:
 
 ```dotenv
-AESTRON_SITE_BASE_URL=https://valorant.yashasviallen.is-a.dev
+AESTRON_SITE_BASE_URL=https://aestron.yashasviallen.is-a.dev
 AESTRON_SERVICE_TOKEN=the-exact-token-from-website.env
 ```
 

@@ -1,4 +1,9 @@
-from aestron_bot.valorant import coaching_notes, summarize_matches
+from aestron_bot.valorant import (
+    ValorantStatsView,
+    coaching_notes,
+    stats_overview_embed,
+    summarize_matches,
+)
 
 
 def _match(*, won: bool = True):
@@ -110,3 +115,23 @@ def test_missing_player_or_empty_matches_are_safe():
     assert coaching_notes(summary) == [
         "Play a supported match, then run this command again."
     ]
+
+
+def test_stats_panel_restores_interactive_drill_downs():
+    summary = summarize_matches([_match()], "player-1")
+    account = {"accountname": "Player", "accounttag": "AP"}
+    view = ValorantStatsView(
+        author_id=123,
+        account=account,
+        summary=summary,
+    )
+
+    overview = stats_overview_embed(account, summary)
+    assert overview.title == "Player#AP · recent form"
+    assert len(view.children) == 3
+    assert view.overview_button.disabled is True
+
+    view.current_page = "coaching"
+    view._refresh_buttons()
+    assert view.render().title == "Review plan · Player#AP"
+    assert view.coaching_button.disabled is True
