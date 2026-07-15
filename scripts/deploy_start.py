@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator, Sequence
@@ -31,6 +32,25 @@ DEPLOYMENT_ENVIRONMENT_KEYS = frozenset(
         "WEBSITE_PORT",
     }
 )
+COMMON_SPARSE_PATHS = (
+    "/.gitignore",
+    "/runtime_info.py",
+    "/scripts/deploy_start.py",
+)
+SERVICE_SPARSE_PATHS = {
+    "bot": (
+        *COMMON_SPARSE_PATHS,
+        "/main.py",
+        "/aestron_bot/",
+        "/resources/",
+        "/requirements.txt",
+    ),
+    "website": (
+        *COMMON_SPARSE_PATHS,
+        "/website/",
+        "/requirements-web.txt",
+    ),
+}
 
 
 class DeploymentError(RuntimeError):
@@ -125,11 +145,8 @@ def _validate_name(value: str, variable: str) -> str:
     return value
 
 
-def _update_repository() -> tuple[str, str, str, bool]:
-    """Fetch and apply only a verified, clean fast-forward update."""
-    if not (ROOT / ".git").is_dir():
-        raise DeploymentError("AUTO_UPDATE requires a Git checkout with .git data.")
-
+def _repository_settings() -> tuple[str, str, str]:
+    """Return the validated remote name, branch, and pinned repository URL."""
     remote = _validate_name(
         os.getenv("DEPLOY_GIT_REMOTE", "origin"), "DEPLOY_GIT_REMOTE"
     )
@@ -142,6 +159,39 @@ def _update_repository() -> tuple[str, str, str, bool]:
             "DEPLOY_GIT_REMOTE_URL is required so startup can pin the trusted remote."
         )
     _validate_remote_url(expected_url)
+    return remote, branch, expected_url
+
+
+def _configure_sparse_checkout(service: str) -> None:
+    """Materialize only files required by one independently deployed service."""
+    paths = SERVICE_SPARSE_PATHS[service]
+    marker = ROOT / ".git" / "aestron-service"
+    if marker.is_file():
+        configured_service = marker.read_text(encoding="utf-8").strip()
+        if configured_service and configured_service != service:
+            raise DeploymentError(
+                "This checkout is already assigned to the "
+                f"{configured_service} service; bot and website need separate "
+                "Pterodactyl servers/checkouts."
+            )
+
+    _git("sparse-checkout", "init", "--no-cone", label="Git sparse checkout init")
+    _git(
+        "sparse-checkout",
+        "set",
+        "--no-cone",
+        *paths,
+        label=f"Git {service} sparse checkout",
+    )
+    marker.write_text(f"{service}\n", encoding="utf-8")
+
+
+def _update_repository(service: str) -> tuple[str, str, str, bool]:
+    """Fetch and apply only a verified, clean fast-forward update."""
+    if not (ROOT / ".git").is_dir():
+        raise DeploymentError("AUTO_UPDATE requires a Git checkout with .git data.")
+
+    remote, branch, expected_url = _repository_settings()
 
     actual_url = _git("remote", "get-url", remote, label="Git remote lookup")
     _validate_remote_url(actual_url)
@@ -159,6 +209,7 @@ def _update_repository() -> tuple[str, str, str, bool]:
         raise DeploymentError(
             "Tracked files are modified; refusing to overwrite local deployment changes."
         )
+    _configure_sparse_checkout(service)
 
     before = _git("rev-parse", "HEAD", label="Git revision lookup")
     _git("fetch", "--quiet", "--no-tags", remote, branch, label="Git fetch")
@@ -183,6 +234,72 @@ def _update_repository() -> tuple[str, str, str, bool]:
     return fetched, branch, version, changed
 
 
+def _bootstrap_repository(service: str) -> tuple[str, str, str, bool]:
+    """Convert an uploaded release into a checkout from the pinned remote."""
+    remote, branch, expected_url = _repository_settings()
+    RUNTIME_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    bootstrap_directory = RUNTIME_DIRECTORY / "git-bootstrap"
+    if bootstrap_directory.exists():
+        raise DeploymentError(
+            "The previous Git bootstrap directory still exists; remove "
+            "runtime/git-bootstrap after checking the failed startup."
+        )
+
+    print(
+        "AUTO_UPDATE is enabled without .git data; creating a checkout from "
+        "the pinned remote.",
+        flush=True,
+    )
+    _run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            "--filter=blob:none",
+            "--single-branch",
+            "--branch",
+            branch,
+            "--origin",
+            remote,
+            expected_url,
+            str(bootstrap_directory),
+        ],
+        label="Git bootstrap clone",
+    )
+    cloned_metadata = bootstrap_directory / ".git"
+    if not cloned_metadata.is_dir():
+        raise DeploymentError("The Git bootstrap did not produce checkout metadata.")
+
+    shutil.move(str(cloned_metadata), str(ROOT / ".git"))
+    shutil.rmtree(bootstrap_directory)
+
+    actual_url = _git("remote", "get-url", remote, label="Git remote lookup")
+    if actual_url.rstrip("/") != expected_url.rstrip("/"):
+        raise DeploymentError(
+            "The bootstrapped Git remote does not match the pinned URL."
+        )
+    fetched = _git(
+        "rev-parse", f"{remote}/{branch}", label="Bootstrapped revision lookup"
+    )
+    if _enabled("DEPLOY_REQUIRE_SIGNED_COMMITS", False):
+        _git("verify-commit", fetched, label="Git commit signature verification")
+
+    # AUTO_UPDATE explicitly makes the pinned repository authoritative for source
+    # files. Ignored deployment secrets such as .env and website.env are retained.
+    _configure_sparse_checkout(service)
+    _git(
+        "checkout",
+        "--force",
+        "-B",
+        branch,
+        fetched,
+        label="Git bootstrap checkout",
+    )
+    version = _git("describe", "--tags", "--always", label="Git version lookup")
+    return fetched, branch, version, True
+
+
 def _current_repository_info() -> tuple[str, str, str, bool]:
     """Read local version metadata when automatic updates are disabled."""
     if not (ROOT / ".git").is_dir():
@@ -191,6 +308,15 @@ def _current_repository_info() -> tuple[str, str, str, bool]:
     branch = _git("rev-parse", "--abbrev-ref", "HEAD", label="Git branch lookup")
     version = _git("describe", "--tags", "--always", label="Git version lookup")
     return commit, branch, version, False
+
+
+def _prepare_repository(service: str) -> tuple[str, str, str, bool]:
+    """Update an existing checkout or securely bootstrap an uploaded release."""
+    if not _enabled("AUTO_UPDATE", True):
+        return _current_repository_info()
+    if (ROOT / ".git").is_dir():
+        return _update_repository(service)
+    return _bootstrap_repository(service)
 
 
 def _sha256(path: Path) -> str:
@@ -338,10 +464,7 @@ def main() -> int:
         state_path = RUNTIME_DIRECTORY / f"deployment-{args.service}.json"
         with _deployment_lock():
             previous_state = _read_state(state_path)
-            if _enabled("AUTO_UPDATE", True):
-                commit, branch, version, changed = _update_repository()
-            else:
-                commit, branch, version, changed = _current_repository_info()
+            commit, branch, version, changed = _prepare_repository(args.service)
             requirement_hash = _install_dependencies(args.service, previous_state)
             _write_state(
                 state_path,

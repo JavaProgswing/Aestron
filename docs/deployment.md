@@ -73,3 +73,32 @@ log also prints the short commit before replacing the bootstrap process.
 For development without a fetch, set `AUTO_UPDATE=0`; regular direct commands
 such as `python main.py` and `python -m uvicorn website.main:app ...` remain
 available and report a development/unknown deployment version.
+
+An installation uploaded through the Pterodactyl file manager initially has no
+`.git` metadata. When `AUTO_UPDATE=1`, the bootstrap clones the pinned remote's
+configured branch without checking it out in the temporary `runtime` directory,
+moves the validated Git metadata into place, and checks out that revision over
+the uploaded source. Ignored deployment files such as `.env`, `database.env`,
+`website.env`, `github.env`, `.local`, and `runtime` remain local. Every later
+start uses the same clean, fast-forward-only update checks as a normal clone.
+Set `AUTO_UPDATE=0` when intentionally running manually modified source files.
+
+## Service-specific files
+
+Each Pterodactyl service uses a separate partial clone and Git sparse checkout.
+Unused file blobs are not downloaded for a new deployment, and the complete
+monorepo is not materialized on both servers:
+
+- Website: `website/`, `runtime_info.py`, `scripts/deploy_start.py`, and
+  `requirements-web.txt`.
+- Bot: `main.py`, `aestron_bot/`, `resources/`, `runtime_info.py`,
+  `scripts/deploy_start.py`, and `requirements.txt`.
+
+The legal documents, templates, CSS, and JavaScript are contained inside
+`website/`. Bot image, audio, command-usage, and VALORANT data files are inside
+`resources/`. Root deployment environment files remain ignored and local.
+
+Do not run both services from one checkout: sparse working trees are mutually
+exclusive. The launcher records the assigned service inside `.git` and refuses
+to switch it accidentally. Use one Pterodactyl server for the website and a
+second Pterodactyl server for the Discord bot.

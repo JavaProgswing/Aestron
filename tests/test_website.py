@@ -1,10 +1,15 @@
+import asyncio
+import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
 
+import pytest
 from fastapi.testclient import TestClient
 
 from website.config import WebsiteSettings
-from website.main import create_app
+from website.main import SensitiveAccessLogFilter, create_app
+from website.riot import RiotAPIError, RiotRSOClient
 from website.security import validate_oauth_state
 
 SERVICE_TOKEN = "service-secret-with-at-least-thirty-two-characters"
@@ -88,8 +93,8 @@ class FakeRiotClient:
         assert access_token == "transient-token"
         return {"puuid": "puuid-1", "gameName": "Player", "tagLine": "TEST"}
 
-    async def active_shard(self, access_token, puuid):
-        assert (access_token, puuid) == ("transient-token", "puuid-1")
+    async def active_shard(self, puuid):
+        assert puuid == "puuid-1"
         return "ap"
 
     async def close(self):
@@ -105,6 +110,7 @@ def _settings():
             "AESTRON_STATE_SECRET": "state-secret-long-enough-for-tests",
             "RIOT_RSO_CLIENT_ID": "client-id",
             "RIOT_RSO_CLIENT_SECRET": "client-secret",
+            "VAL_API_TOKEN": "product-api-key",
             "RIOT_RSO_CLUSTER": "asia",
             "AESTRON_ALLOWED_HOSTS": "testserver",
         }
@@ -157,6 +163,21 @@ def test_api_discovery_health_and_private_service_auth():
     assert validate_oauth_state(state, _settings().state_secret) == 123
 
 
+def test_linking_requires_the_separate_product_api_key():
+    settings = replace(_settings(), riot_api_key=None)
+    app = create_app(settings, database=FakeDatabase(), riot_client=FakeRiotClient())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/oauth/link",
+            headers={"X-Aestron-Service-Token": SERVICE_TOKEN},
+            json={"discord_user_id": 123},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Riot account linking is not fully configured."
+
+
 def test_oauth_callback_stores_identity_and_shard_but_no_token():
     client, database = _client()
     with client:
@@ -179,6 +200,115 @@ def test_oauth_callback_stores_identity_and_shard_but_no_token():
         "region": "ap",
     }
     assert "token" not in repr(database.account).lower()
+
+
+def test_oauth_callback_query_is_redacted_from_access_logs():
+    record = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        __file__,
+        1,
+        '%s - "%s %s HTTP/%s" %d',
+        (
+            "127.0.0.1:1234",
+            "GET",
+            "/auth/riot/callback?code=secret-code&state=signed-state",
+            "1.1",
+            200,
+        ),
+        None,
+    )
+
+    assert SensitiveAccessLogFilter().filter(record) is True
+    assert record.args[2] == "/auth/riot/callback?<redacted>"
+    assert "secret-code" not in record.getMessage()
+    assert "signed-state" not in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    [
+        (401, "RSO client credentials"),
+        (400, "expired or reused"),
+        (503, "token exchange (503)"),
+    ],
+)
+def test_riot_token_exchange_returns_actionable_sanitized_errors(status_code, message):
+    class FakeResponse:
+        status = status_code
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeSession:
+        closed = False
+
+        def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    async def exchange():
+        client = RiotRSOClient(
+            client_id="client-id",
+            client_secret="client-secret",
+            api_key="product-api-key",
+            redirect_uri="https://example.com/auth/riot/callback",
+            cluster="asia",
+            session=FakeSession(),
+        )
+        with pytest.raises(RiotAPIError) as captured:
+            await client.exchange_code("single-use-code")
+        assert message in str(captured.value)
+
+    asyncio.run(exchange())
+
+
+def test_active_shard_uses_product_key_header_not_query_string():
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def json(self):
+            return {
+                "puuid": "player/one",
+                "game": "val",
+                "activeShard": "ap",
+            }
+
+    class FakeSession:
+        closed = False
+        url = None
+        headers = None
+
+        def get(self, url, *, headers, timeout):
+            self.url = url
+            self.headers = headers
+            return FakeResponse()
+
+    async def resolve():
+        session = FakeSession()
+        client = RiotRSOClient(
+            client_id="client-id",
+            client_secret="client-secret",
+            api_key="product-api-key",
+            redirect_uri="https://example.com/auth/riot/callback",
+            cluster="asia",
+            session=session,
+        )
+
+        assert await client.active_shard("player/one") == "ap"
+        assert session.headers == {"X-Riot-Token": "product-api-key"}
+        assert "api_key" not in session.url
+        assert session.url.endswith("/player%2Fone")
+
+    asyncio.run(resolve())
 
 
 def test_feedback_validation_sources_and_admin_auth():

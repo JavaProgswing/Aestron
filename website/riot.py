@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 
@@ -23,6 +23,7 @@ class RiotRSOClient:
         *,
         client_id: str | None,
         client_secret: str | None,
+        api_key: str | None,
         redirect_uri: str,
         cluster: str,
         session: aiohttp.ClientSession | None = None,
@@ -30,6 +31,7 @@ class RiotRSOClient:
         """Configure the approved RSO client and routing cluster."""
         self.client_id = client_id
         self.client_secret = client_secret
+        self.api_key = api_key
         self.redirect_uri = redirect_uri
         self.cluster = cluster
         self.session = session
@@ -60,7 +62,9 @@ class RiotRSOClient:
         if not self.configured:
             raise RiotAPIError("Riot Sign On is not configured.")
         session = await self._get_session()
-        auth = aiohttp.BasicAuth(self.client_id or "", self.client_secret or "")
+        authorization = aiohttp.encode_basic_auth(
+            self.client_id or "", self.client_secret or ""
+        )
         data = {
             "grant_type": "authorization_code",
             "code": code,
@@ -69,12 +73,22 @@ class RiotRSOClient:
         async with session.post(
             self.token_endpoint,
             data=data,
-            auth=auth,
+            headers={"Authorization": authorization},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as response:
             if response.status != 200:
+                if response.status == 401:
+                    raise RiotAPIError(
+                        "Riot rejected the RSO client credentials (401). Verify "
+                        "RIOT_RSO_CLIENT_ID and the separate RSO client secret."
+                    )
+                if response.status == 400:
+                    raise RiotAPIError(
+                        "Riot rejected the one-time code (400). It may be expired "
+                        "or reused, or RIOT_RSO_REDIRECT_URI may not exactly match."
+                    )
                 raise RiotAPIError(
-                    f"Riot rejected the authorization code ({response.status})."
+                    f"Riot rejected the token exchange ({response.status})."
                 )
             payload = await response.json()
         if not payload.get("access_token"):
@@ -103,24 +117,30 @@ class RiotRSOClient:
             raise RiotAPIError("Riot returned an incomplete account response.")
         return payload
 
-    async def active_shard(self, access_token: str, puuid: str) -> str:
-        """Resolve the platform routing shard while the RSO token is transient."""
+    async def active_shard(self, puuid: str) -> str:
+        """Resolve VALORANT routing with the separate Riot product API key."""
+        if not self.api_key:
+            raise RiotAPIError("The Riot product API key is not configured.")
         session = await self._get_session()
         endpoint = (
             f"https://{self.cluster}.api.riotgames.com/riot/account/v1/"
-            f"active-shards/by-game/val/by-puuid/{puuid}"
+            f"active-shards/by-game/val/by-puuid/{quote(puuid, safe='')}"
         )
         async with session.get(
             endpoint,
-            headers={"Authorization": f"Bearer {access_token}"},
+            headers={"X-Riot-Token": self.api_key},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as response:
+            if response.status in {401, 403}:
+                raise RiotAPIError(
+                    "Riot rejected the product API key during shard lookup."
+                )
             if response.status != 200:
                 raise RiotAPIError(
                     f"Riot could not resolve the account shard ({response.status})."
                 )
             payload = await response.json()
-        shard = str(payload.get("activeShard") or "").lower()
+        shard = str(payload.get("activeShard") or "").casefold()
         if shard not in {"ap", "br", "eu", "kr", "latam", "na"}:
             raise RiotAPIError("Riot returned an unsupported account shard.")
         return shard

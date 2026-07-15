@@ -31,6 +31,12 @@ RSO `client_id` and `client_secret`. The redirect URI registered in the Riot
 Developer Portal must exactly match the HTTPS callback above. A development API
 key is not suitable for a public production product and may expire.
 
+Set `VAL_API_TOKEN` to the separate Riot product API key authorized for
+ACCOUNT-V1 and VAL-MATCH-V1. It is not the RSO client secret. Aestron uses the
+RSO access token only for `/riot/account/v1/accounts/me`, then sends the product
+key through the `X-Riot-Token` header for active-shard lookup so the credential
+never appears in a URL.
+
 Keep `AESTRON_SITE_BASE_URL` empty in the bot `.env` until the public health,
 privacy, terms, and RSO flow have been verified. After deployment, set:
 

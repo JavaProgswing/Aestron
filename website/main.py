@@ -41,6 +41,38 @@ BASE_DIRECTORY = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=BASE_DIRECTORY / "templates")
 
 
+class SensitiveAccessLogFilter(logging.Filter):
+    """Remove OAuth credentials from Uvicorn request-target logging."""
+
+    sensitive_paths = ("/auth/riot/callback",)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Redact the query string while preserving method, path, and status."""
+        if not isinstance(record.args, tuple) or len(record.args) < 3:
+            return True
+        arguments = list(record.args)
+        request_target = str(arguments[2])
+        for path in self.sensitive_paths:
+            if request_target.startswith(f"{path}?"):
+                arguments[2] = f"{path}?<redacted>"
+                record.args = tuple(arguments)
+                break
+        return True
+
+
+def _install_access_log_filter() -> None:
+    """Install one process-wide filter after Uvicorn configures its logger."""
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(
+        isinstance(log_filter, SensitiveAccessLogFilter)
+        for log_filter in access_logger.filters
+    ):
+        access_logger.addFilter(SensitiveAccessLogFilter())
+
+
+_install_access_log_filter()
+
+
 class SlidingWindowLimiter:
     """Small per-process limiter for unauthenticated feedback submissions."""
 
@@ -73,6 +105,7 @@ def create_app(
     app_riot = riot_client or RiotRSOClient(
         client_id=app_settings.riot_client_id,
         client_secret=app_settings.riot_client_secret,
+        api_key=app_settings.riot_api_key,
         redirect_uri=app_settings.riot_redirect_uri,
         cluster=app_settings.riot_cluster,
     )
@@ -227,6 +260,7 @@ def create_app(
             "environment": settings_value.environment,
             "database": database_value.connected,
             "riot_rso": settings_value.rso_configured,
+            "riot_api": bool(settings_value.riot_api_key),
             "service_api": settings_value.service_api_configured,
             "admin_api": settings_value.admin_api_configured,
         }
@@ -237,6 +271,7 @@ def create_app(
         settings_value = request.app.state.settings
         return {
             "rso_ready": settings_value.rso_configured,
+            "api_key_ready": bool(settings_value.riot_api_key),
             "database_ready": request.app.state.database.connected,
             "cluster": settings_value.riot_cluster,
             "redirect_uri": settings_value.riot_redirect_uri,
@@ -253,10 +288,10 @@ def create_app(
     async def create_riot_link(request: Request, payload: LinkRequest) -> LinkResponse:
         """Create a bot-authenticated, signed, ten-minute Riot login URL."""
         settings_value = request.app.state.settings
-        if not settings_value.rso_configured or not settings_value.state_secret:
+        if not settings_value.valorant_linking_configured:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Riot Sign On is not configured.",
+                detail="Riot account linking is not fully configured.",
             )
         state_value = create_oauth_state(
             payload.discord_user_id, settings_value.state_secret
@@ -289,9 +324,7 @@ def create_app(
             tokens = await request.app.state.riot.exchange_code(code)
             access_token = tokens["access_token"]
             account = await request.app.state.riot.account_me(access_token)
-            shard = await request.app.state.riot.active_shard(
-                access_token, account["puuid"]
-            )
+            shard = await request.app.state.riot.active_shard(account["puuid"])
             await request.app.state.database.upsert_riot_account(
                 discord_user_id=discord_user_id,
                 puuid=account["puuid"],
@@ -418,6 +451,7 @@ def create_app(
             "feedback": await request.app.state.database.feedback_counts(),
             "database": request.app.state.database.connected,
             "riot_rso": request.app.state.settings.rso_configured,
+            "riot_api": bool(request.app.state.settings.riot_api_key),
         }
 
     return application

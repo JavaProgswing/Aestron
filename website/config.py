@@ -28,6 +28,7 @@ class WebsiteSettings:
     state_secret: str | None
     riot_client_id: str | None
     riot_client_secret: str | None
+    riot_api_key: str | None
     riot_cluster: str
     riot_redirect_uri: str
     topgg_bot_url: str | None
@@ -95,6 +96,7 @@ class WebsiteSettings:
             riot_client_secret=(
                 values.get("RIOT_RSO_CLIENT_SECRET", "").strip() or None
             ),
+            riot_api_key=values.get("VAL_API_TOKEN", "").strip() or None,
             riot_cluster=cluster,
             riot_redirect_uri=redirect_uri,
             topgg_bot_url=_optional_url(values, "TOPGG_BOT_URL"),
@@ -118,6 +120,11 @@ class WebsiteSettings:
     def service_api_configured(self) -> bool:
         """Whether the bot-to-website API can authenticate callers."""
         return bool(self.service_token)
+
+    @property
+    def valorant_linking_configured(self) -> bool:
+        """Whether RSO identity and API-key shard resolution are available."""
+        return self.rso_configured and bool(self.riot_api_key)
 
     @property
     def admin_api_configured(self) -> bool:
