@@ -36,6 +36,14 @@ disconnects. Run `/voicehealth` to see the connected Lavalink version, search
 source, active player count, latest connection error, and a live encoded-track
 search probe.
 
+If YouTube OAuth is required, provision it with a separate low-value account,
+store `YOUTUBE_OAUTH_REFRESH_TOKEN` as a secret panel variable, and never commit
+the token. The YouTube source plugin can print a reusable refresh token while
+its OAuth logger is at INFO; the example configuration keeps that logger at
+WARN for normal operation. Temporarily lower it only during initial
+provisioning, capture the token privately, then restore WARN and rotate any
+token that has appeared in shared logs.
+
 You can run the same source check without connecting the Discord bot:
 
 ```powershell

@@ -45,8 +45,14 @@ Use one worker unless the in-memory public feedback limiter is replaced by a
 shared Redis-backed limiter. Do not use `--reload` in production.
 
 ```bash
-if [[ -d .git ]] && [[ "${AUTO_UPDATE}" == "1" ]]; then git pull; fi; pip install -U --prefix .local -r requirements-web.txt; python -m uvicorn website.main:app --host 0.0.0.0 --port 27004 --env-file website.env --proxy-headers
+python scripts/deploy_start.py website --port 27004 --env-file website.env
 ```
+
+Set the pinned Git remote and updater variables described in
+[deployment.md](deployment.md). The bootstrap performs a clean,
+fast-forward-only fetch and installs `requirements-web.txt` only when its hash
+changes. It also passes proxy-header trust to Uvicorn through the bounded
+`FORWARDED_ALLOW_IPS` environment value.
 
 Configure the reverse proxy for HTTPS, WebSocket-capable forwarding, and the
 original `Host` and `X-Forwarded-Proto` headers. Restrict Pterodactyl port 27004

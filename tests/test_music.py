@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import wavelink
 
 from aestron_bot.lavalink import LavalinkService
-from aestron_bot.music import Music
+from aestron_bot.music import Music, QueueView, _format_duration
 
 
 class FakeQueue:
@@ -105,6 +105,35 @@ def test_music_commands_have_clear_usage_metadata():
         assert command.usage is not None
 
 
+def test_queue_view_paginates_every_track_with_stable_numbers():
+    async def run_test():
+        queue = FakeQueue()
+        queue.tracks.extend(
+            SimpleNamespace(title=f"Track {index}", uri=f"https://example.com/{index}")
+            for index in range(1, 24)
+        )
+        current = SimpleNamespace(
+            title="Current Track", uri="https://example.com/current"
+        )
+        view = QueueView(SimpleNamespace(current=current, queue=queue), author_id=123)
+
+        assert view.page_count == 3
+        assert "Track 1" in view.render().description
+        assert "Track 11" not in view.render().description
+
+        view.page = 1
+        second_page = view.render()
+        assert "**11.**" in second_page.description
+        assert "Track 11" in second_page.description
+        assert second_page.footer.text == "Page 2/3 • 23 track(s) waiting"
+
+    asyncio.run(run_test())
+
+
+def test_music_duration_drops_fractional_seconds():
+    assert _format_duration(75_200) == "0:01:15"
+
+
 def test_play_restores_track_and_reports_lavalink_playback_failure(monkeypatch):
     async def run_test():
         bot = SimpleNamespace(
@@ -182,6 +211,26 @@ def test_lavalink_service_reports_an_unready_pool(monkeypatch):
         assert service.connected is False
         assert "did not become ready" in service.last_error
         connect.assert_awaited_once()
+        await service.close()
+
+    asyncio.run(run_test())
+
+
+def test_lavalink_node_ready_event_clears_a_stale_timeout(monkeypatch):
+    async def run_test():
+        service = LavalinkService(SimpleNamespace())
+        service.last_error = "Node did not become ready within 10 seconds."
+        node = SimpleNamespace(
+            identifier=service.identifier,
+            fetch_version=AsyncMock(return_value="4.1.1"),
+        )
+
+        await service.handle_node_ready(node)
+
+        assert service.last_error is None
+        assert service.version == "4.1.1"
+        assert service._node is node
+        service._node = None
         await service.close()
 
     asyncio.run(run_test())

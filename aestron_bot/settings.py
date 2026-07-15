@@ -93,7 +93,11 @@ class RuntimeSettings:
             development_channel_id=_optional_snowflake(values, "CHANNEL_DEV_ID"),
             support_server_invite=support_invite,
             default_prefix=default_prefix,
-            version=values.get("BOT_VERSION", "development").strip() or "development",
+            version=(
+                values.get("AESTRON_VERSION", "").strip()
+                or values.get("BOT_VERSION", "").strip()
+                or "development"
+            ),
             site_base_url=site_base_url or None,
             aestron_service_token=service_token or None,
         )

@@ -40,8 +40,16 @@ plugins:
       - ANDROID_VR
       - WEB
       - WEBEMBEDDED
+    # Enable OAuth only when the normal clients cannot load YouTube tracks.
+    # Store the token as a secret Pterodactyl variable; never commit it here.
+    # oauth:
+    #   enabled: true
+    #   refreshToken: "${YOUTUBE_OAUTH_REFRESH_TOKEN}"
 
 logging:
   level:
     root: INFO
     lavalink: INFO
+    # OAuth setup can log a reusable refresh token at INFO. Keep this class at
+    # WARN after provisioning so secrets cannot leak into routine server logs.
+    dev.lavalink.youtube.http.YoutubeOauth2Handler: WARN

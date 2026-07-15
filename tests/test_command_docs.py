@@ -118,8 +118,7 @@ def test_every_registered_command_has_complete_documentation():
             assert len(bot_help) <= 6000
             assert isinstance(bot_help_view, InteractiveHelpView)
             assert any(
-                isinstance(item, HelpCategorySelect)
-                for item in bot_help_view.children
+                isinstance(item, HelpCategorySelect) for item in bot_help_view.children
             )
 
             channel.send.reset_mock()

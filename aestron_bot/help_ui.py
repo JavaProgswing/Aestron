@@ -188,9 +188,7 @@ class InteractiveHelpView(discord.ui.View):
         )
         return embed
 
-    def _pages(
-        self, category: HelpCategory
-    ) -> list[tuple[commands.Command, ...]]:
+    def _pages(self, category: HelpCategory) -> list[tuple[commands.Command, ...]]:
         commands_list = category.commands
         return [
             commands_list[index : index + self.page_size]
@@ -235,9 +233,7 @@ class InteractiveHelpView(discord.ui.View):
         self._refresh_buttons()
         await interaction.response.edit_message(embed=self.render(), view=self)
 
-    @discord.ui.button(
-        emoji="◀️", style=discord.ButtonStyle.secondary, row=2
-    )
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.secondary, row=2)
     async def previous_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -247,9 +243,7 @@ class InteractiveHelpView(discord.ui.View):
         self._refresh_buttons()
         await interaction.response.edit_message(embed=self.render(), view=self)
 
-    @discord.ui.button(
-        emoji="▶️", style=discord.ButtonStyle.secondary, row=2
-    )
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.secondary, row=2)
     async def next_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:

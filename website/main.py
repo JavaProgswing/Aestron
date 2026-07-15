@@ -17,6 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from runtime_info import runtime_info
+
 from .config import WebsiteSettings
 from .database import DatabaseUnavailableError, WebsiteDatabase
 from .models import (
@@ -84,10 +86,11 @@ def create_app(
             await application.state.riot.close()
             await application.state.database.close()
 
+    deployment = runtime_info()
     application = FastAPI(
         title="Aestron API",
         summary="Aestron feedback, administration, and secure bot integrations.",
-        version="1.0.0",
+        version=str(deployment["version"]),
         docs_url="/api/docs",
         redoc_url="/api/redoc",
         openapi_url="/api/openapi.json",
@@ -207,7 +210,7 @@ def create_app(
         """Describe the stable API root and useful discovery URLs."""
         return {
             "name": "Aestron API",
-            "version": "1.0.0",
+            "version": runtime_info()["version"],
             "status": "online",
             "documentation": str(request.url_for("swagger_ui_html")),
             "health": str(request.url_for("health")),
@@ -220,6 +223,7 @@ def create_app(
         database_value = request.app.state.database
         return {
             "status": "healthy" if database_value.connected else "degraded",
+            "runtime": runtime_info(),
             "environment": settings_value.environment,
             "database": database_value.connected,
             "riot_rso": settings_value.rso_configured,

@@ -14,6 +14,8 @@ import discord
 import psutil
 from discord.ext import commands
 
+from runtime_info import runtime_info
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -282,6 +284,7 @@ class Statistics(commands.Cog):
             or "No commands recorded yet."
         )
         uptime_text = str(timedelta(seconds=int(uptime.total_seconds())))
+        deployment = runtime_info()
 
         embed = discord.Embed(
             title=f"{self.bot.user.name if self.bot.user else 'Aestron'} statistics",
@@ -322,7 +325,12 @@ class Statistics(commands.Cog):
         )
         embed.add_field(
             name="Process",
-            value=f"CPU: **{cpu_percent:.1f}%**\nRAM: **{memory_mib:.1f} MiB**",
+            value=(
+                f"CPU: **{cpu_percent:.1f}%**\n"
+                f"RAM: **{memory_mib:.1f} MiB**\n"
+                f"Version: **{deployment['version']}**\n"
+                f"Commit: `{deployment['git_commit_short']}`"
+            ),
         )
         embed.set_footer(
             text=(

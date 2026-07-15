@@ -105,6 +105,14 @@ VALORANT product and prototype dashboard are `/valorant` and
 Pterodactyl, HTTPS proxy, Riot callback, environment, and rollout instructions
 are in [docs/website-deployment.md](docs/website-deployment.md).
 
+For Pterodactyl production starts, use `python scripts/deploy_start.py bot` for
+the Discord process and `python scripts/deploy_start.py website --port 27004
+--env-file website.env` for the separate website process. The bootstrap fetches
+on every start, pins the expected remote, accepts fast-forward updates only,
+installs only the relevant changed requirements, and publishes commit/version
+metadata to `/stats` and `/api/health`. Configuration and read-only deploy-key
+guidance are in [docs/deployment.md](docs/deployment.md).
+
 Keep `AESTRON_SITE_BASE_URL` empty in the bot environment until the public site
 is deployed and verified. Then set it to the HTTPS origin and copy the exact same
 `AESTRON_SERVICE_TOKEN` into both bot and website environments.

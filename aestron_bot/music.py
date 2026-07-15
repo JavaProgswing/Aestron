@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import math
 import os
 from datetime import timedelta
 from typing import cast
@@ -115,6 +117,99 @@ class VolumeSelect(discord.ui.Select):
         await interaction.response.edit_message(embed=embed, view=self.view)
 
 
+class QueueView(discord.ui.View):
+    """Paginated, requester-scoped snapshot of a guild's music queue."""
+
+    page_size = 10
+
+    def __init__(self, player: wavelink.Player, *, author_id: int) -> None:
+        """Capture a stable queue snapshot for interactive browsing."""
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.current = player.current
+        self.tracks = tuple(player.queue)
+        self.page = 0
+        self.message: discord.Message | None = None
+        self._refresh_buttons()
+
+    @property
+    def page_count(self) -> int:
+        """Return the number of pages, including one empty page."""
+        return max(1, math.ceil(len(self.tracks) / self.page_size))
+
+    @staticmethod
+    def _track_line(track: wavelink.Playable) -> str:
+        title = discord.utils.escape_markdown(track.title)
+        parsed = urlparse(track.uri or "")
+        if parsed.scheme in {"http", "https"}:
+            return f"[{title}]({track.uri})"
+        return title
+
+    def render(self) -> discord.Embed:
+        """Render the current queue page with stable item numbering."""
+        lines: list[str] = []
+        if self.current is not None:
+            lines.append(f"**Now:** {self._track_line(self.current)}")
+
+        start = self.page * self.page_size
+        for index, track in enumerate(
+            self.tracks[start : start + self.page_size], start=start + 1
+        ):
+            lines.append(f"**{index}.** {self._track_line(track)}")
+
+        embed = discord.Embed(
+            title="Music queue",
+            description="\n".join(lines) or "The queue is empty.",
+            color=0x7C5CFC,
+        )
+        embed.set_footer(
+            text=(
+                f"Page {self.page + 1}/{self.page_count} • "
+                f"{len(self.tracks)} track(s) waiting"
+            )
+        )
+        return embed
+
+    def _refresh_buttons(self) -> None:
+        self.previous_page.disabled = self.page == 0
+        self.next_page.disabled = self.page >= self.page_count - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Only allow the command invoker to browse this queue snapshot."""
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "Run `/queue` to open your own queue browser.", ephemeral=True
+        )
+        return False
+
+    async def on_timeout(self) -> None:
+        """Disable pagination controls when the snapshot expires."""
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await self.message.edit(view=self)
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def previous_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Show the previous queue page."""
+        self.page = max(0, self.page - 1)
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.render(), view=self)
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.secondary)
+    async def next_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Show the next queue page."""
+        self.page = min(self.page_count - 1, self.page + 1)
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.render(), view=self)
+
+
 class SongPanel(discord.ui.View):
     """Controls for the currently playing Wavelink track."""
 
@@ -198,22 +293,14 @@ class SongPanel(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Show the active and upcoming tracks privately."""
-        current = self.player.current
-        lines = []
-        if current is not None:
-            lines.append(f"**Now:** [{current.title}]({current.uri})")
-        for index, track in enumerate(list(self.player.queue)[:10], start=1):
-            lines.append(f"**{index}.** [{track.title}]({track.uri})")
-        if self.player.queue.count > 10:
-            lines.append(f"…and {self.player.queue.count - 10} more.")
+        view = QueueView(self.player, author_id=interaction.user.id)
         await interaction.response.send_message(
-            embed=discord.Embed(
-                title="Music queue",
-                description="\n".join(lines) or "The queue is empty.",
-                color=0x7C5CFC,
-            ),
+            embed=view.render(),
+            view=view,
             ephemeral=True,
         )
+        with contextlib.suppress(discord.HTTPException):
+            view.message = await interaction.original_response()
 
     @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger)
     async def stop_button(
@@ -571,51 +658,37 @@ class Music(commands.Cog):
         duration = max(1, track.length)
         progress = min(12, int((player.position / duration) * 12))
         progress_bar = "▬" * progress + "🔘" + "▬" * (12 - progress)
-        requester_id = _track_extra(track, "requester_id")
-        embed = discord.Embed(
-            title=track.title,
-            url=track.uri,
-            description=(
+        embed = _now_playing_embed(player, track)
+        embed.title = "Currently playing 🎶"
+        embed.insert_field_at(
+            0,
+            name="Progress",
+            value=(
                 f"{progress_bar}\n"
-                f"`{timedelta(milliseconds=player.position)}` / "
-                f"`{timedelta(milliseconds=track.length)}`"
+                f"`{_format_duration(player.position)}` / "
+                f"`{_format_duration(track.length)}`"
             ),
-            color=discord.Color.blurple(),
+            inline=False,
         )
-        embed.add_field(
-            name="Requester", value=f"<@{requester_id}>" if requester_id else "Unknown"
-        )
-        embed.add_field(name="Volume", value=f"{player.volume}%")
-        if track.artwork:
-            embed.set_thumbnail(url=track.artwork)
-        await ctx.send(embed=embed)
+        panel = SongPanel(player, timeout=120)
+        panel.message = await ctx.send(embed=embed, view=panel)
 
     @commands.hybrid_command(
         name="queue",
         aliases=["q"],
         brief="Show the upcoming music queue.",
-        description="Show the current song and up to the next 10 queued tracks.",
+        description="Browse the current song and every queued track by page.",
         usage="",
     )
     @commands.guild_only()
     async def show_queue(self, ctx: commands.Context) -> None:
-        """Show the current track and next ten entries."""
+        """Show the current track and a paginated queue snapshot."""
         player = ctx.voice_client
         if not isinstance(player, wavelink.Player) or player.current is None:
             await self._send_error(ctx, "Nothing is currently playing.")
             return
-        lines = [f"**Now:** [{player.current.title}]({player.current.uri})"]
-        for index, track in enumerate(list(player.queue)[:10], start=1):
-            lines.append(f"**{index}.** [{track.title}]({track.uri})")
-        if player.queue.count > 10:
-            lines.append(f"…and {player.queue.count - 10} more.")
-        await ctx.send(
-            embed=discord.Embed(
-                title="Music queue",
-                description="\n".join(lines),
-                color=discord.Color.blurple(),
-            )
-        )
+        view = QueueView(player, author_id=ctx.author.id)
+        view.message = await ctx.send(embed=view.render(), view=view)
 
     @commands.hybrid_command(
         brief="Pause or resume playback.",
@@ -703,6 +776,13 @@ class Music(commands.Cog):
                 inline=False,
             )
         await ctx.send(embed=embed)
+
+    @commands.Cog.listener()
+    async def on_wavelink_node_ready(
+        self, payload: wavelink.NodeReadyEventPayload
+    ) -> None:
+        """Clear stale startup errors when Lavalink becomes ready late."""
+        await self.lavalink.handle_node_ready(payload.node)
 
     @commands.Cog.listener()
     async def on_wavelink_track_start(

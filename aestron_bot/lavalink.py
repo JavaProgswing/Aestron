@@ -186,6 +186,35 @@ class LavalinkService:
             "last_probe": self.last_probe,
         }
 
+    async def handle_node_ready(self, node: wavelink.Node) -> None:
+        """Reconcile service state when Wavelink finishes connecting late.
+
+        Wavelink can receive Lavalink's ready payload after ``ensure_connected``
+        reaches its local timeout.  The node-ready event is authoritative, so a
+        matching event must clear the stale error and refresh the server version.
+        """
+        if node.identifier != self.identifier:
+            LOGGER.debug("Ignoring unrelated Lavalink node %s", node.identifier)
+            return
+
+        previous_error = self.last_error
+        self._node = node
+        self.last_error = None
+        try:
+            self.version = await asyncio.wait_for(node.fetch_version(), timeout=5)
+        except Exception:
+            LOGGER.warning(
+                "Lavalink node %s became ready, but its version could not be read",
+                node.identifier,
+                exc_info=True,
+            )
+        if previous_error:
+            LOGGER.info(
+                "Lavalink node %s recovered after the readiness timeout (version=%s)",
+                node.identifier,
+                self.version or "unknown",
+            )
+
     async def probe_search(
         self, query: str = "Aestron playback test"
     ) -> dict[str, Any]:
