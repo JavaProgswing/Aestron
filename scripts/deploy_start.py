@@ -61,6 +61,10 @@ class DeploymentError(RuntimeError):
     """Raised when a startup safety check fails."""
 
 
+class InvalidCheckoutError(DeploymentError):
+    """Raised when existing Git metadata cannot describe a working tree."""
+
+
 def _load_deployment_environment() -> None:
     """Load allowlisted startup settings from uncommitted ``github.env``.
 
@@ -198,11 +202,25 @@ def _configure_sparse_checkout(service: str) -> None:
     marker.write_text(f"{service}\n", encoding="utf-8")
 
 
+def _tracked_status() -> str:
+    """Return tracked changes or identify unusable Git metadata."""
+    result = _run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        label="Git status",
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.strip().splitlines()
+        suffix = f" Last Git message: {detail[-1][:300]}" if detail else ""
+        raise InvalidCheckoutError(
+            f"Git status failed with exit code {result.returncode}.{suffix}"
+        )
+    return result.stdout.strip()
+
+
 def _ensure_clean_checkout() -> None:
     """Refuse local edits unless deployment explicitly makes Git authoritative."""
-    status_output = _git(
-        "status", "--porcelain", "--untracked-files=no", label="Git status"
-    )
+    status_output = _tracked_status()
     if not status_output:
         return
     if not _enabled("DEPLOY_DISCARD_LOCAL_CHANGES", False):
@@ -218,8 +236,27 @@ def _ensure_clean_checkout() -> None:
         flush=True,
     )
     _git("reset", "--hard", "HEAD", label="Git tracked-file reset")
-    if _git("status", "--porcelain", "--untracked-files=no", label="Git status"):
+    if _tracked_status():
         raise DeploymentError("Tracked files remain modified after the Git reset.")
+
+
+def _quarantine_invalid_git_metadata() -> Path:
+    """Move broken metadata aside without deleting deployment evidence."""
+    source = ROOT / ".git"
+    RUNTIME_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    destination = RUNTIME_DIRECTORY / f"invalid-git-{timestamp}"
+    counter = 1
+    while destination.exists():
+        destination = RUNTIME_DIRECTORY / f"invalid-git-{timestamp}-{counter}"
+        counter += 1
+    try:
+        shutil.move(str(source), str(destination))
+    except OSError as error:
+        raise DeploymentError(
+            "Invalid Git metadata could not be quarantined."
+        ) from error
+    return destination
 
 
 def _update_repository(service: str) -> tuple[str, str, str, bool]:
@@ -348,6 +385,19 @@ def _prepare_repository(service: str) -> tuple[str, str, str, bool]:
     if not _enabled("AUTO_UPDATE", True):
         return _current_repository_info()
     if (ROOT / ".git").is_dir():
+        try:
+            _tracked_status()
+        except InvalidCheckoutError:
+            if not _enabled("DEPLOY_DISCARD_LOCAL_CHANGES", False):
+                raise
+            quarantine_path = _quarantine_invalid_git_metadata()
+            print(
+                "Existing Git metadata is invalid and was quarantined at "
+                f"{quarantine_path.relative_to(ROOT)}; rebuilding from the "
+                "pinned remote.",
+                flush=True,
+            )
+            return _bootstrap_repository(service)
         return _update_repository(service)
     return _bootstrap_repository(service)
 

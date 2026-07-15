@@ -5,11 +5,13 @@ import pytest
 from scripts import deploy_start
 from scripts.deploy_start import (
     DeploymentError,
+    InvalidCheckoutError,
     _configure_sparse_checkout,
     _enabled,
     _ensure_clean_checkout,
     _load_deployment_environment,
     _prepare_repository,
+    _tracked_status,
     _validate_remote_url,
 )
 
@@ -164,8 +166,8 @@ def test_dirty_checkout_is_rejected_by_default(monkeypatch):
     monkeypatch.delenv("DEPLOY_DISCARD_LOCAL_CHANGES", raising=False)
     monkeypatch.setattr(
         deploy_start,
-        "_git",
-        lambda *arguments, **kwargs: " M scripts/deploy_start.py",
+        "_tracked_status",
+        lambda: " M scripts/deploy_start.py",
     )
 
     with pytest.raises(DeploymentError, match="DEPLOY_DISCARD_LOCAL_CHANGES"):
@@ -177,15 +179,17 @@ def test_explicit_git_authority_discards_only_tracked_changes(monkeypatch, capsy
     dirty = True
     calls = []
 
+    def fake_status():
+        return " M scripts/deploy_start.py" if dirty else ""
+
     def fake_git(*arguments, label="Git command"):
         nonlocal dirty
         calls.append(arguments)
-        if arguments[:1] == ("status",):
-            return " M scripts/deploy_start.py" if dirty else ""
         if arguments[:2] == ("reset", "--hard"):
             dirty = False
         return ""
 
+    monkeypatch.setattr(deploy_start, "_tracked_status", fake_status)
     monkeypatch.setattr(deploy_start, "_git", fake_git)
 
     _ensure_clean_checkout()
@@ -194,3 +198,40 @@ def test_explicit_git_authority_discards_only_tracked_changes(monkeypatch, capsy
     assert (
         "ignored environment and runtime files are preserved" in capsys.readouterr().out
     )
+
+
+def test_git_status_error_includes_sanitized_last_message(monkeypatch):
+    result = subprocess.CompletedProcess(
+        ["git", "status"],
+        128,
+        "",
+        "fatal: not a git repository\n",
+    )
+    monkeypatch.setattr(deploy_start, "_run", lambda *args, **kwargs: result)
+
+    with pytest.raises(InvalidCheckoutError, match="not a git repository"):
+        _tracked_status()
+
+
+def test_invalid_git_metadata_is_quarantined_and_rebuilt(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(deploy_start, "ROOT", tmp_path)
+    monkeypatch.setattr(deploy_start, "RUNTIME_DIRECTORY", tmp_path / "runtime")
+    monkeypatch.setenv("AUTO_UPDATE", "1")
+    monkeypatch.setenv("DEPLOY_DISCARD_LOCAL_CHANGES", "1")
+    monkeypatch.setattr(
+        deploy_start,
+        "_tracked_status",
+        lambda: (_ for _ in ()).throw(InvalidCheckoutError("broken Git metadata")),
+    )
+    monkeypatch.setattr(
+        deploy_start,
+        "_bootstrap_repository",
+        lambda service: ("new-commit", "master", "v2", True),
+    )
+
+    repository_info = _prepare_repository("bot")
+
+    assert repository_info == ("new-commit", "master", "v2", True)
+    assert not (tmp_path / ".git").exists()
+    assert len(list((tmp_path / "runtime").glob("invalid-git-*"))) == 1

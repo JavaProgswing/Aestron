@@ -37,6 +37,13 @@ configuration, credentials, installed packages, and runtime state are not
 deleted. Leave this setting at `0` on development checkouts where local source
 edits must stop deployment instead of being overwritten.
 
+If a previous interrupted bootstrap leaves unusable `.git` metadata, the same
+setting permits automatic recovery. The launcher moves that directory to
+`runtime/invalid-git-<timestamp>` instead of deleting it, bootstraps a fresh
+partial checkout from the pinned remote, and continues startup. Git status
+failures include only the final diagnostic line and never print command
+arguments or credentials.
+
 `DEPLOY_GIT_REMOTE` must match a name shown by `git remote`, and
 `DEPLOY_GIT_REMOTE_URL` must exactly match `git remote get-url <name>` apart
 from a trailing slash. Use a
