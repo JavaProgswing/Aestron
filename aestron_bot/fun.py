@@ -8,7 +8,6 @@ import secrets
 from dataclasses import dataclass
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 ACCENT = 0xFF4655
@@ -197,8 +196,6 @@ class TriviaView(InvokerView):
 class FunGames(commands.Cog):
     """Lightweight games and conversation starters."""
 
-    games = app_commands.Group(name="games", description="Interactive Aestron games.")
-
     def __init__(self, bot: commands.Bot) -> None:
         """Store the bot instance."""
         self.bot = bot
@@ -343,24 +340,3 @@ class FunGames(commands.Cog):
         """Start one interactive trivia question."""
         view = TriviaView(ctx.author.id, _pick(TRIVIA_QUESTIONS))
         view.message = await ctx.send(embed=view.embed(), view=view)
-
-    @games.command(name="rps", description="Play rock-paper-scissors against Aestron.")
-    async def slash_rps(self, interaction: discord.Interaction) -> None:
-        """Start rock-paper-scissors from the grouped slash command."""
-        view = RockPaperScissorsView(interaction.user.id)
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="Rock, paper, scissors",
-                description="Choose your move below.",
-                color=ACCENT,
-            ),
-            view=view,
-        )
-        view.message = await interaction.original_response()
-
-    @games.command(name="trivia", description="Answer a reviewed trivia question.")
-    async def slash_trivia(self, interaction: discord.Interaction) -> None:
-        """Start trivia from the grouped slash command."""
-        view = TriviaView(interaction.user.id, _pick(TRIVIA_QUESTIONS))
-        await interaction.response.send_message(embed=view.embed(), view=view)
-        view.message = await interaction.original_response()

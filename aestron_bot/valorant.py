@@ -758,6 +758,7 @@ class Valorant(commands.Cog):
         view.message = await ctx.send(embed=view.render(), view=view, ephemeral=True)
 
     @commands.hybrid_command(
+        with_app_command=False,
         aliases=["valhistory", "vmatches"],
         brief="Browse recent VALORANT matches interactively.",
         description=(

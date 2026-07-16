@@ -75,6 +75,15 @@ def test_all_cogs_register_with_discord_py_2_7():
             for cog in cog_types:
                 await bot.add_cog(cog(bot))
             await bot.add_cog(main.Statistics(bot, bot.statistics))
+            standalone_slash_commands = main.client.tree.get_commands(
+                type=discord.AppCommandType.chat_input
+            )
+            # Production also registers standalone tree commands at import time.
+            # Keep one spare global slot so adding a cog cannot crash startup.
+            total_slash_roots = len(bot.tree.get_commands()) + len(
+                standalone_slash_commands
+            )
+            assert total_slash_roots <= 99
             assert len(bot.cogs) == len(cog_types) + 1
             assert len(bot.commands) > 100
             assert bot.get_command("stats") is not None

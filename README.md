@@ -95,10 +95,11 @@ when the node has no working audio source.
 - `/linkaccount` and `/unlinkaccount` — secure opt-in Riot account linking.
 - `/vstats [member] [matches]` — interactive overview, history, agent/map
   context, match selector, coaching prompts, and metric guide.
-- `/matchhistory`, `/matchanalysis`, and `/valcoach` — recent match cards,
-  round-level match inspection, and evidence-based post-match review.
-- `/games rps` and `/games trivia` — interactive invoker-only games. Additional
-  text games are `a!coinflip`, `a!roll`, `a!choose`, `a!eightball`, and `a!rate`.
+- `a!matchhistory`, `/matchanalysis`, and `/valcoach` — recent match cards,
+  round-level match inspection, and evidence-based post-match review. Match
+  history is also available from the selector in `/vstats`.
+- `a!rps` and `a!trivia` — interactive invoker-only games. Additional text games
+  are `a!coinflip`, `a!roll`, `a!choose`, `a!eightball`, and `a!rate`.
 
 ## Website and API
 
