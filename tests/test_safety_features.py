@@ -335,6 +335,47 @@ def test_fun_leveling_and_minecraft_regressions_are_registered():
     )
 
 
+def test_minecraft_golden_apple_is_not_wasted_at_full_health():
+    """A full-health fighter keeps their single-use heal and their turn."""
+
+    async def run_test():
+        view = main.Minecraftpvp(
+            memberone_id=1,
+            membertwo_id=2,
+            memberone_name="one",
+            membertwo_name="two",
+            memberone_health=20,
+            membertwo_health=20,
+            memberone_armor="Leather",
+            membertwo_armor="Leather",
+            memberone_sword="Wooden",
+            membertwo_sword="Wooden",
+            memberone_avatar=b"",
+            membertwo_avatar=b"",
+            voice_effects=None,
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=1),
+            response=SimpleNamespace(
+                send_message=AsyncMock(),
+                defer=AsyncMock(),
+            ),
+        )
+        heal_button = next(
+            item for item in view.children if item.custom_id == "minecraftpvp:heal"
+        )
+
+        await heal_button.callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        interaction.response.defer.assert_not_awaited()
+        assert view.memberone_heal_available is True
+        assert view.memberone_healthpoint == 20
+        assert view.moveturn == 1
+
+    asyncio.run(run_test())
+
+
 def test_ticket_views_are_persistent_and_channel_names_are_safe():
     """Restart-safe controls require stable custom IDs and no view timeout."""
     open_view = OpenTicketView()

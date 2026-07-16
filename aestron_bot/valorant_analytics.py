@@ -96,12 +96,32 @@ class RoundPerformance:
     deaths: int
     assists: int
     damage: int
+    damage_received: int
+    headshots: int
+    bodyshots: int
+    legshots: int
     loadout_value: int
     spent: int
     remaining: int
     weapon: str
     armor: str
     opening_result: str | None
+
+    @property
+    def damage_delta(self) -> int:
+        """Return damage dealt minus damage received in this round."""
+        return self.damage - self.damage_received
+
+    @property
+    def headshot_rate(self) -> float:
+        """Return headshot hits as a percentage of recorded hit locations."""
+        return (
+            _ratio(
+                self.headshots,
+                self.headshots + self.bodyshots + self.legshots,
+            )
+            * 100
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +400,9 @@ def analyze_match(
             (item for item in player_stats if item.get("puuid") == puuid), {}
         )
         round_damage = 0
+        round_headshots = 0
+        round_bodyshots = 0
+        round_legshots = 0
         for damage in player_round.get("damage") or []:
             if not isinstance(damage, dict):
                 continue
@@ -388,11 +411,17 @@ def analyze_match(
             values["headshots"] += _integer(damage.get("headshots"))
             values["bodyshots"] += _integer(damage.get("bodyshots"))
             values["legshots"] += _integer(damage.get("legshots"))
+            round_headshots += _integer(damage.get("headshots"))
+            round_bodyshots += _integer(damage.get("bodyshots"))
+            round_legshots += _integer(damage.get("legshots"))
 
+        round_damage_received = 0
         for item in player_stats:
             for damage in item.get("damage") or []:
                 if isinstance(damage, dict) and damage.get("receiver") == puuid:
-                    values["damage_received"] += _integer(damage.get("damage"))
+                    received = _integer(damage.get("damage"))
+                    values["damage_received"] += received
+                    round_damage_received += received
 
         round_assists = 0
         for kill in all_kills:
@@ -442,6 +471,10 @@ def analyze_match(
                 deaths=int(any(kill.get("victim") == puuid for kill in all_kills)),
                 assists=round_assists,
                 damage=round_damage,
+                damage_received=round_damage_received,
+                headshots=round_headshots,
+                bodyshots=round_bodyshots,
+                legshots=round_legshots,
                 loadout_value=_integer(economy.get("loadoutValue")),
                 spent=_integer(economy.get("spent")),
                 remaining=_integer(economy.get("remaining")),

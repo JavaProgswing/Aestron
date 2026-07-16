@@ -2725,6 +2725,7 @@ class Minecraftpvp(discord.ui.View):
                 armor=self.memberone_armor,
                 sword=self.memberone_sword,
                 shield_active=self.memberone_resistance,
+                guard_ready=self.memberone_guard_ready,
                 heal_available=self.memberone_heal_available,
             )
         return FighterVisual(
@@ -2735,6 +2736,7 @@ class Minecraftpvp(discord.ui.View):
             armor=self.membertwo_armor,
             sword=self.membertwo_sword,
             shield_active=self.membertwo_resistance,
+            guard_ready=self.membertwo_guard_ready,
             heal_available=self.membertwo_heal_available,
         )
 
@@ -2971,6 +2973,20 @@ class Minecraftpvp(discord.ui.View):
                 "Your golden apple has already been consumed.", ephemeral=True
             )
             return
+        current_health = (
+            self.memberone_healthpoint if side == "left" else self.membertwo_healthpoint
+        )
+        total_health = (
+            self.total_memberone_healthpoint
+            if side == "left"
+            else self.total_membertwo_healthpoint
+        )
+        if current_health >= total_health:
+            await interaction.response.send_message(
+                "You are already at full health. Your golden apple was not consumed.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.defer()
         if side == "left":
             before = self.memberone_healthpoint
@@ -3053,6 +3069,7 @@ class Minecraftpvp(discord.ui.View):
             self.last_event = (
                 f"{defender_name}'s shield blocked {attacker_name}'s strike."
             )
+            self.last_action = f"block_{'right' if attacker_side == 'left' else 'left'}"
             play_minecraft_sound(self.vc, "Shield_block5.ogg")
         else:
             self.last_event = (
@@ -3065,7 +3082,7 @@ class Minecraftpvp(discord.ui.View):
                 "critical": "Critical",
             }[attack_type]
             play_minecraft_sound(self.vc, f"{sound_attack}_attack1.ogg")
-        self.last_action = f"attack_{attacker_side}"
+            self.last_action = f"attack_{attacker_side}"
         if remaining <= 0:
             await self._complete_fight(
                 interaction,

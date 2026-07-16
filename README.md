@@ -116,11 +116,12 @@ when the node has no working audio source.
 - `/valorant history`, `/valorant match`, and `/valorant coach` — rendered
   dashboards with per-round timelines, personal economy efficiency, opponent
   duel matrices, official minimap kill/death plots, round selection, player-card
-  banners, agent art, weapon icons, and evidence-based review. Public artwork and
-  map-coordinate transforms are loaded asynchronously from valorant-api.com and
-  cached in memory; Riot match data remains the only statistics source. Aestron
-  does not invent personal MMR/ELO because Riot's supported player-match APIs do
-  not expose it and Riot policy prohibits replacement ranking calculators.
+  banners, agent art, weapon/shield loadout cards, store costs, hit profiles,
+  damage differentials, and evidence-based review. Public artwork and map-coordinate
+  transforms are loaded asynchronously from valorant-api.com and cached in memory;
+  Riot match data remains the only statistics source. Aestron does not invent
+  personal MMR/ELO because Riot's supported player-match APIs do not expose it and
+  Riot policy prohibits replacement ranking calculators.
 - `/fun rps` runs a first-to-three match and `/fun trivia` runs a scored
   five-question session. Coin flips, dice, decisions, and eight-ball answers can
   replay in place; would-you-rather uses a public one-vote-per-member poll.

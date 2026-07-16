@@ -1,3 +1,5 @@
+import pytest
+
 from aestron_bot.valorant import ValorantStatsView
 from aestron_bot.valorant_analytics import (
     AssetCatalog,
@@ -51,8 +53,8 @@ def _match(*, won: bool = True):
                             "loadoutValue": 3900,
                             "spent": 2900,
                             "remaining": 1000,
-                            "weapon": "Vandal",
-                            "armor": "Heavy",
+                            "weapon": "9c82e19d-4575-0200-1a81-3eacf00cf872",
+                            "armor": "822bcab2-40a2-324e-c137-e09195ad7692",
                         },
                         "damage": [
                             {
@@ -103,8 +105,8 @@ def _match(*, won: bool = True):
                             "loadoutValue": 4700,
                             "spent": 800,
                             "remaining": 200,
-                            "weapon": "Vandal",
-                            "armor": "Heavy",
+                            "weapon": "9c82e19d-4575-0200-1a81-3eacf00cf872",
+                            "armor": "822bcab2-40a2-324e-c137-e09195ad7692",
                         },
                         "damage": [
                             {
@@ -148,6 +150,11 @@ def test_match_summary_uses_round_and_damage_data():
         False,
     ]
     assert summary.performances[0].round_details[0].loadout_value == 3900
+    assert summary.performances[0].round_details[0].damage_delta == 180
+    assert summary.performances[0].round_details[0].headshot_rate == pytest.approx(
+        100 / 3
+    )
+    assert summary.performances[0].round_details[1].damage_received == 80
     assert summary.performances[0].duels[0].kills == 1
     assert summary.performances[0].duels[0].deaths == 1
     assert len(summary.performances[0].kill_locations) == 2

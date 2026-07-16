@@ -34,8 +34,9 @@ PRODUCT_UPDATES = (
         details=(
             "VALORANT now renders overview, match history, round timeline, personal economy, duel matrix, trends, and review-plan pages from official completed-match data.",
             "Match reviews use real map layouts, numbered kill/death positions, player-card or map banners, agent portraits, and finishing-weapon art loaded from a bounded public artwork cache.",
+            "Round cards now resolve primary weapons and shields with current artwork and store metadata, then show damage received, damage differential, and recorded head/body/leg hits.",
             "The dashboard never estimates hidden MMR or ELO; every displayed metric is derived from a documented match field or clearly labelled aggregate.",
-            "Minecraft PvP and inventory use cached in-game item sprites, and every combat button acknowledges Discord before image rendering, audio, or reward writes.",
+            "Minecraft PvP and inventory use cached in-game item sprites, remove unsupported display glyphs, preserve full-health golden apples, and acknowledge Discord before image rendering, audio, or reward writes.",
             "Fun commands share a consistent rendered-card system while preserving replay, scoring, elimination, and live-vote controls.",
         ),
         commands=(

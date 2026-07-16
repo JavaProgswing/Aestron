@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
@@ -47,6 +48,7 @@ class FighterVisual:
     armor: str
     sword: str
     shield_active: bool = False
+    guard_ready: bool = True
     heal_available: bool = True
 
 
@@ -58,11 +60,22 @@ def _font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default(size=size)
 
 
+def _safe_text(text: str) -> str:
+    """Remove control and symbol glyphs unsupported by the bundled render font."""
+    return "".join(
+        character
+        for character in str(text)
+        if unicodedata.category(character)[:1] not in {"C", "S"}
+    )
+
+
 def _bounded_text(draw: ImageDraw.ImageDraw, text: str, width: int, font) -> str:
-    value = " ".join(text.split()) or "Player"
+    safe_text = _safe_text(text)
+    value = " ".join(safe_text.split()) or "Player"
+    original = value
     while value and draw.textbbox((0, 0), value, font=font)[2] > width:
         value = value[:-1]
-    return f"{value.rstrip()}…" if value != text and value else value
+    return f"{value.rstrip()}…" if value != original and value else value
 
 
 def _avatar_image(data: bytes, name: str) -> Image.Image:
@@ -72,7 +85,7 @@ def _avatar_image(data: bytes, name: str) -> Image.Image:
     except (OSError, ValueError):
         avatar = Image.new("RGB", (126, 126), (49, 68, 52))
         fallback = ImageDraw.Draw(avatar)
-        initial = (name.strip()[:1] or "?").upper()
+        initial = (_safe_text(name).strip()[:1] or "?").upper()
         fallback.text(
             (63, 63),
             initial,
@@ -203,7 +216,9 @@ def _draw_fighter(
 
     chips = []
     if fighter.shield_active:
-        chips.append(("SHIELD UP", (71, 137, 211)))
+        chips.append(("NEXT HIT BLOCKED", (71, 137, 211)))
+    elif not fighter.guard_ready:
+        chips.append(("GUARD RECHARGING", (93, 105, 95)))
     chip_x = x1 + 28
     for label, color in chips:
         width = draw.textbbox((0, 0), label, font=_font(11, bold=True))[2] + 24
@@ -235,23 +250,61 @@ def _draw_fighter(
 
 
 def _draw_action_effect(
-    draw: ImageDraw.ImageDraw, action: str, left_box, right_box
+    canvas: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    action: str,
+    left_box,
+    right_box,
+    left: FighterVisual,
+    right: FighterVisual,
 ) -> None:
     if action.startswith("attack_"):
+        attacker = left if action == "attack_left" else right
         target = right_box if action == "attack_left" else left_box
-        x1, y1, x2, y2 = target
-        for offset in (0, 16, 32):
-            draw.line(
-                (x1 + 65 + offset, y1 + 158, x1 + 145 + offset, y1 + 82),
-                fill=(255, 89, 72),
-                width=7,
+        x1, y1, _, _ = target
+        sword = _item_sprite(_SWORD_FILES[attacker.sword], 64).rotate(
+            -35 if action == "attack_left" else 35,
+            resample=Image.Resampling.NEAREST,
+            expand=True,
+        )
+        effect_x, effect_y = x1 + 185, y1 + 118
+        canvas.paste(sword, (effect_x, effect_y), sword)
+        effect_draw = ImageDraw.Draw(canvas)
+        for dx, dy, size in ((72, 12, 8), (84, 28, 6), (62, 40, 5)):
+            effect_draw.rectangle(
+                (
+                    effect_x + dx,
+                    effect_y + dy,
+                    effect_x + dx + size,
+                    effect_y + dy + size,
+                ),
+                fill=(238, 76, 60),
             )
+    elif action.startswith("block_"):
+        target = left_box if action == "block_left" else right_box
+        x1, y1, x2, y2 = target
+        draw.rounded_rectangle(
+            (x1 + 8, y1 + 8, x2 - 8, y2 - 8),
+            radius=17,
+            outline=(79, 153, 224),
+            width=6,
+        )
+        draw.text(
+            ((x1 + x2) // 2, y1 + 145),
+            "BLOCKED",
+            font=_font(17, bold=True),
+            fill=(117, 189, 255),
+            anchor="mm",
+        )
     elif action.startswith("heal_"):
         target = left_box if action == "heal_left" else right_box
         x1, y1, _, _ = target
-        for dx, dy in ((45, 150), (78, 172), (115, 145), (150, 178)):
-            draw.ellipse(
-                (x1 + dx, y1 + dy, x1 + dx + 10, y1 + dy + 10),
+        apple = _item_sprite("golden_apple.png", 48)
+        canvas.paste(apple, (x1 + 190, y1 + 122), apple)
+        effect_draw = ImageDraw.Draw(canvas)
+        for dx, dy in ((165, 128), (178, 154), (244, 132), (254, 158)):
+            effect_draw.rectangle(
+                (x1 + dx, y1 + dy, x1 + dx + 7, y1 + dy + 7),
                 fill=(105, 231, 114),
             )
     elif action.startswith("victory_"):
@@ -306,7 +359,8 @@ def render_pvp_board(
     draw.text(
         (550, 239), "VS", font=_font(20, bold=True), fill=(240, 244, 237), anchor="mm"
     )
-    _draw_action_effect(draw, action, left_box, right_box)
+    _draw_action_effect(canvas, draw, action, left_box, right_box, left, right)
+    draw = ImageDraw.Draw(canvas)
 
     draw.rounded_rectangle(
         (34, 482, 1066, 536), radius=14, fill=(20, 26, 22), outline=(58, 70, 60)

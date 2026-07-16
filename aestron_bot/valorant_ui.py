@@ -7,7 +7,7 @@ from io import BytesIO
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
 
 from .valorant_analytics import MatchPerformance, PlayerSummary, coaching_notes
-from .valorant_assets import MapArtwork, ValorantArtwork
+from .valorant_assets import EquipmentArtwork, MapArtwork, ValorantArtwork
 
 WIDTH = 1200
 HEIGHT = 760
@@ -150,6 +150,49 @@ def _sparkline(
         draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color)
 
 
+def _equipment_card(
+    canvas: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    label: str,
+    equipment: EquipmentArtwork | None,
+    fallback: str,
+) -> None:
+    """Draw one weapon or shield card with current public store metadata."""
+    x1, y1, x2, y2 = box
+    _panel(draw, box, fill=(17, 28, 38))
+    name = equipment.display_name if equipment else fallback
+    detail = (
+        f"{equipment.cost:,} credits · {equipment.category}"
+        if equipment and equipment.cost
+        else "Store metadata unavailable"
+    )
+    icon = _asset(equipment.display_icon) if equipment else None
+    if icon is not None:
+        icon.thumbnail((x2 - x1 - 32, 60), Image.Resampling.LANCZOS)
+        icon_x = x1 + (x2 - x1 - icon.width) // 2
+        canvas.paste(icon, (icon_x, y1 + 30), icon)
+    card_draw = ImageDraw.Draw(canvas)
+    _text(card_draw, (x1 + 14, y1 + 12), label, size=9, color=MUTED, bold=True)
+    _text(
+        card_draw,
+        ((x1 + x2) // 2, y2 - 39),
+        _fit(name, 25),
+        size=16,
+        bold=True,
+        anchor="ma",
+    )
+    _text(
+        card_draw, ((x1 + x2) // 2, y2 - 15), detail, size=9, color=MUTED, anchor="ma"
+    )
+
+
+def _equipment_fallback(identifier: str, label: str) -> str:
+    """Avoid displaying opaque Riot UUIDs when artwork metadata is unavailable."""
+    candidate = identifier.rstrip("/").rsplit("/", maxsplit=1)[-1].strip()
+    return candidate if candidate and len(candidate) <= 24 else f"Unknown {label}"
+
+
 def _map_plot(
     canvas: Image.Image,
     draw: ImageDraw.ImageDraw,
@@ -275,26 +318,78 @@ def _round_detail(
         or "no opening duel",
         accent=GOLD,
     )
-    _text(draw, (700, 382), "ECONOMY", size=11, color=MUTED, bold=True)
-    for index, (label, value) in enumerate(
+    weapon_art = artwork.weapons.get(detail.weapon)
+    armor_art = artwork.gear.get(detail.armor)
+    _equipment_card(
+        canvas,
+        draw,
+        (700, 373, 910, 515),
+        "PRIMARY WEAPON",
+        weapon_art,
+        _equipment_fallback(detail.weapon, "weapon"),
+    )
+    _equipment_card(
+        canvas,
+        draw,
+        (922, 373, 1132, 515),
+        "SHIELD",
+        armor_art,
+        _equipment_fallback(detail.armor, "shield"),
+    )
+    draw = ImageDraw.Draw(canvas)
+    for index, (label, value, accent) in enumerate(
         (
-            ("Loadout", f"{detail.loadout_value:,}"),
-            ("Spent", f"{detail.spent:,}"),
-            ("Remaining", f"{detail.remaining:,}"),
-            ("Armor", detail.armor.rsplit("/", 1)[-1]),
+            ("LOADOUT", f"{detail.loadout_value:,}", BLUE),
+            ("SPENT", f"{detail.spent:,}", GOLD),
+            ("BANK", f"{detail.remaining:,}", MINT),
+            (
+                "DAMAGE DIFF",
+                f"{detail.damage_delta:+d}",
+                RED if detail.damage_delta < 0 else MINT,
+            ),
         )
     ):
-        x = 700 + (index % 2) * 216
-        y = 414 + (index // 2) * 76
-        _text(draw, (x, y), label.upper(), size=9, color=MUTED, bold=True)
-        _text(draw, (x, y + 27), value, size=18, bold=True)
+        x = 700 + index * 108
+        _text(draw, (x, 541), label, size=8, color=MUTED, bold=True)
+        _text(draw, (x, 567), value, size=17, color=accent, bold=True)
     _text(
         draw,
-        (700, 573),
-        "PLAYER-INVOLVED FINISHING WEAPONS",
+        (700, 604),
+        "HIT PROFILE",
         size=10,
         color=MUTED,
         bold=True,
+    )
+    _text(
+        draw,
+        (1132, 604),
+        f"{detail.headshot_rate:.1f}% HEADSHOT HITS",
+        size=10,
+        color=GOLD,
+        bold=True,
+        anchor="ra",
+    )
+    total_hits = detail.headshots + detail.bodyshots + detail.legshots
+    _bar(
+        draw,
+        (700, 621, 1132, 632),
+        detail.headshots / max(1, total_hits),
+        color=RED,
+    )
+    _text(
+        draw,
+        (700, 648),
+        f"{detail.headshots} head · {detail.bodyshots} body · {detail.legshots} leg",
+        size=10,
+        color=MUTED,
+    )
+    _text(
+        draw,
+        (1132, 648),
+        f"{detail.damage_received} received · opener {detail.opening_result or 'none'}",
+        size=10,
+        color=MUTED,
+        anchor="ra",
     )
     weapon_events = [
         item
@@ -302,20 +397,21 @@ def _round_detail(
         if item.round_number == round_number and item.weapon_id in artwork.weapons
     ]
     for index, event in enumerate(weapon_events[:3]):
-        weapon = _asset(artwork.weapons[event.weapon_id])
+        item_art = artwork.weapons[event.weapon_id]
+        weapon = _asset(item_art.kill_stream_icon or item_art.display_icon)
         if weapon is None:
             continue
-        weapon.thumbnail((125, 52), Image.Resampling.LANCZOS)
-        x = 700 + index * 140
-        canvas.paste(weapon, (x, 610), weapon)
+        weapon.thumbnail((105, 35), Image.Resampling.LANCZOS)
+        x = 700 + index * 142
+        canvas.paste(weapon, (x, 668), weapon)
         _text(
-            draw,
-            (x + 62, 680),
-            event.outcome.upper(),
-            size=9,
+            ImageDraw.Draw(canvas),
+            (x + 112, 685),
+            "K" if event.outcome == "kill" else "D",
+            size=8,
             color=MINT if event.outcome == "kill" else RED,
             bold=True,
-            anchor="ma",
+            anchor="lm",
         )
 
 
@@ -462,7 +558,7 @@ def _matches(
         for x, label, value in (
             (790, "ACS", f"{match.acs:.0f}"),
             (900, "ADR", f"{match.adr:.0f}"),
-            (1010, "DDΔ", f"{match.damage_delta:+.0f}"),
+            (1010, "DMG +/-", f"{match.damage_delta:+.0f}"),
         ):
             _text(draw, (x, y + 17), label, size=10, color=MUTED, bold=True)
             _text(draw, (x, y + 39), value, size=15, bold=True)
@@ -596,7 +692,13 @@ def _rounds(draw: ImageDraw.ImageDraw, match: MatchPerformance) -> None:
             size=19,
             bold=True,
         )
-        _text(draw, (x + 104, y + 47), f"{item.damage} dmg", size=12, color=MUTED)
+        _text(
+            draw,
+            (x + 104, y + 47),
+            f"{item.damage} dmg · diff {item.damage_delta:+d}",
+            size=11,
+            color=MUTED,
+        )
         if item.opening_result:
             _text(
                 draw,

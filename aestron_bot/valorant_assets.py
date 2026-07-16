@@ -30,6 +30,17 @@ class MapArtwork:
     y_scalar: float
 
 
+@dataclass(frozen=True, slots=True)
+class EquipmentArtwork:
+    """One current weapon or shield with its public store metadata."""
+
+    display_name: str
+    display_icon: bytes
+    kill_stream_icon: bytes
+    cost: int
+    category: str
+
+
 @dataclass(slots=True)
 class ValorantArtwork:
     """Bounded artwork required by one interactive stats session."""
@@ -37,7 +48,8 @@ class ValorantArtwork:
     maps: dict[str, MapArtwork] = field(default_factory=dict)
     agents: dict[str, bytes] = field(default_factory=dict)
     cards: dict[str, bytes] = field(default_factory=dict)
-    weapons: dict[str, bytes] = field(default_factory=dict)
+    weapons: dict[str, EquipmentArtwork] = field(default_factory=dict)
+    gear: dict[str, EquipmentArtwork] = field(default_factory=dict)
 
 
 class ValorantAssetService:
@@ -89,6 +101,18 @@ class ValorantAssetService:
             for event in match.kill_locations
             if SAFE_ID.fullmatch(event.weapon_id)
         }
+        weapon_ids.update(
+            detail.weapon
+            for match in matches
+            for detail in match.round_details
+            if SAFE_ID.fullmatch(detail.weapon)
+        )
+        gear_ids = {
+            detail.armor
+            for match in matches
+            for detail in match.round_details
+            if SAFE_ID.fullmatch(detail.armor)
+        }
 
         tasks = []
         labels = []
@@ -100,11 +124,13 @@ class ValorantAssetService:
             ("agent", agent_ids),
             ("card", card_ids),
             ("weapon", weapon_ids),
+            ("gear", gear_ids),
         ):
             endpoint = {
                 "agent": "agents",
                 "card": "playercards",
                 "weapon": "weapons",
+                "gear": "gear",
             }[category]
             for identifier in identifiers:
                 labels.append((category, identifier, None))
@@ -120,8 +146,10 @@ class ValorantAssetService:
                 artwork.agents[identifier] = result
             elif category == "card":
                 artwork.cards[identifier] = result
-            else:
+            elif category == "weapon":
                 artwork.weapons[identifier] = result
+            else:
+                artwork.gear[identifier] = result
         return artwork
 
     async def _load_map(self, item: dict[str, Any]) -> MapArtwork | None:
@@ -144,14 +172,36 @@ class ValorantAssetService:
 
     async def _load_item(
         self, endpoint: str, identifier: str, category: str
-    ) -> bytes | None:
+    ) -> bytes | EquipmentArtwork | None:
         payload = await self._json(f"/{endpoint}/{identifier}", ttl=12 * 60 * 60)
         if not isinstance(payload, dict):
             return None
+        if category in {"weapon", "gear"}:
+            display_url = str(payload.get("displayIcon") or "")
+            kill_stream_url = str(payload.get("killStreamIcon") or "")
+            if not display_url.startswith("https://media.valorant-api.com/"):
+                return None
+            display_icon, kill_stream_icon = await asyncio.gather(
+                self._media(display_url),
+                self._media(kill_stream_url)
+                if kill_stream_url.startswith("https://media.valorant-api.com/")
+                else asyncio.sleep(0, result=b""),
+            )
+            shop_data = payload.get("shopData") or {}
+            return EquipmentArtwork(
+                display_name=str(payload.get("displayName") or "Unknown equipment"),
+                display_icon=display_icon,
+                kill_stream_icon=kill_stream_icon,
+                cost=int(shop_data.get("cost") or 0),
+                category=str(
+                    shop_data.get("categoryText")
+                    or shop_data.get("category")
+                    or category
+                ),
+            )
         key = {
             "agent": "fullPortraitV2",
             "card": "wideArt",
-            "weapon": "killStreamIcon",
         }[category]
         url = str(payload.get(key) or payload.get("displayIcon") or "")
         if not url.startswith("https://media.valorant-api.com/"):
