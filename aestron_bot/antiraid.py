@@ -228,31 +228,36 @@ class AntiRaid(commands.Cog):
         if missing:
             raise commands.BotMissingPermissions(missing)
         async with self.bot.database.pool.acquire() as connection:
-            await connection.execute(
-                "INSERT INTO antiraid_settings "
-                "(guild_id, log_channel_id, enabled) VALUES ($1, $2, TRUE) "
-                "ON CONFLICT (guild_id) DO UPDATE SET "
-                "log_channel_id = EXCLUDED.log_channel_id, enabled = TRUE, updated_at = NOW()",
-                guild.id,
-                channel.id,
-            )
-            await connection.execute(
-                "INSERT INTO antiraid (guildid, channelid) VALUES ($1, $2) "
-                "ON CONFLICT (guildid) DO UPDATE SET channelid = EXCLUDED.channelid",
-                guild.id,
-                channel.id,
-            )
+            async with connection.transaction():
+                await connection.execute(
+                    "INSERT INTO antiraid_settings "
+                    "(guild_id, log_channel_id, enabled) VALUES ($1, $2, TRUE) "
+                    "ON CONFLICT (guild_id) DO UPDATE SET "
+                    "log_channel_id = EXCLUDED.log_channel_id, enabled = TRUE, "
+                    "updated_at = NOW()",
+                    guild.id,
+                    channel.id,
+                )
+                # ``antiraid`` is an old import-only table. Some installations
+                # created it before guildid was unique, so mirroring with an
+                # ON CONFLICT target is unsafe. Remove the migrated row to stop
+                # stale legacy data being imported on a later restart.
+                await connection.execute(
+                    "DELETE FROM antiraid WHERE guildid = $1",
+                    guild.id,
+                )
 
     async def _disable(self, guild_id: int) -> None:
         async with self.bot.database.pool.acquire() as connection:
-            await connection.execute(
-                "UPDATE antiraid_settings SET enabled = FALSE, updated_at = NOW() "
-                "WHERE guild_id = $1",
-                guild_id,
-            )
-            await connection.execute(
-                "DELETE FROM antiraid WHERE guildid = $1", guild_id
-            )
+            async with connection.transaction():
+                await connection.execute(
+                    "UPDATE antiraid_settings SET enabled = FALSE, updated_at = NOW() "
+                    "WHERE guild_id = $1",
+                    guild_id,
+                )
+                await connection.execute(
+                    "DELETE FROM antiraid WHERE guildid = $1", guild_id
+                )
         for key in [key for key in self._windows if key[0] == guild_id]:
             self._windows.pop(key, None)
 
@@ -417,8 +422,9 @@ class AntiRaid(commands.Cog):
         self, interaction: discord.Interaction, channel: discord.TextChannel
     ) -> None:
         """Enable anti-raid through slash commands."""
+        await interaction.response.defer(ephemeral=True)
         await self._enable(interaction.guild, channel)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Anti-raid enabled. Alerts will be sent to {channel.mention}.",
             ephemeral=True,
         )
@@ -429,10 +435,9 @@ class AntiRaid(commands.Cog):
     @app_commands.checks.cooldown(1, 10, key=lambda interaction: interaction.guild_id)
     async def slash_disable(self, interaction: discord.Interaction) -> None:
         """Disable anti-raid through slash commands."""
+        await interaction.response.defer(ephemeral=True)
         await self._disable(interaction.guild_id)
-        await interaction.response.send_message(
-            "Anti-raid is disabled.", ephemeral=True
-        )
+        await interaction.followup.send("Anti-raid is disabled.", ephemeral=True)
 
     @antiraid.command(name="status", description="Show anti-raid health and incidents.")
     @app_commands.default_permissions(manage_guild=True)
@@ -465,10 +470,11 @@ class AntiRaid(commands.Cog):
         window_seconds: app_commands.Range[int, 5, 120] = 20,
     ) -> None:
         """Configure anti-raid through slash commands."""
+        await interaction.response.defer(ephemeral=True)
         await self._configure(
             interaction.guild_id, action.value, threshold, window_seconds
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Anti-raid set to **{action.name}** at **{threshold}** actions per "
             f"**{window_seconds}s**.",
             ephemeral=True,

@@ -216,6 +216,67 @@ def test_antiraid_covers_destructive_actions_and_permissions():
     )
 
 
+def test_antiraid_enable_uses_canonical_transactional_settings():
+    """Old anti-raid tables must not be used as an upsert conflict target."""
+
+    class AsyncContext:
+        def __init__(self, value):
+            self.value = value
+
+        async def __aenter__(self):
+            return self.value
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Connection:
+        def __init__(self):
+            self.executions = []
+            self.transactions = 0
+
+        def transaction(self):
+            self.transactions += 1
+            return AsyncContext(self)
+
+        async def execute(self, query, *args):
+            self.executions.append((" ".join(query.split()), args))
+
+    async def run_test():
+        connection = Connection()
+        pool = SimpleNamespace(acquire=lambda: AsyncContext(connection))
+        cog = AntiRaid(SimpleNamespace(database=SimpleNamespace(pool=pool)))
+        guild = SimpleNamespace(id=91, me=object())
+        permissions = SimpleNamespace(
+            view_channel=True,
+            send_messages=True,
+            embed_links=True,
+            view_audit_log=True,
+        )
+        channel = SimpleNamespace(
+            id=37,
+            guild=guild,
+            permissions_for=lambda _member: permissions,
+        )
+
+        await cog._enable(guild, channel)
+
+        assert connection.transactions == 1
+        assert len(connection.executions) == 2
+        settings_query, settings_args = connection.executions[0]
+        cleanup_query, cleanup_args = connection.executions[1]
+        assert "INSERT INTO antiraid_settings" in settings_query
+        assert "ON CONFLICT (guild_id) DO UPDATE" in settings_query
+        assert settings_args == (91, 37)
+        assert cleanup_query == "DELETE FROM antiraid WHERE guildid = $1"
+        assert cleanup_args == (91,)
+        assert all(
+            "ON CONFLICT (guildid)" not in query
+            for query, _args in connection.executions
+        )
+
+    asyncio.run(run_test())
+
+
 def test_template_and_antiraid_mutations_have_runtime_guards():
     """High-impact slash actions require checks in addition to UI defaults."""
     template_checks = {
