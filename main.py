@@ -1088,7 +1088,7 @@ class MinecraftFun(commands.Cog):
         self.bot = bot
 
     async def cog_load(self) -> None:
-        """Create restart-safe reward cooldown storage."""
+        """Create restart-safe reward and PvP leaderboard storage."""
         if not self.bot.database.connected:
             return
         async with self.bot.database.pool.acquire() as con:
@@ -1100,6 +1100,18 @@ class MinecraftFun(commands.Cog):
                     claimed_at TIMESTAMPTZ NOT NULL,
                     PRIMARY KEY (memberid, reward_type)
                 )
+                """
+            )
+            await con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS leaderboard (
+                    mention TEXT PRIMARY KEY,
+                    wins BIGINT NOT NULL DEFAULT 0
+                );
+                ALTER TABLE leaderboard ADD COLUMN IF NOT EXISTS wins BIGINT;
+                UPDATE leaderboard SET wins = 1 WHERE wins IS NULL;
+                ALTER TABLE leaderboard ALTER COLUMN wins SET DEFAULT 0;
+                ALTER TABLE leaderboard ALTER COLUMN wins SET NOT NULL;
                 """
             )
 
@@ -1574,8 +1586,8 @@ class MinecraftFun(commands.Cog):
     async def pvpleaderboard(self, ctx):
         async with client.database.pool.acquire() as con:
             leaders = await con.fetch(
-                "SELECT mention, COUNT(*) AS wins FROM leaderboard "
-                "GROUP BY mention ORDER BY wins DESC, mention ASC LIMIT 10"
+                "SELECT mention, wins FROM leaderboard "
+                "ORDER BY wins DESC, mention ASC LIMIT 10"
             )
 
         embed_one = discord.Embed(
@@ -2698,6 +2710,7 @@ class Minecraftpvp(discord.ui.View):
         self.last_event = f"{memberone_name} takes the opening turn."
         self.last_action = "idle"
         self.finished = False
+        self._completion_lock = asyncio.Lock()
 
     def _finish(self, *, delay: float = 2.5) -> None:
         """Stop controls and release the temporary voice session."""
@@ -2776,7 +2789,8 @@ class Minecraftpvp(discord.ui.View):
             return False
         return True
 
-    async def _refresh(self, interaction: discord.Interaction) -> None:
+    async def _refresh_message(self, interaction: discord.Interaction) -> None:
+        """Render and edit the Discord message without overriding View internals."""
         board = await asyncio.to_thread(self.render_board)
         file = discord.File(BytesIO(board), filename="minecraft-pvp.png")
         embed = discord.Embed(
@@ -2818,7 +2832,10 @@ class Minecraftpvp(discord.ui.View):
                 loser_id,
             )
             await con.execute(
-                "INSERT INTO leaderboard (mention) VALUES ($1)", str(winner_id)
+                "INSERT INTO leaderboard (mention, wins) VALUES ($1, 1) "
+                "ON CONFLICT (mention) DO UPDATE "
+                "SET wins = leaderboard.wins + 1",
+                str(winner_id),
             )
 
     async def _complete_fight(
@@ -2831,21 +2848,25 @@ class Minecraftpvp(discord.ui.View):
         loser_name: str,
         surrendered: bool = False,
     ) -> None:
-        reward = 25 if surrendered else 50
-        await self._award(winner_id, loser_id, reward)
-        self.last_event = (
-            f"{loser_name} yielded. {winner_name} wins (+{reward}); "
-            f"{loser_name} receives +5."
-            if surrendered
-            else f"{winner_name} defeated {loser_name} (+{reward}); "
-            f"{loser_name} receives +5."
-        )
-        self.last_action = f"victory_{self._side_for(winner_id)}"
-        self._finish()
-        play_minecraft_sound(
-            self.vc, "Event_raidhorn4.ogg" if surrendered else "Player_hurt1.ogg"
-        )
-        await self._refresh(interaction)
+        async with self._completion_lock:
+            if self.finished:
+                return
+            reward = 25 if surrendered else 50
+            await self._award(winner_id, loser_id, reward)
+            self.last_event = (
+                f"{loser_name} yielded. {winner_name} wins (+{reward}); "
+                f"{loser_name} receives +5."
+                if surrendered
+                else f"{winner_name} defeated {loser_name} (+{reward}); "
+                f"{loser_name} receives +5."
+            )
+            self.last_action = f"victory_{self._side_for(winner_id)}"
+            self._finish()
+            play_minecraft_sound(
+                self.vc,
+                "Event_raidhorn4.ogg" if surrendered else "Player_hurt1.ogg",
+            )
+            await self._refresh_message(interaction)
 
     async def on_timeout(self) -> None:
         if self.finished:
@@ -2950,7 +2971,7 @@ class Minecraftpvp(discord.ui.View):
         self.last_event = f"{name} raised a shield. The next strike will be blocked."
         self.last_action = "idle"
         play_minecraft_sound(self.vc, "Equip_netherite4.ogg")
-        await self._refresh(interaction)
+        await self._refresh_message(interaction)
 
     @discord.ui.button(
         label="Golden apple",
@@ -3013,7 +3034,7 @@ class Minecraftpvp(discord.ui.View):
         self.last_event = f"{name} restored {restored:.1f} health with a golden apple."
         self.last_action = f"heal_{side}"
         play_minecraft_sound(self.vc, "Random_levelup.ogg")
-        await self._refresh(interaction)
+        await self._refresh_message(interaction)
 
     @discord.ui.button(
         label="Strike",
@@ -3092,7 +3113,7 @@ class Minecraftpvp(discord.ui.View):
                 loser_name=loser[1],
             )
             return
-        await self._refresh(interaction)
+        await self._refresh_message(interaction)
 
 
 def is_custom_command(command_name):

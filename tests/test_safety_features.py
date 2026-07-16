@@ -296,9 +296,11 @@ def test_fun_leveling_and_minecraft_regressions_are_registered():
         fun_commands
     )
     reward_source = inspect.getsource(main.MinecraftFun._claim_reward)
+    setup_source = inspect.getsource(main.MinecraftFun.cog_load)
     payment_source = inspect.getsource(main.MinecraftFun.payment.callback)
     pvp_source = inspect.getsource(main.MinecraftFun.pvp.callback)
     assert "minecraft_reward_claims" in reward_source
+    assert "ALTER TABLE leaderboard ADD COLUMN IF NOT EXISTS wins" in setup_source
     assert "con.transaction()" in reward_source
     assert "await uservoted" in reward_source
     assert "FOR UPDATE" in payment_source
@@ -331,8 +333,12 @@ def test_fun_leveling_and_minecraft_regressions_are_registered():
     assert len(view.render_board()) > 10_000
     attack_source = inspect.getsource(main.Minecraftpvp.attack)
     assert attack_source.index("await interaction.response.defer") < (
-        attack_source.index("await self._refresh")
+        attack_source.index("await self._refresh_message")
     )
+    assert main.Minecraftpvp._refresh is discord.ui.View._refresh
+    award_source = inspect.getsource(main.Minecraftpvp._award)
+    assert "ON CONFLICT (mention) DO UPDATE" in award_source
+    assert "wins = leaderboard.wins + 1" in award_source
 
 
 def test_minecraft_golden_apple_is_not_wasted_at_full_health():

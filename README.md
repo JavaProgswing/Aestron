@@ -298,7 +298,7 @@ CREATE TABLE levelsettings
 CREATE TABLE verifymsg
 (messageid bigint ,channelid bigint ,guildid bigint PRIMARY KEY);
 CREATE TABLE leaderboard
-(mention text PRIMARY KEY);
+(mention text PRIMARY KEY, wins bigint NOT NULL DEFAULT 0);
 CREATE TABLE cautionraid
 (guildid bigint PRIMARY KEY);
 CREATE TABLE warnings

@@ -37,6 +37,7 @@ PRODUCT_UPDATES = (
             "Round cards now resolve primary weapons and shields with current artwork and store metadata, then show damage received, damage differential, and recorded head/body/leg hits.",
             "The dashboard never estimates hidden MMR or ELO; every displayed metric is derived from a documented match field or clearly labelled aggregate.",
             "Minecraft PvP and inventory use cached in-game item sprites, remove unsupported display glyphs, preserve full-health golden apples, and acknowledge Discord before image rendering, audio, or reward writes.",
+            "PvP completion no longer shadows discord.py's internal view refresh method; leaderboard wins are migrated to an atomic counter and final-move rewards are protected from duplicate clicks.",
             "Fun commands share a consistent rendered-card system while preserving replay, scoring, elimination, and live-vote controls.",
         ),
         commands=(
