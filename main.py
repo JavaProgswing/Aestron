@@ -49,6 +49,7 @@ from aestron_bot import (
 )
 from aestron_bot.calculator import evaluate_expression
 from aestron_bot.feedback import Feedback as ModernFeedback
+from aestron_bot.fun import FunGames
 from aestron_bot.help_ui import (
     HelpCategory,
     InteractiveHelpView,
@@ -666,6 +667,7 @@ def get_cog_types():
         Misc,
         Call,
         Fun,
+        FunGames,
         Social,
         Giveaways,
         Support,

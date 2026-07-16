@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 import discord
 import wavelink
+from discord import app_commands
 from discord.ext import commands
 
 from .lavalink import LavalinkService
@@ -42,6 +43,30 @@ def _format_duration(milliseconds: int) -> str:
     return str(timedelta(milliseconds=milliseconds)).split(".", maxsplit=1)[0]
 
 
+def _parse_timestamp(value: str) -> int:
+    """Parse SS, MM:SS, or HH:MM:SS into milliseconds."""
+    parts = value.strip().split(":")
+    if not 1 <= len(parts) <= 3 or any(not part.isdecimal() for part in parts):
+        raise ValueError("Use seconds, MM:SS, or HH:MM:SS.")
+    numbers = [int(part) for part in parts]
+    if len(numbers) > 1 and numbers[-1] >= 60:
+        raise ValueError("Seconds must be below 60 in a timestamp.")
+    if len(numbers) == 3 and numbers[-2] >= 60:
+        raise ValueError("Minutes must be below 60 in HH:MM:SS.")
+    seconds = sum(number * 60**power for power, number in enumerate(reversed(numbers)))
+    return seconds * 1000
+
+
+def _queue_mode_label(mode: wavelink.QueueMode) -> str:
+    """Return a readable queue repeat mode."""
+    labels = {
+        wavelink.QueueMode.normal: "Off",
+        wavelink.QueueMode.loop: "Track",
+        wavelink.QueueMode.loop_all: "Queue",
+    }
+    return labels.get(mode, "Off")
+
+
 def _now_playing_embed(
     player: wavelink.Player,
     track: wavelink.Playable,
@@ -65,6 +90,7 @@ def _now_playing_embed(
     embed.add_field(name="Duration", value=f"`{_format_duration(track.length)}`")
     embed.add_field(name="Volume", value=f"`{player.volume}%`")
     embed.add_field(name="Up next", value=f"`{player.queue.count}` track(s)")
+    embed.add_field(name="Repeat", value=f"`{_queue_mode_label(player.queue.mode)}`")
     if requester_id:
         embed.add_field(
             name="Requested by",
@@ -115,6 +141,62 @@ class VolumeSelect(discord.ui.Select):
             option.default = option.value == str(level)
         embed = _now_playing_embed(self.player, self.player.current)
         await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class LoopModeSelect(discord.ui.Select):
+    """Repeat-mode selector for the active player."""
+
+    modes = {
+        "off": wavelink.QueueMode.normal,
+        "track": wavelink.QueueMode.loop,
+        "queue": wavelink.QueueMode.loop_all,
+    }
+
+    def __init__(self, player: wavelink.Player) -> None:
+        """Create options reflecting the current queue mode."""
+        self.player = player
+        current = player.queue.mode
+        super().__init__(
+            placeholder=f"Repeat • {_queue_mode_label(current)}",
+            options=[
+                discord.SelectOption(
+                    label="Off",
+                    value="off",
+                    emoji="➡️",
+                    default=current is wavelink.QueueMode.normal,
+                ),
+                discord.SelectOption(
+                    label="Current track",
+                    value="track",
+                    emoji="🔂",
+                    default=current is wavelink.QueueMode.loop,
+                ),
+                discord.SelectOption(
+                    label="Entire queue",
+                    value="queue",
+                    emoji="🔁",
+                    default=current is wavelink.QueueMode.loop_all,
+                ),
+            ],
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """Change repeat mode and refresh the now-playing card."""
+        mode = self.modes[self.values[0]]
+        self.player.queue.mode = mode
+        self.placeholder = f"Repeat • {_queue_mode_label(mode)}"
+        for option in self.options:
+            option.default = option.value == self.values[0]
+        track = self.player.current
+        if track is None:
+            await interaction.response.send_message(
+                "Nothing is currently playing.", ephemeral=True
+            )
+            return
+        await interaction.response.edit_message(
+            embed=_now_playing_embed(self.player, track), view=self.view
+        )
 
 
 class QueueView(discord.ui.View):
@@ -219,6 +301,7 @@ class SongPanel(discord.ui.View):
         self.player = player
         self.message: discord.Message | None = None
         self.add_item(VolumeSelect(player))
+        self.add_item(LoopModeSelect(player))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Restrict controls to listeners and channel managers."""
@@ -316,6 +399,10 @@ class SongPanel(discord.ui.View):
 class Music(commands.Cog):
     """Reliable, asynchronous Lavalink music playback commands."""
 
+    music_controls = app_commands.Group(
+        name="music", description="Advanced queue and playback controls."
+    )
+
     def __init__(self, bot: commands.Bot) -> None:
         """Initialize per-guild playback locks."""
         self.bot = bot
@@ -335,7 +422,54 @@ class Music(commands.Cog):
         return cast(LavalinkService, self.bot.lavalink)
 
     def _guild_lock(self, guild_id: int) -> asyncio.Lock:
+        """Return the serialization lock for one guild player."""
         return self._guild_locks.setdefault(guild_id, asyncio.Lock())
+
+    async def _controllable_player(
+        self, ctx: commands.Context, *, require_track: bool = True
+    ) -> wavelink.Player | None:
+        """Resolve an active player and enforce same-channel control."""
+        player = ctx.voice_client
+        if not isinstance(player, wavelink.Player):
+            await self._send_error(ctx, "I am not connected for music playback.")
+            return None
+        if require_track and player.current is None:
+            await self._send_error(ctx, "Nothing is currently playing.")
+            return None
+        member = ctx.author
+        can_manage = ctx.channel.permissions_for(member).manage_channels
+        voice = getattr(member, "voice", None)
+        if not can_manage and (voice is None or voice.channel != player.channel):
+            await self._send_error(ctx, "Join my voice channel to control playback.")
+            return None
+        return player
+
+    async def _interaction_player(
+        self, interaction: discord.Interaction, *, require_track: bool = True
+    ) -> wavelink.Player | None:
+        """Resolve a same-channel player for grouped slash controls."""
+        guild = interaction.guild
+        player = guild.voice_client if guild is not None else None
+        if not isinstance(player, wavelink.Player):
+            await interaction.response.send_message(
+                "I am not connected for music playback.", ephemeral=True
+            )
+            return None
+        if require_track and player.current is None:
+            await interaction.response.send_message(
+                "Nothing is currently playing.", ephemeral=True
+            )
+            return None
+        member = interaction.user
+        permissions = getattr(member, "guild_permissions", None)
+        can_manage = bool(permissions and permissions.manage_channels)
+        voice = getattr(member, "voice", None)
+        if not can_manage and (voice is None or voice.channel != player.channel):
+            await interaction.response.send_message(
+                "Join my voice channel to control playback.", ephemeral=True
+            )
+            return None
+        return player
 
     @staticmethod
     async def _send_error(ctx: commands.Context, message: str) -> None:
@@ -737,6 +871,222 @@ class Music(commands.Cog):
             return
         await player.set_volume(level)
         await ctx.send(f"Volume set to **{level}%**.")
+
+    @commands.hybrid_command(
+        with_app_command=False,
+        brief="Repeat a track or the whole queue.",
+        description="Set repeat mode to off, track, or queue.",
+        usage="<off|track|queue>",
+    )
+    @commands.guild_only()
+    async def loop(self, ctx: commands.Context, mode: str) -> None:
+        """Set the Wavelink queue repeat mode."""
+        player = await self._controllable_player(ctx)
+        if player is None:
+            return
+        modes = {
+            "off": wavelink.QueueMode.normal,
+            "track": wavelink.QueueMode.loop,
+            "queue": wavelink.QueueMode.loop_all,
+        }
+        normalized = mode.casefold()
+        if normalized not in modes:
+            raise commands.BadArgument("Mode must be `off`, `track`, or `queue`.")
+        player.queue.mode = modes[normalized]
+        await ctx.send(f"Repeat mode set to **{normalized}**.")
+
+    @commands.hybrid_command(
+        with_app_command=False,
+        brief="Shuffle the waiting tracks.",
+        description="Randomize every upcoming track without changing the current song.",
+        usage="",
+    )
+    @commands.guild_only()
+    async def shuffle(self, ctx: commands.Context) -> None:
+        """Shuffle the upcoming queue."""
+        player = await self._controllable_player(ctx, require_track=False)
+        if player is None:
+            return
+        if player.queue.count < 2:
+            await self._send_error(ctx, "Add at least two tracks before shuffling.")
+            return
+        player.queue.shuffle()
+        await ctx.send(f"Shuffled **{player.queue.count}** upcoming tracks. 🔀")
+
+    @commands.hybrid_command(
+        with_app_command=False,
+        brief="Remove an upcoming track.",
+        description="Remove a track by its one-based position from `/queue`.",
+        usage="<position>",
+    )
+    @commands.guild_only()
+    async def remove(
+        self, ctx: commands.Context, position: commands.Range[int, 1, 1000]
+    ) -> None:
+        """Remove one upcoming queue item."""
+        player = await self._controllable_player(ctx, require_track=False)
+        if player is None:
+            return
+        if position > player.queue.count:
+            raise commands.BadArgument(
+                f"Position must be between 1 and {player.queue.count}."
+            )
+        removed = player.queue.peek(position - 1)
+        player.queue.delete(position - 1)
+        await ctx.send(f"Removed **{removed.title}** from the queue.")
+
+    @commands.hybrid_command(
+        with_app_command=False,
+        name="clearqueue",
+        aliases=["clearq"],
+        brief="Clear every upcoming track.",
+        description="Remove the waiting queue while leaving the current song playing.",
+        usage="",
+    )
+    @commands.guild_only()
+    async def clear_queue(self, ctx: commands.Context) -> None:
+        """Clear all upcoming tracks."""
+        player = await self._controllable_player(ctx, require_track=False)
+        if player is None:
+            return
+        count = player.queue.count
+        player.queue.clear()
+        await ctx.send(f"Cleared **{count}** upcoming track(s).")
+
+    @commands.hybrid_command(
+        with_app_command=False,
+        brief="Seek within the current track.",
+        description="Jump to a position using seconds, MM:SS, or HH:MM:SS.",
+        usage="<seconds|MM:SS|HH:MM:SS>",
+    )
+    @commands.guild_only()
+    async def seek(self, ctx: commands.Context, position: str) -> None:
+        """Seek the current non-stream track to a validated position."""
+        player = await self._controllable_player(ctx)
+        if player is None or player.current is None:
+            return
+        try:
+            milliseconds = _parse_timestamp(position)
+        except ValueError as error:
+            raise commands.BadArgument(str(error)) from error
+        if player.current.is_stream:
+            await self._send_error(ctx, "Live streams do not support seeking.")
+            return
+        if milliseconds >= player.current.length:
+            raise commands.BadArgument(
+                f"Position must be before {_format_duration(player.current.length)}."
+            )
+        await player.seek(milliseconds)
+        await ctx.send(f"Jumped to **{_format_duration(milliseconds)}**.")
+
+    @music_controls.command(name="loop", description="Set the queue repeat mode.")
+    @app_commands.describe(mode="Repeat off, the current track, or the entire queue.")
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="Off", value="off"),
+            app_commands.Choice(name="Current track", value="track"),
+            app_commands.Choice(name="Entire queue", value="queue"),
+        ]
+    )
+    async def slash_loop(
+        self, interaction: discord.Interaction, mode: app_commands.Choice[str]
+    ) -> None:
+        """Set repeat mode through the grouped slash command."""
+        player = await self._interaction_player(interaction)
+        if player is None:
+            return
+        modes = {
+            "off": wavelink.QueueMode.normal,
+            "track": wavelink.QueueMode.loop,
+            "queue": wavelink.QueueMode.loop_all,
+        }
+        player.queue.mode = modes[mode.value]
+        await interaction.response.send_message(f"Repeat mode set to **{mode.value}**.")
+
+    @music_controls.command(
+        name="shuffle", description="Randomize all upcoming tracks."
+    )
+    async def slash_shuffle(self, interaction: discord.Interaction) -> None:
+        """Shuffle the queue through the grouped slash command."""
+        player = await self._interaction_player(interaction, require_track=False)
+        if player is None:
+            return
+        if player.queue.count < 2:
+            await interaction.response.send_message(
+                "Add at least two tracks before shuffling.", ephemeral=True
+            )
+            return
+        player.queue.shuffle()
+        await interaction.response.send_message(
+            f"Shuffled **{player.queue.count}** upcoming tracks. 🔀"
+        )
+
+    @music_controls.command(
+        name="remove", description="Remove an upcoming track by queue position."
+    )
+    @app_commands.describe(position="The one-based position shown by /queue.")
+    async def slash_remove(
+        self, interaction: discord.Interaction, position: app_commands.Range[int, 1]
+    ) -> None:
+        """Remove a queue item through the grouped slash command."""
+        player = await self._interaction_player(interaction, require_track=False)
+        if player is None:
+            return
+        if position > player.queue.count:
+            await interaction.response.send_message(
+                f"Position must be between 1 and {player.queue.count}.",
+                ephemeral=True,
+            )
+            return
+        removed = player.queue.peek(position - 1)
+        player.queue.delete(position - 1)
+        await interaction.response.send_message(
+            f"Removed **{removed.title}** from the queue."
+        )
+
+    @music_controls.command(
+        name="clear", description="Clear upcoming tracks but keep the current song."
+    )
+    async def slash_clear(self, interaction: discord.Interaction) -> None:
+        """Clear the queue through the grouped slash command."""
+        player = await self._interaction_player(interaction, require_track=False)
+        if player is None:
+            return
+        count = player.queue.count
+        player.queue.clear()
+        await interaction.response.send_message(
+            f"Cleared **{count}** upcoming track(s)."
+        )
+
+    @music_controls.command(
+        name="seek", description="Jump within the current non-live track."
+    )
+    @app_commands.describe(position="Seconds, MM:SS, or HH:MM:SS.")
+    async def slash_seek(self, interaction: discord.Interaction, position: str) -> None:
+        """Seek through the grouped slash command."""
+        player = await self._interaction_player(interaction)
+        if player is None or player.current is None:
+            return
+        try:
+            milliseconds = _parse_timestamp(position)
+        except ValueError as error:
+            await interaction.response.send_message(str(error), ephemeral=True)
+            return
+        if player.current.is_stream:
+            await interaction.response.send_message(
+                "Live streams do not support seeking.", ephemeral=True
+            )
+            return
+        if milliseconds >= player.current.length:
+            await interaction.response.send_message(
+                f"Position must be before {_format_duration(player.current.length)}.",
+                ephemeral=True,
+            )
+            return
+        await player.seek(milliseconds)
+        await interaction.response.send_message(
+            f"Jumped to **{_format_duration(milliseconds)}**."
+        )
 
     @commands.hybrid_command(
         name="voicehealth",

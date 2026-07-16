@@ -5,12 +5,13 @@ from unittest.mock import AsyncMock
 import wavelink
 
 from aestron_bot.lavalink import LavalinkService
-from aestron_bot.music import Music, QueueView, _format_duration
+from aestron_bot.music import Music, QueueView, _format_duration, _parse_timestamp
 
 
 class FakeQueue:
     def __init__(self):
         self.tracks = []
+        self.mode = wavelink.QueueMode.normal
 
     async def put_wait(self, track):
         self.tracks.append(track)
@@ -94,6 +95,11 @@ def test_music_commands_have_clear_usage_metadata():
         "pause",
         "stop",
         "volume",
+        "loop",
+        "shuffle",
+        "remove",
+        "clearqueue",
+        "seek",
         "voicehealth",
     }
     commands = {command.name: command for command in Music.__cog_commands__}
@@ -132,6 +138,21 @@ def test_queue_view_paginates_every_track_with_stable_numbers():
 
 def test_music_duration_drops_fractional_seconds():
     assert _format_duration(75_200) == "0:01:15"
+
+
+def test_music_timestamp_parser_accepts_documented_formats():
+    assert _parse_timestamp("75") == 75_000
+    assert _parse_timestamp("1:15") == 75_000
+    assert _parse_timestamp("1:02:03") == 3_723_000
+
+
+def test_music_timestamp_parser_rejects_ambiguous_values():
+    import pytest
+
+    with pytest.raises(ValueError):
+        _parse_timestamp("1:75")
+    with pytest.raises(ValueError):
+        _parse_timestamp("later")
 
 
 def test_play_restores_track_and_reports_lavalink_playback_failure(monkeypatch):

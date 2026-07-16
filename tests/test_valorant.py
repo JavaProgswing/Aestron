@@ -1,4 +1,5 @@
 from aestron_bot.valorant import (
+    AssetCatalog,
     ValorantStatsView,
     coaching_notes,
     stats_overview_embed,
@@ -8,7 +9,12 @@ from aestron_bot.valorant import (
 
 def _match(*, won: bool = True):
     return {
-        "matchInfo": {"mapId": "Ascent"},
+        "matchInfo": {
+            "matchId": "match-123",
+            "mapId": "map-ascent",
+            "gameStartMillis": 1_700_000_000_000,
+            "queueId": "competitive",
+        },
         "players": [
             {
                 "puuid": "player-1",
@@ -29,7 +35,10 @@ def _match(*, won: bool = True):
                 },
             }
         ],
-        "teams": [{"teamId": "Blue", "won": won}],
+        "teams": [
+            {"teamId": "Blue", "won": won, "roundsWon": 2},
+            {"teamId": "Red", "won": not won, "roundsWon": 0},
+        ],
         "roundResults": [
             {
                 "playerStats": [
@@ -38,6 +47,7 @@ def _match(*, won: bool = True):
                         "damage": [
                             {
                                 "damage": 180,
+                                "receiver": "other",
                                 "headshots": 1,
                                 "bodyshots": 2,
                                 "legshots": 0,
@@ -57,7 +67,7 @@ def _match(*, won: bool = True):
                 "playerStats": [
                     {
                         "puuid": "other",
-                        "damage": [],
+                        "damage": [{"damage": 80, "receiver": "player-1"}],
                         "kills": [
                             {
                                 "killer": "other",
@@ -71,6 +81,7 @@ def _match(*, won: bool = True):
                         "damage": [
                             {
                                 "damage": 120,
+                                "receiver": "other",
                                 "headshots": 1,
                                 "bodyshots": 1,
                                 "legshots": 0,
@@ -85,17 +96,22 @@ def _match(*, won: bool = True):
 
 
 def test_match_summary_uses_round_and_damage_data():
-    summary = summarize_matches([_match()], "player-1")
+    catalog = AssetCatalog(agents={"jett": "Jett"}, maps={"map-ascent": "Ascent"})
+    summary = summarize_matches([_match()], "player-1", catalog)
 
     assert summary.matches == 1
     assert summary.wins == 1
     assert summary.kd_ratio == 3
     assert summary.acs == 250
     assert summary.adr == 150
+    assert summary.damage_delta == 110
     assert summary.headshot_rate == 40
     assert summary.first_kills == 1
     assert summary.first_deaths == 1
     assert summary.ability_casts == 4
+    assert summary.survival_rate == 50
+    assert summary.performances[0].scoreline == "2-0"
+    assert summary.performances[0].map_name == "Ascent"
 
 
 def test_coaching_is_transparent_and_never_creates_a_rank():
@@ -104,7 +120,7 @@ def test_coaching_is_transparent_and_never_creates_a_rank():
 
     assert notes
     assert all("MMR" not in note and "ELO" not in note for note in notes)
-    assert any("Utility usage" in note for note in notes)
+    assert any("Utility" in note for note in notes)
 
 
 def test_missing_player_or_empty_matches_are_safe():
@@ -127,11 +143,14 @@ def test_stats_panel_restores_interactive_drill_downs():
     )
 
     overview = stats_overview_embed(account, summary)
-    assert overview.title == "Player#AP · recent form"
-    assert len(view.children) == 3
+    assert overview.title == "⚔️ Player#AP · Performance Lab"
+    assert len(view.children) == 6
     assert view.overview_button.disabled is True
 
     view.current_page = "coaching"
     view._refresh_buttons()
     assert view.render().title == "Review plan · Player#AP"
     assert view.coaching_button.disabled is True
+
+    view.current_page = "match:0"
+    assert view.render().title == "🟢 VICTORY · map-ascent"

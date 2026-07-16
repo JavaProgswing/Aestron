@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import Counter
-from dataclasses import dataclass
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -13,65 +12,20 @@ import aiohttp
 import discord
 from discord.ext import commands
 
+from .valorant_analytics import (
+    AssetCatalog,
+    MatchPerformance,
+    PlayerSummary,
+    coaching_notes,
+    summarize_matches,
+)
+
 LOGGER = logging.getLogger(__name__)
 SUPPORTED_SHARDS = frozenset({"ap", "br", "eu", "kr", "latam", "na"})
 
 
 class ValorantServiceError(RuntimeError):
     """Describe an expected website or Riot API failure to a command caller."""
-
-
-@dataclass(frozen=True, slots=True)
-class PlayerSummary:
-    """Aggregate official match fields used by Discord presentation."""
-
-    matches: int
-    wins: int
-    rounds: int
-    kills: int
-    deaths: int
-    assists: int
-    score: int
-    damage: int
-    headshots: int
-    bodyshots: int
-    legshots: int
-    first_kills: int
-    first_deaths: int
-    agents: Counter[str]
-    maps: Counter[str]
-    ability_casts: int
-
-    @property
-    def win_rate(self) -> float:
-        """Return wins as a percentage of analyzed matches."""
-        return _ratio(self.wins * 100, self.matches)
-
-    @property
-    def kd_ratio(self) -> float:
-        """Return kills per death without dividing by zero."""
-        return _ratio(self.kills, self.deaths)
-
-    @property
-    def acs(self) -> float:
-        """Return average combat score per played round."""
-        return _ratio(self.score, self.rounds)
-
-    @property
-    def adr(self) -> float:
-        """Return average damage per played round."""
-        return _ratio(self.damage, self.rounds)
-
-    @property
-    def headshot_rate(self) -> float:
-        """Return headshots as a percentage of recorded hit locations."""
-        hits = self.headshots + self.bodyshots + self.legshots
-        return _ratio(self.headshots * 100, hits)
-
-    @property
-    def opening_duel_rate(self) -> float:
-        """Return won opening duels as a percentage of opening engagements."""
-        return _ratio(self.first_kills * 100, self.first_kills + self.first_deaths)
 
 
 class ValorantService:
@@ -90,6 +44,11 @@ class ValorantService:
         self.website_base_url = (website_base_url or "").rstrip("/")
         self.service_token = service_token or ""
         self.riot_api_key = riot_api_key or ""
+        self._match_cache: dict[
+            tuple[str, str], tuple[float, tuple[dict[str, Any], ...]]
+        ] = {}
+        self._catalog_cache: dict[str, tuple[float, AssetCatalog]] = {}
+        self._cache_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     @property
     def linking_ready(self) -> bool:
@@ -126,37 +85,76 @@ class ValorantService:
     async def recent_matches(
         self, account: dict[str, Any], *, limit: int = 8
     ) -> list[dict[str, Any]]:
-        """Fetch recent official matches with bounded parallel requests."""
+        """Fetch and briefly cache recent matches with bounded parallel requests."""
         puuid = str(account.get("puuid") or "")
         shard = str(account.get("region") or "").lower()
         if not puuid or shard not in SUPPORTED_SHARDS:
             raise ValorantServiceError(
                 "The linked account has incomplete routing data. Please relink it."
             )
-        history = await self._riot_request(
-            shard,
-            f"/val/match/v1/matchlists/by-puuid/{quote(puuid, safe='')}",
-        )
-        identifiers = [
-            item.get("matchId")
-            for item in history.get("history", [])[:limit]
-            if isinstance(item, dict) and item.get("matchId")
-        ]
-        semaphore = asyncio.Semaphore(4)
+        limit = max(1, min(10, limit))
+        cache_key = (shard, puuid)
+        cached = self._match_cache.get(cache_key)
+        if cached and time.monotonic() - cached[0] < 120:
+            return list(cached[1][:limit])
 
-        async def load(match_id: str) -> dict[str, Any] | None:
-            async with semaphore:
-                try:
-                    return await self._riot_request(
-                        shard,
-                        f"/val/match/v1/matches/{quote(match_id, safe='')}",
-                    )
-                except ValorantServiceError:
-                    LOGGER.exception("Could not fetch Riot match id=%s", match_id)
-                    return None
+        lock = self._cache_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            cached = self._match_cache.get(cache_key)
+            if cached and time.monotonic() - cached[0] < 120:
+                return list(cached[1][:limit])
 
-        matches = await asyncio.gather(*(load(match_id) for match_id in identifiers))
-        return [match for match in matches if match is not None]
+            history = await self._riot_request(
+                shard,
+                f"/val/match/v1/matchlists/by-puuid/{quote(puuid, safe='')}",
+            )
+            identifiers = [
+                str(item["matchId"])
+                for item in history.get("history", [])[:10]
+                if isinstance(item, dict) and item.get("matchId")
+            ]
+            semaphore = asyncio.Semaphore(4)
+
+            async def load(match_id: str) -> dict[str, Any] | None:
+                async with semaphore:
+                    try:
+                        return await self._riot_request(
+                            shard,
+                            f"/val/match/v1/matches/{quote(match_id, safe='')}",
+                        )
+                    except ValorantServiceError as error:
+                        LOGGER.warning(
+                            "Could not fetch Riot match id=%s: %s", match_id, error
+                        )
+                        return None
+
+            loaded = await asyncio.gather(*(load(match_id) for match_id in identifiers))
+            matches = tuple(match for match in loaded if match is not None)
+            if identifiers and not matches:
+                raise ValorantServiceError(
+                    "Riot returned match history but every match detail failed to load."
+                )
+            self._match_cache[cache_key] = (time.monotonic(), matches)
+            return list(matches[:limit])
+
+    async def content_catalog(self, account: dict[str, Any]) -> AssetCatalog:
+        """Return a six-hour cache of current Riot agent and map names."""
+        shard = str(account.get("region") or "").lower()
+        if shard not in SUPPORTED_SHARDS:
+            return AssetCatalog(agents={}, maps={})
+        cached = self._catalog_cache.get(shard)
+        if cached and time.monotonic() - cached[0] < 21_600:
+            return cached[1]
+        try:
+            payload = await self._riot_request(
+                shard, "/val/content/v1/contents?locale=en-US"
+            )
+        except ValorantServiceError as error:
+            LOGGER.warning("Could not refresh Riot content catalog: %s", error)
+            return AssetCatalog(agents={}, maps={})
+        catalog = AssetCatalog.from_riot_content(payload)
+        self._catalog_cache[shard] = (time.monotonic(), catalog)
+        return catalog
 
     async def _site_request(
         self,
@@ -204,9 +202,13 @@ class ValorantService:
                     url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)
                 ) as response:
                     if response.status == 429 and attempt == 0:
-                        retry_after = min(
-                            float(response.headers.get("Retry-After", 1)), 5
-                        )
+                        try:
+                            retry_after = min(
+                                max(float(response.headers.get("Retry-After", 1)), 0),
+                                5,
+                            )
+                        except ValueError:
+                            retry_after = 1
                         await asyncio.sleep(retry_after)
                         continue
                     if response.status == 404:
@@ -230,178 +232,187 @@ class ValorantService:
         raise ValorantServiceError("Riot's rate limit is busy. Try again shortly.")
 
 
-def summarize_matches(matches: list[dict[str, Any]], puuid: str) -> PlayerSummary:
-    """Aggregate a player's official match fields without creating a skill rating."""
-    values: Counter[str] = Counter()
-    agents: Counter[str] = Counter()
-    maps: Counter[str] = Counter()
-    analyzed = 0
-    for match in matches:
-        players = match.get("players", [])
-        player = next(
-            (
-                item
-                for item in players
-                if isinstance(item, dict) and item.get("puuid") == puuid
-            ),
-            None,
-        )
-        if player is None:
-            continue
-        stats = player.get("stats") or {}
-        rounds = int(stats.get("roundsPlayed") or 0)
-        if rounds <= 0:
-            continue
-        analyzed += 1
-        for key in ("kills", "deaths", "assists", "score", "roundsPlayed"):
-            values[key] += int(stats.get(key) or 0)
-        ability_casts = stats.get("abilityCasts") or {}
-        values["ability_casts"] += sum(
-            int(ability_casts.get(key) or 0)
-            for key in (
-                "grenadeCasts",
-                "ability1Casts",
-                "ability2Casts",
-                "ultimateCasts",
-            )
-        )
-        character = str(player.get("characterId") or "Unknown agent")
-        agents[character] += 1
-        match_info = match.get("matchInfo") or {}
-        maps[str(match_info.get("mapId") or "Unknown map")] += 1
-        team_id = player.get("teamId")
-        team = next(
-            (
-                item
-                for item in match.get("teams", [])
-                if isinstance(item, dict) and item.get("teamId") == team_id
-            ),
-            {},
-        )
-        values["wins"] += int(bool(team.get("won")))
-        for round_result in match.get("roundResults", []):
-            kills = [
-                kill
-                for item in round_result.get("playerStats", [])
-                if isinstance(item, dict)
-                for kill in item.get("kills", [])
-                if isinstance(kill, dict)
-            ]
-            first_kill = min(
-                kills,
-                key=lambda item: item.get("timeSinceRoundStartMillis", 10**9),
-                default=None,
-            )
-            if first_kill:
-                values["first_kills"] += int(first_kill.get("killer") == puuid)
-                values["first_deaths"] += int(first_kill.get("victim") == puuid)
-            player_round = next(
-                (
-                    item
-                    for item in round_result.get("playerStats", [])
-                    if isinstance(item, dict) and item.get("puuid") == puuid
-                ),
-                {},
-            )
-            for damage in player_round.get("damage", []):
-                values["damage"] += int(damage.get("damage") or 0)
-                values["headshots"] += int(damage.get("headshots") or 0)
-                values["bodyshots"] += int(damage.get("bodyshots") or 0)
-                values["legshots"] += int(damage.get("legshots") or 0)
-    return PlayerSummary(
-        matches=analyzed,
-        wins=values["wins"],
-        rounds=values["roundsPlayed"],
-        kills=values["kills"],
-        deaths=values["deaths"],
-        assists=values["assists"],
-        score=values["score"],
-        damage=values["damage"],
-        headshots=values["headshots"],
-        bodyshots=values["bodyshots"],
-        legshots=values["legshots"],
-        first_kills=values["first_kills"],
-        first_deaths=values["first_deaths"],
-        agents=agents,
-        maps=maps,
-        ability_casts=values["ability_casts"],
-    )
-
-
-def coaching_notes(summary: PlayerSummary) -> list[str]:
-    """Produce transparent review prompts from the displayed aggregates."""
-    if summary.matches == 0:
-        return ["Play a supported match, then run this command again."]
-    notes: list[str] = []
-    if summary.first_kills + summary.first_deaths >= 3:
-        if summary.opening_duel_rate < 45:
-            notes.append(
-                f"Opening duels: {summary.first_kills} first kills vs "
-                f"{summary.first_deaths} first deaths. Review positioning and utility "
-                "on the rounds where you were the first death."
-            )
-        else:
-            notes.append(
-                f"Opening duels are converting at {summary.opening_duel_rate:.0f}%. "
-                "Review whether your team could trade or build on those advantages."
-            )
-    if summary.adr < 110:
-        notes.append(
-            f"Damage impact averaged {summary.adr:.0f} ADR. Review crossfire timing "
-            "and whether utility created damage opportunities before each duel."
-        )
-    elif summary.adr >= 150:
-        notes.append(
-            f"Damage impact is strong at {summary.adr:.0f} ADR. Check how often that "
-            "damage converted into round wins rather than chasing a higher number."
-        )
-    casts_per_round = _ratio(summary.ability_casts, summary.rounds)
-    notes.append(
-        f"Utility usage averaged {casts_per_round:.1f} casts per round. Compare deaths "
-        "with unused utility; the number itself is context, not a target."
-    )
-    return notes[:3]
-
-
 def stats_overview_embed(
     account: dict[str, Any], summary: PlayerSummary
 ) -> discord.Embed:
-    """Build the interactive VALORANT overview card."""
+    """Build the high-level interactive VALORANT dashboard."""
     embed = discord.Embed(
-        title=f"{account['accountname']}#{account['accounttag']} · recent form",
+        title=f"⚔️ {account['accountname']}#{account['accounttag']} · Performance Lab",
         description=(
             f"Official post-match data from **{summary.matches} matches** and "
-            f"**{summary.rounds} rounds**. This is not a replacement rank."
+            f"**{summary.rounds} rounds**. Select a match below for a full breakdown."
         ),
-        color=discord.Color.red(),
+        color=0xFF4655,
     )
     embed.add_field(
-        name="Record",
-        value=f"{summary.wins}W · {summary.win_rate:.1f}%",
+        name="🏆 Recent record",
+        value=(
+            f"**{summary.wins}W – {summary.losses}L**\n"
+            f"`{summary.win_rate:.1f}%` win rate"
+        ),
         inline=True,
     )
+    embed.add_field(
+        name="🎯 Combat",
+        value=(
+            f"**{summary.kills} / {summary.deaths} / {summary.assists}**\n"
+            f"`{summary.kd_ratio:.2f}` K/D · `{summary.kda_ratio:.2f}` KDA"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="💥 Round impact",
+        value=(
+            f"`{summary.acs:.0f}` ACS · `{summary.adr:.0f}` ADR\n"
+            f"`{summary.damage_delta:+.0f}` damage delta / round"
+            if summary.damage_received
+            else f"`{summary.acs:.0f}` ACS · `{summary.adr:.0f}` ADR\nDamage delta unavailable"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🔫 Mechanics",
+        value=(
+            f"`{summary.headshot_rate:.1f}%` headshot hits\n"
+            f"`{summary.survival_rate:.1f}%` round survival"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="⚡ Opening pressure",
+        value=(
+            f"**{summary.first_kills}** first kills · **{summary.first_deaths}** deaths\n"
+            f"`{summary.opening_duel_rate:.1f}%` conversion"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🧠 Team contribution",
+        value=(
+            f"`{summary.casts_per_round:.1f}` utility casts / round\n"
+            f"**{summary.multi_kill_rounds}** multikill rounds · "
+            f"**{summary.plants + summary.defuses}** objectives"
+        ),
+        inline=True,
+    )
+    embed.set_footer(
+        text="Opt-in Riot data • Completed matches only • No hidden MMR estimate"
+    )
+    return embed
+
+
+def matches_embed(account: dict[str, Any], summary: PlayerSummary) -> discord.Embed:
+    """Show compact recent-match cards before a user selects one."""
+    lines: list[str] = []
+    for index, match in enumerate(summary.performances, start=1):
+        result = "🟢 W" if match.won else "🔴 L"
+        lines.append(
+            f"**{index}. {result} {match.scoreline} · {match.map_name}**\n"
+            f"{match.agent_name} · `{match.kills}/{match.deaths}/{match.assists}` · "
+            f"`{match.acs:.0f} ACS` · `{match.adr:.0f} ADR`"
+        )
+    embed = discord.Embed(
+        title=f"🗂️ Match history · {account['accountname']}#{account['accounttag']}",
+        description="\n\n".join(lines) or "No supported match details were returned.",
+        color=0x2F3136,
+    )
+    embed.set_footer(text="Choose a numbered match from the menu for round-level data")
+    return embed
+
+
+def breakdown_embed(account: dict[str, Any], summary: PlayerSummary) -> discord.Embed:
+    """Show agent, map, and recent consistency context."""
+
+    def counter_lines(values: Any) -> str:
+        return (
+            "\n".join(
+                f"**{name}** · {count} match{'es' if count != 1 else ''}"
+                for name, count in values.most_common(5)
+            )
+            or "No data"
+        )
+
+    recent = summary.performances[:3]
+    recent_acs = sum(match.acs for match in recent) / len(recent) if recent else 0
+    recent_adr = sum(match.adr for match in recent) / len(recent) if recent else 0
+    embed = discord.Embed(
+        title=f"🧩 Agent & map context · {account['accountname']}#{account['accounttag']}",
+        description=(
+            "Usage counts provide context, not agent or map win-rate claims from a "
+            "small sample."
+        ),
+        color=0x00A8A8,
+    )
+    embed.add_field(name="Most played agents", value=counter_lines(summary.agents))
+    embed.add_field(name="Recent maps", value=counter_lines(summary.maps))
+    embed.add_field(
+        name="Last 3 form",
+        value=f"`{recent_acs:.0f}` ACS · `{recent_adr:.0f}` ADR",
+        inline=False,
+    )
+    return embed
+
+
+def match_detail_embed(
+    account: dict[str, Any], match: MatchPerformance, index: int
+) -> discord.Embed:
+    """Render one completed match with transparent round-derived metrics."""
+    result = "VICTORY" if match.won else "DEFEAT"
+    timestamp = (
+        f"<t:{match.game_start_millis // 1000}:R>"
+        if match.game_start_millis > 0
+        else "Time unavailable"
+    )
+    embed = discord.Embed(
+        title=f"{'🟢' if match.won else '🔴'} {result} · {match.map_name}",
+        description=(
+            f"**{match.agent_name}** · {match.queue.title()} · {timestamp}\n"
+            f"Match **#{index}** in the current history sample"
+        ),
+        color=0x57F287 if match.won else 0xED4245,
+    )
+    embed.add_field(name="Score", value=f"**{match.scoreline}**")
     embed.add_field(
         name="K / D / A",
         value=(
-            f"{summary.kills} / {summary.deaths} / {summary.assists}\n"
-            f"K/D {summary.kd_ratio:.2f}"
+            f"**{match.kills} / {match.deaths} / {match.assists}**\n"
+            f"`{match.kd_ratio:.2f}` K/D · `{match.kda_ratio:.2f}` KDA"
         ),
-        inline=True,
     )
     embed.add_field(
-        name="Impact",
-        value=f"ACS {summary.acs:.0f}\nADR {summary.adr:.0f}",
-        inline=True,
+        name="Impact", value=f"`{match.acs:.0f}` ACS\n`{match.adr:.0f}` ADR"
     )
+    delta = (
+        f"`{match.damage_delta:+.0f}` / round"
+        if match.damage_received
+        else "Not returned"
+    )
+    embed.add_field(name="Damage delta", value=delta)
     embed.add_field(
-        name="Headshot hits", value=f"{summary.headshot_rate:.1f}%", inline=True
+        name="Mechanics",
+        value=(
+            f"`{match.headshot_rate:.1f}%` headshot hits\n"
+            f"`{match.survival_rate:.1f}%` survival"
+        ),
     )
     embed.add_field(
         name="Opening duels",
-        value=f"{summary.first_kills} won · {summary.first_deaths} lost",
-        inline=True,
+        value=f"**{match.first_kills}** won · **{match.first_deaths}** lost",
     )
-    embed.set_footer(text="Opt-in Riot data • Use the controls below for context")
+    embed.add_field(
+        name="Round events",
+        value=(
+            f"**{match.multi_kill_rounds}** multikill rounds\n"
+            f"**{match.plants}** plants · **{match.defuses}** defuses"
+        ),
+    )
+    embed.add_field(
+        name="Utility",
+        value=f"**{match.ability_casts}** casts · `{match.ability_casts / match.rounds:.1f}` / round",
+    )
+    embed.set_footer(
+        text=f"{account['accountname']}#{account['accounttag']} • Match ID {match.match_id[:18]}"
+    )
     return embed
 
 
@@ -430,8 +441,11 @@ def metrics_guide_embed(account: dict[str, Any]) -> discord.Embed:
         color=0x7C5CFC,
     )
     embed.add_field(
-        name="ACS / ADR",
-        value="Combat score and damage averaged across played rounds.",
+        name="ACS / ADR / damage delta",
+        value=(
+            "Combat score, damage dealt, and dealt-minus-received damage averaged "
+            "across played rounds."
+        ),
         inline=False,
     )
     embed.add_field(
@@ -445,6 +459,14 @@ def metrics_guide_embed(account: dict[str, Any]) -> discord.Embed:
         inline=False,
     )
     embed.add_field(
+        name="Survival / multikills",
+        value=(
+            "Survival uses recorded kill events. A multikill round contains two or "
+            "more eliminations by the player."
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="Review prompts",
         value="Rule-based observations from displayed aggregates—not AI rank or MMR.",
         inline=False,
@@ -452,8 +474,43 @@ def metrics_guide_embed(account: dict[str, Any]) -> discord.Embed:
     return embed
 
 
+class MatchSelect(discord.ui.Select):
+    """Select one recent match without issuing another Riot request."""
+
+    def __init__(self, summary: PlayerSummary) -> None:
+        """Create options for each analyzed recent match."""
+        options = [
+            discord.SelectOption(
+                label=f"{index}. {'Win' if match.won else 'Loss'} · {match.map_name}"[
+                    :100
+                ],
+                description=(
+                    f"{match.agent_name} · {match.kills}/{match.deaths}/{match.assists} · "
+                    f"{match.acs:.0f} ACS"
+                )[:100],
+                value=str(index - 1),
+                emoji="🟢" if match.won else "🔴",
+            )
+            for index, match in enumerate(summary.performances, start=1)
+        ]
+        super().__init__(
+            placeholder="Inspect a recent match…",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """Open the selected match detail page."""
+        view = self.view
+        if not isinstance(view, ValorantStatsView):
+            return
+        await view._show(interaction, f"match:{self.values[0]}")
+
+
 class ValorantStatsView(discord.ui.View):
-    """Interactive overview, coaching, and metric explanations."""
+    """Interactive overview, history, match drill-down, coaching, and guides."""
 
     def __init__(
         self,
@@ -470,6 +527,8 @@ class ValorantStatsView(discord.ui.View):
         self.summary = summary
         self.current_page = initial_page
         self.message: discord.Message | None = None
+        if summary.performances:
+            self.add_item(MatchSelect(summary))
         self._refresh_buttons()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -487,10 +546,22 @@ class ValorantStatsView(discord.ui.View):
             return coaching_embed(self.account, self.summary)
         if self.current_page == "metrics":
             return metrics_guide_embed(self.account)
+        if self.current_page == "matches":
+            return matches_embed(self.account, self.summary)
+        if self.current_page == "breakdown":
+            return breakdown_embed(self.account, self.summary)
+        if self.current_page.startswith("match:"):
+            index = int(self.current_page.partition(":")[2])
+            if 0 <= index < len(self.summary.performances):
+                return match_detail_embed(
+                    self.account, self.summary.performances[index], index + 1
+                )
         return stats_overview_embed(self.account, self.summary)
 
     def _refresh_buttons(self) -> None:
         self.overview_button.disabled = self.current_page == "overview"
+        self.matches_button.disabled = self.current_page == "matches"
+        self.breakdown_button.disabled = self.current_page == "breakdown"
         self.coaching_button.disabled = self.current_page == "coaching"
         self.metrics_button.disabled = self.current_page == "metrics"
 
@@ -508,18 +579,30 @@ class ValorantStatsView(discord.ui.View):
         """Show recent aggregate performance."""
         await self._show(interaction, "overview")
 
+    @discord.ui.button(label="Matches", emoji="🗂️", style=discord.ButtonStyle.secondary)
+    async def matches_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Show recent match cards."""
+        await self._show(interaction, "matches")
+
     @discord.ui.button(
-        label="Review plan", emoji="🎯", style=discord.ButtonStyle.primary
+        label="Breakdown", emoji="🧩", style=discord.ButtonStyle.secondary
     )
+    async def breakdown_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Show agent, map, and recent-form context."""
+        await self._show(interaction, "breakdown")
+
+    @discord.ui.button(label="Coach", emoji="🎯", style=discord.ButtonStyle.primary)
     async def coaching_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Show post-match coaching prompts."""
         await self._show(interaction, "coaching")
 
-    @discord.ui.button(
-        label="Metrics guide", emoji="ℹ️", style=discord.ButtonStyle.secondary
-    )
+    @discord.ui.button(label="Guide", emoji="ℹ️", style=discord.ButtonStyle.secondary)
     async def metrics_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -561,13 +644,20 @@ class Valorant(commands.Cog):
         return self.service
 
     async def _load(
-        self, ctx: commands.Context, member: discord.Member | discord.User
+        self,
+        ctx: commands.Context,
+        member: discord.Member | discord.User,
+        *,
+        limit: int = 8,
     ) -> tuple[dict[str, Any], PlayerSummary] | None:
         try:
             service = self._service()
             account = await service.account(member.id)
-            matches = await service.recent_matches(account)
-            summary = summarize_matches(matches, str(account["puuid"]))
+            matches, catalog = await asyncio.gather(
+                service.recent_matches(account, limit=limit),
+                service.content_catalog(account),
+            )
+            summary = summarize_matches(matches, str(account["puuid"]), catalog=catalog)
             return account, summary
         except ValorantServiceError as error:
             await ctx.send(f"⚠️ {error}", ephemeral=True)
@@ -588,11 +678,33 @@ class Valorant(commands.Cog):
             await ctx.send(f"⚠️ {error}", ephemeral=True)
             return
         view = discord.ui.View(timeout=600)
-        view.add_item(discord.ui.Button(label="Continue to Riot", url=url))
+        view.add_item(
+            discord.ui.Button(label="Link with Riot Sign On", emoji="🔐", url=url)
+        )
+        embed = discord.Embed(
+            title="Connect your VALORANT profile",
+            description=(
+                "Authorize Aestron through Riot Sign On to unlock the interactive "
+                "match lab, match history, and post-match coaching."
+            ),
+            color=0xFF4655,
+        )
+        embed.add_field(
+            name="What is stored?",
+            value="Your Riot ID, PUUID, routing shard, and Discord account link.",
+            inline=False,
+        )
+        embed.add_field(
+            name="Privacy",
+            value=(
+                "The login link expires in 10 minutes. OAuth tokens are not stored, "
+                "and `/unlinkaccount` removes the link."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="Official Riot authorization • Opt in required")
         await ctx.send(
-            "Riot will ask you to authorize Aestron. The link expires in 10 minutes. "
-            "Linking opts your authorized VALORANT identity and match statistics into "
-            "Aestron's bot and website; you can unlink at any time.",
+            embed=embed,
             view=view,
             ephemeral=True,
         )
@@ -617,20 +729,24 @@ class Valorant(commands.Cog):
 
     @commands.hybrid_command(
         aliases=["valstats"],
-        brief="Show recent official VALORANT performance stats.",
-        description="Summarizes up to eight recent matches for an opted-in player.",
-        usage="[member]",
+        brief="Open an interactive VALORANT performance lab.",
+        description=(
+            "Analyze up to ten recent matches with match drill-downs, agent/map "
+            "context, damage impact, and review prompts."
+        ),
+        usage="[member] [matches=8]",
     )
     @commands.cooldown(1, 20, commands.BucketType.user)
     async def vstats(
         self,
         ctx: commands.Context,
         member: discord.Member | discord.User | None = None,
+        matches: commands.Range[int, 1, 10] = 8,
     ) -> None:
-        """Show a compact recent-match summary for an opted-in player."""
+        """Open the complete interactive match-analysis dashboard."""
         target = member or ctx.author
         await ctx.defer(ephemeral=True)
-        loaded = await self._load(ctx, target)
+        loaded = await self._load(ctx, target, limit=matches)
         if loaded is None:
             return
         account, summary = loaded
@@ -642,20 +758,91 @@ class Valorant(commands.Cog):
         view.message = await ctx.send(embed=view.render(), view=view, ephemeral=True)
 
     @commands.hybrid_command(
-        brief="Turn recent VALORANT stats into review prompts.",
-        description="Shows evidence-based post-match practice ideas for an opted-in player.",
-        usage="[member]",
+        aliases=["valhistory", "vmatches"],
+        brief="Browse recent VALORANT matches interactively.",
+        description=(
+            "Show recent opted-in match results and select one for round-level stats."
+        ),
+        usage="[member] [matches=8]",
+    )
+    @commands.cooldown(1, 20, commands.BucketType.user)
+    async def matchhistory(
+        self,
+        ctx: commands.Context,
+        member: discord.Member | discord.User | None = None,
+        matches: commands.Range[int, 1, 10] = 8,
+    ) -> None:
+        """Open the dashboard directly on recent match history."""
+        target = member or ctx.author
+        await ctx.defer(ephemeral=True)
+        loaded = await self._load(ctx, target, limit=matches)
+        if loaded is None:
+            return
+        account, summary = loaded
+        view = ValorantStatsView(
+            author_id=ctx.author.id,
+            account=account,
+            summary=summary,
+            initial_page="matches",
+        )
+        view.message = await ctx.send(embed=view.render(), view=view, ephemeral=True)
+
+    @commands.hybrid_command(
+        aliases=["lastmatch", "valmatch"],
+        brief="Analyze one recent VALORANT match in depth.",
+        description=(
+            "Open a selected recent match with score, KDA, ACS, ADR, damage delta, "
+            "opening duels, survival, multikills, objectives, and utility."
+        ),
+        usage="[number=1] [member]",
+    )
+    @commands.cooldown(1, 20, commands.BucketType.user)
+    async def matchanalysis(
+        self,
+        ctx: commands.Context,
+        number: commands.Range[int, 1, 10] = 1,
+        member: discord.Member | discord.User | None = None,
+    ) -> None:
+        """Open one numbered match while retaining all dashboard controls."""
+        target = member or ctx.author
+        await ctx.defer(ephemeral=True)
+        loaded = await self._load(ctx, target, limit=max(8, number))
+        if loaded is None:
+            return
+        account, summary = loaded
+        if number > len(summary.performances):
+            await ctx.send(
+                f"Only **{len(summary.performances)}** recent match(es) were available.",
+                ephemeral=True,
+            )
+            return
+        view = ValorantStatsView(
+            author_id=ctx.author.id,
+            account=account,
+            summary=summary,
+            initial_page=f"match:{number - 1}",
+        )
+        view.message = await ctx.send(embed=view.render(), view=view, ephemeral=True)
+
+    @commands.hybrid_command(
+        brief="Turn recent VALORANT matches into a review plan.",
+        description=(
+            "Build transparent practice prompts from opening duels, damage, survival, "
+            "and utility across recent completed matches."
+        ),
+        usage="[member] [matches=8]",
     )
     @commands.cooldown(1, 20, commands.BucketType.user)
     async def valcoach(
         self,
         ctx: commands.Context,
         member: discord.Member | discord.User | None = None,
+        matches: commands.Range[int, 1, 10] = 8,
     ) -> None:
         """Show transparent post-match coaching prompts."""
         target = member or ctx.author
         await ctx.defer(ephemeral=True)
-        loaded = await self._load(ctx, target)
+        loaded = await self._load(ctx, target, limit=matches)
         if loaded is None:
             return
         account, summary = loaded
@@ -666,7 +853,3 @@ class Valorant(commands.Cog):
             initial_page="coaching",
         )
         view.message = await ctx.send(embed=view.render(), view=view, ephemeral=True)
-
-
-def _ratio(numerator: int | float, denominator: int | float) -> float:
-    return float(numerator) / float(denominator) if denominator else 0.0

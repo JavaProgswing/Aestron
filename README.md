@@ -6,6 +6,8 @@ The actively maintained runtime features are split into focused modules:
 
 - `aestron_bot/lavalink.py` owns node connection, health, and reconnection.
 - `aestron_bot/music.py` owns searches, queues, playback, controls, and errors.
+- `aestron_bot/fun.py` provides dependency-free interactive games and social
+  commands with invoker-only controls and bounded input.
 - `aestron_bot/moderation.py` owns validated moderation commands, native
   timeouts, hierarchy checks, and warning records.
 - `aestron_bot/database.py` owns the async PostgreSQL pool lifecycle and
@@ -81,14 +83,22 @@ when the node has no working audio source.
 - `/currentlyplaying` — show the current track and progress.
 - `/queue` — show upcoming tracks.
 - `/pause`, `/skip`, `/stop`, `/volume <0-150>` — control playback.
+- `/music loop <mode>`, `/music shuffle`, `/music remove <position>`,
+  `/music clear`, and `/music seek <time>` — advanced repeat and queue controls.
+  The matching prefix commands are `a!loop`, `a!shuffle`, `a!remove`,
+  `a!clearqueue`, and `a!seek`.
 - `/voicehealth` — diagnose the Lavalink node and latest voice error.
 - `/stats` — show commands used, successful/failed invocations, current and
   historical guild activity, uptime, latency, process activity, and music health.
 - `/suggest <title> <details>` and `/reportbug <feature> <details>` — submit
   validated feedback to the shared website/admin queue.
-- `/linkaccount`, `/unlinkaccount`, `/vstats [member]`, and `/valcoach [member]`
-  — secure opt-in VALORANT linking, official recent stats, and evidence-based
-  post-match review prompts.
+- `/linkaccount` and `/unlinkaccount` — secure opt-in Riot account linking.
+- `/vstats [member] [matches]` — interactive overview, history, agent/map
+  context, match selector, coaching prompts, and metric guide.
+- `/matchhistory`, `/matchanalysis`, and `/valcoach` — recent match cards,
+  round-level match inspection, and evidence-based post-match review.
+- `/games rps` and `/games trivia` — interactive invoker-only games. Additional
+  text games are `a!coinflip`, `a!roll`, `a!choose`, `a!eightball`, and `a!rate`.
 
 ## Website and API
 
@@ -230,8 +240,13 @@ reports that persistence is unavailable.
 
 The website creates and migrates its Riot identity and feedback tables. The bot
 retrieves recent matches on demand from official Riot endpoints with bounded
-parallelism and rate-limit handling; the old fixed-shard pollers, pickled match
-objects, static metadata extractors, and third-party MMR endpoint are not used.
+parallelism, short-lived caching, current VAL-CONTENT names, and rate-limit
+handling. Analytics include match score, K/D/A, ACS, ADR, dealt-minus-received
+damage per round, headshot-hit percentage, opening duels, survival, multikill
+rounds, objectives, and utility casts. They use completed-match fields only and
+do not estimate hidden MMR, KAST, economy value, or live tactical advice. The old
+fixed-shard pollers, pickled match objects, static metadata extractors, and
+third-party MMR endpoint are not used.
 
 After doing this, run the bot with:
 
