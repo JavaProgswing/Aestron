@@ -2,52 +2,57 @@
 {% block title %}Aestron updates — commands, fixes, and releases{% endblock %}
 {% block page_id %}updates{% endblock %}
 {% block content %}
-<section class="page-hero section-shell updates-hero">
-  <div>
+<section class="section-shell updates-hero">
+  <div class="updates-intro">
     <p class="eyebrow"><span></span>Release feed</p>
-    <h1>What changed.<br><em>What works better.</em></h1>
-    <p>Recent command additions, behavior fixes, and platform updates for the version currently serving this page.</p>
+    <h1>Changes you can<br><em>actually use.</em></h1>
+    <p>Commands, fixes, and platform improvements shipped in the version serving this page.</p>
   </div>
-</section>
-
-<section class="section-shell deployment-card glass-card reveal" aria-labelledby="deployment-title">
-  <div>
-    <span class="section-index">Running deployment</span>
-    <h2 id="deployment-title">Version {{ runtime.version }}</h2>
-    <p>Branch <code>{{ runtime.git_branch }}</code> · uptime {{ uptime_label }}</p>
-  </div>
-  <div class="deployment-revision">
-    <small>Git revision</small>
+  <aside class="deployment-card glass-card reveal" aria-labelledby="deployment-title">
+    <div class="deployment-heading">
+      <span class="status-chip ready">Live deployment</span>
+      <span>{{ updates|length }} release notes</span>
+    </div>
+    <h2 id="deployment-title">{{ runtime.version }}</h2>
+    <dl class="deployment-facts">
+      <div><dt>Branch</dt><dd><code>{{ runtime.git_branch }}</code></dd></div>
+      <div><dt>Uptime</dt><dd>{{ uptime_label }}</dd></div>
+      <div><dt>Revision</dt><dd><code>{{ runtime.git_commit_short }}</code></dd></div>
+    </dl>
     {% if runtime.git_commit_url %}
-      <a href="{{ runtime.git_commit_url }}" rel="noreferrer" target="_blank" aria-label="Open deployed Git commit {{ runtime.git_commit_short }}">
-        <code>{{ runtime.git_commit_short }}</code><span>View commit ↗</span>
+      <a class="deployment-link" href="{{ runtime.git_commit_url }}" rel="noreferrer" target="_blank" aria-label="Open deployed Git commit {{ runtime.git_commit_short }}">
+        Inspect deployed commit <span aria-hidden="true">↗</span>
       </a>
     {% else %}
-      <code>{{ runtime.git_commit_short }}</code>
-      <span>Commit link becomes available in a Git-backed deployment.</span>
+      <p class="deployment-note">A commit link appears on Git-backed deployments.</p>
     {% endif %}
-  </div>
+  </aside>
 </section>
 
 <section class="section-shell updates-feed" aria-label="Recent Aestron updates">
+  <header class="updates-feed-heading">
+    <span class="section-index">Release history</span>
+    <p>Newest first. Command names link each change to something you can try in Discord.</p>
+  </header>
   {% for update in updates %}
   <article class="update-entry reveal">
-    <header>
-      <div>
-        <span class="update-category">{{ update.category }}</span>
-        <time datetime="{{ update.published }}">{{ update.published }}</time>
-      </div>
+    <div class="update-meta">
+      <span class="update-number">{{ "%02d"|format(loop.index) }}</span>
+      <span class="update-category">{{ update.category }}</span>
+      <time datetime="{{ update.published }}">{{ update.published }}</time>
+    </div>
+    <div class="update-copy">
       <h2>{{ update.title }}</h2>
       <p>{{ update.summary }}</p>
-    </header>
-    <ul>
-      {% for detail in update.details %}<li>{{ detail }}</li>{% endfor %}
-    </ul>
-    {% if update.commands %}
-    <div class="command-chips" aria-label="Related commands">
-      {% for command in update.commands %}<code>{{ command }}</code>{% endfor %}
+      <ul>
+        {% for detail in update.details %}<li>{{ detail }}</li>{% endfor %}
+      </ul>
+      {% if update.commands %}
+      <div class="command-chips" aria-label="Related commands">
+        {% for command in update.commands %}<code>{{ command }}</code>{% endfor %}
+      </div>
+      {% endif %}
     </div>
-    {% endif %}
   </article>
   {% endfor %}
 </section>

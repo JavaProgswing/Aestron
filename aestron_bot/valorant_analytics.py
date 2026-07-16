@@ -77,6 +77,39 @@ EMPTY_CATALOG = AssetCatalog(agents={}, maps={})
 
 
 @dataclass(frozen=True, slots=True)
+class RoundPerformance:
+    """One player's auditable contribution in one completed round."""
+
+    number: int
+    won: bool | None
+    result: str
+    kills: int
+    deaths: int
+    assists: int
+    damage: int
+    loadout_value: int
+    spent: int
+    remaining: int
+    weapon: str
+    armor: str
+    opening_result: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DuelPerformance:
+    """Kill/death record against one opponent in a completed match."""
+
+    opponent: str
+    kills: int
+    deaths: int
+
+    @property
+    def differential(self) -> int:
+        """Return kills minus deaths for this matchup."""
+        return self.kills - self.deaths
+
+
+@dataclass(frozen=True, slots=True)
 class MatchPerformance:
     """One player's transparent performance metrics for one completed match."""
 
@@ -105,6 +138,8 @@ class MatchPerformance:
     plants: int
     defuses: int
     ability_casts: int
+    round_details: tuple[RoundPerformance, ...]
+    duels: tuple[DuelPerformance, ...]
 
     @property
     def kd_ratio(self) -> float:
@@ -141,6 +176,17 @@ class MatchPerformance:
     def survival_rate(self) -> float:
         """Return the percentage of rounds survived."""
         return _ratio(self.survival_rounds * 100, self.rounds)
+
+    @property
+    def opening_duel_rate(self) -> float:
+        """Return won opening duels as a percentage of contested openers."""
+        return _ratio(self.first_kills * 100, self.first_kills + self.first_deaths)
+
+    @property
+    def economy_efficiency(self) -> float:
+        """Return damage per thousand credits of recorded loadout value."""
+        loadout = sum(item.loadout_value for item in self.round_details)
+        return _ratio(self.damage * 1000, loadout)
 
     @property
     def scoreline(self) -> str:
@@ -260,8 +306,20 @@ def analyze_match(
     if rounds <= 0:
         return None
 
+    team_id = player.get("teamId")
+    player_names = {
+        str(item.get("puuid")): (
+            f"{item.get('gameName')}#{item.get('tagLine')}"
+            if item.get("gameName") and item.get("tagLine")
+            else catalog.agent_name(item.get("characterId"))
+        )
+        for item in players
+        if isinstance(item, dict) and item.get("puuid")
+    }
     values: Counter[str] = Counter()
-    for round_result in round_results:
+    duel_values: dict[str, Counter[str]] = {}
+    round_details: list[RoundPerformance] = []
+    for fallback_number, round_result in enumerate(round_results, start=1):
         player_stats = [
             item
             for item in (round_result.get("playerStats") or [])
@@ -293,10 +351,12 @@ def analyze_match(
         player_round = next(
             (item for item in player_stats if item.get("puuid") == puuid), {}
         )
+        round_damage = 0
         for damage in player_round.get("damage") or []:
             if not isinstance(damage, dict):
                 continue
             values["damage"] += _integer(damage.get("damage"))
+            round_damage += _integer(damage.get("damage"))
             values["headshots"] += _integer(damage.get("headshots"))
             values["bodyshots"] += _integer(damage.get("bodyshots"))
             values["legshots"] += _integer(damage.get("legshots"))
@@ -305,6 +365,46 @@ def analyze_match(
             for damage in item.get("damage") or []:
                 if isinstance(damage, dict) and damage.get("receiver") == puuid:
                     values["damage_received"] += _integer(damage.get("damage"))
+
+        round_assists = 0
+        for kill in all_kills:
+            killer = str(kill.get("killer") or "")
+            victim = str(kill.get("victim") or "")
+            if killer == puuid and victim:
+                duel_values.setdefault(victim, Counter())["kills"] += 1
+            if victim == puuid and killer:
+                duel_values.setdefault(killer, Counter())["deaths"] += 1
+            if puuid in (kill.get("assistants") or []):
+                round_assists += 1
+
+        economy = player_round.get("economy") or {}
+        opening_result = None
+        if first_kill and first_kill.get("killer") == puuid:
+            opening_result = "won"
+        elif first_kill and first_kill.get("victim") == puuid:
+            opening_result = "lost"
+        winning_team = round_result.get("winningTeam")
+        round_details.append(
+            RoundPerformance(
+                number=_integer(round_result.get("roundNum")) or fallback_number,
+                won=(winning_team == team_id) if winning_team is not None else None,
+                result=str(
+                    round_result.get("roundResult")
+                    or round_result.get("roundCeremony")
+                    or "Result unavailable"
+                ).replace("_", " "),
+                kills=len(player_kills),
+                deaths=int(any(kill.get("victim") == puuid for kill in all_kills)),
+                assists=round_assists,
+                damage=round_damage,
+                loadout_value=_integer(economy.get("loadoutValue")),
+                spent=_integer(economy.get("spent")),
+                remaining=_integer(economy.get("remaining")),
+                weapon=str(economy.get("weapon") or "Unknown"),
+                armor=str(economy.get("armor") or "Unknown"),
+                opening_result=opening_result,
+            )
+        )
 
     ability_casts = stats.get("abilityCasts") or {}
     ability_total = sum(
@@ -316,7 +416,6 @@ def analyze_match(
             "ultimateCasts",
         )
     )
-    team_id = player.get("teamId")
     teams = [item for item in (match.get("teams") or []) if isinstance(item, dict)]
     team = next((item for item in teams if item.get("teamId") == team_id), {})
     opponent = next((item for item in teams if item.get("teamId") != team_id), {})
@@ -348,6 +447,21 @@ def analyze_match(
         plants=values["plants"],
         defuses=values["defuses"],
         ability_casts=ability_total,
+        round_details=tuple(round_details),
+        duels=tuple(
+            DuelPerformance(
+                opponent=player_names.get(opponent_id, opponent_id[:12]),
+                kills=record["kills"],
+                deaths=record["deaths"],
+            )
+            for opponent_id, record in sorted(
+                duel_values.items(),
+                key=lambda item: (
+                    -(item[1]["kills"] + item[1]["deaths"]),
+                    item[0],
+                ),
+            )
+        ),
     )
 
 

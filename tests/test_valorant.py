@@ -41,9 +41,19 @@ def _match(*, won: bool = True):
         ],
         "roundResults": [
             {
+                "roundNum": 1,
+                "winningTeam": "Blue",
+                "roundResult": "Eliminated",
                 "playerStats": [
                     {
                         "puuid": "player-1",
+                        "economy": {
+                            "loadoutValue": 3900,
+                            "spent": 2900,
+                            "remaining": 1000,
+                            "weapon": "Vandal",
+                            "armor": "Heavy",
+                        },
                         "damage": [
                             {
                                 "damage": 180,
@@ -61,9 +71,12 @@ def _match(*, won: bool = True):
                             }
                         ],
                     }
-                ]
+                ],
             },
             {
+                "roundNum": 2,
+                "winningTeam": "Red",
+                "roundResult": "Eliminated",
                 "playerStats": [
                     {
                         "puuid": "other",
@@ -78,6 +91,13 @@ def _match(*, won: bool = True):
                     },
                     {
                         "puuid": "player-1",
+                        "economy": {
+                            "loadoutValue": 4700,
+                            "spent": 800,
+                            "remaining": 200,
+                            "weapon": "Vandal",
+                            "armor": "Heavy",
+                        },
                         "damage": [
                             {
                                 "damage": 120,
@@ -89,7 +109,7 @@ def _match(*, won: bool = True):
                         ],
                         "kills": [],
                     },
-                ]
+                ],
             },
         ],
     }
@@ -112,6 +132,13 @@ def test_match_summary_uses_round_and_damage_data():
     assert summary.survival_rate == 50
     assert summary.performances[0].scoreline == "2-0"
     assert summary.performances[0].map_name == "Ascent"
+    assert [item.won for item in summary.performances[0].round_details] == [
+        True,
+        False,
+    ]
+    assert summary.performances[0].round_details[0].loadout_value == 3900
+    assert summary.performances[0].duels[0].kills == 1
+    assert summary.performances[0].duels[0].deaths == 1
 
 
 def test_coaching_is_transparent_and_never_creates_a_rank():
@@ -144,8 +171,9 @@ def test_stats_panel_restores_interactive_drill_downs():
 
     overview = stats_overview_embed(account, summary)
     assert overview.title == "⚔️ Player#AP · Performance Lab"
-    assert len(view.children) == 6
+    assert len(view.children) == 7
     assert view.overview_button.disabled is True
+    assert view.section_select.disabled is True
 
     view.current_page = "coaching"
     view._refresh_buttons()
@@ -154,3 +182,13 @@ def test_stats_panel_restores_interactive_drill_downs():
 
     view.current_page = "match:0"
     assert view.render().title == "🟢 VICTORY · map-ascent"
+
+    view.selected_match_index = 0
+    view.current_page = "match:0:rounds"
+    assert view.render().title == "Round review · map-ascent"
+
+    view.current_page = "match:0:economy"
+    assert view.render().title == "Economy review · map-ascent"
+
+    view.current_page = "match:0:duels"
+    assert view.render().title == "Duel matrix · map-ascent"

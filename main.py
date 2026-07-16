@@ -11,6 +11,7 @@ import secrets
 import sys
 import time
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 
 import aiohttp
@@ -53,6 +54,12 @@ from aestron_bot.giveaways import Giveaways
 from aestron_bot.help_command import AestronHelpCommand
 from aestron_bot.info import AestronInfo
 from aestron_bot.leveling import Leveling
+from aestron_bot.minecraft_ui import (
+    ARMOR_RESISTANCE,
+    SWORD_DAMAGE,
+    FighterVisual,
+    render_pvp_board,
+)
 from aestron_bot.moderation import Moderation
 from aestron_bot.music import Music
 from aestron_bot.profiles import build_profile_embed
@@ -699,38 +706,44 @@ class Confirmpvp(discord.ui.View):
     async def on_timeout(self):
         for child in self.children:
             child.disabled = True
-        await self._message.edit(view=self)
+        if self._message is not None:
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await self._message.edit(
+                    content="This duel invitation expired.", view=self
+                )
 
-    # When the confirm button is pressed, set the inner value to `True` and
-    # stop the View from listening to more input.
-    # We also send the user an ephemeral _message that we're confirming their choice.
-    @discord.ui.button(label="Accept duel", emoji="⚔️", style=discord.ButtonStyle.green)
+    @discord.ui.button(label="Accept duel", style=discord.ButtonStyle.green)
     async def confirm(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         if not interaction.user.id == self.memberid:
             await interaction.response.send_message(
-                "This user hasn't challenged you to this fight⚔️!", ephemeral=True
+                "Only the challenged player can answer this invitation.", ephemeral=True
             )
             return
-        await interaction.response.send_message(
-            "Challenge accepted. Prepare your loadout!", ephemeral=True
-        )
         self.value = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            "Challenge accepted. Preparing the arena…", ephemeral=True
+        )
         self.stop()
 
-    # This one is similar to the confirmation button except sets the inner value to `False`
-    @discord.ui.button(label="Decline", emoji="🏳️", style=discord.ButtonStyle.red)
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red)
     async def decline(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         if not interaction.user.id == self.memberid:
             await interaction.response.send_message(
-                "This user hasn't challenged you to this fight⚔️!", ephemeral=True
+                "Only the challenged player can answer this invitation.", ephemeral=True
             )
             return
-        await interaction.response.send_message("Challenge declined.", ephemeral=True)
         self.value = False
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send("Challenge declined.", ephemeral=True)
         self.stop()
 
 
@@ -1088,6 +1101,34 @@ class MinecraftFun(commands.Cog):
                 )
                 """
             )
+
+    @staticmethod
+    async def _minecraft_inventory(member_id: int) -> dict[str, str]:
+        """Return a validated loadout, creating the player's economy row once."""
+        default_inventory = {"orechoice": "Leather", "swordchoice": "Wooden"}
+        async with client.database.pool.acquire() as con, con.transaction():
+            await con.execute(
+                "INSERT INTO mceconomy (memberid, balance, inventory) "
+                "VALUES ($1, $2, $3) ON CONFLICT (memberid) DO NOTHING",
+                member_id,
+                1500,
+                json.dumps(default_inventory),
+            )
+            stored = await con.fetchval(
+                "SELECT inventory FROM mceconomy WHERE memberid = $1",
+                member_id,
+            )
+        try:
+            inventory = json.loads(stored)
+        except (TypeError, json.JSONDecodeError):
+            inventory = default_inventory
+        armor = inventory.get("orechoice", "Leather")
+        sword = inventory.get("swordchoice", "Wooden")
+        if armor not in ARMOR_RESISTANCE:
+            armor = "Leather"
+        if sword not in SWORD_DAMAGE:
+            sword = "Wooden"
+        return {"orechoice": armor, "swordchoice": sword}
 
     async def _claim_reward(
         self,
@@ -1459,185 +1500,106 @@ class MinecraftFun(commands.Cog):
         voice_channel: discord.VoiceChannel | None = None,
     ):
         if member == ctx.author:
-            await ctx.send(
-                "Trying to battle yourself will only have major consequences !",
-                ephemeral=True,
-            )
+            await ctx.send("Choose another member to challenge.", ephemeral=True)
             return
         if member.bot:
-            await ctx.send(
-                "You cannot battle bots,we cannot be defeated!", ephemeral=True
-            )
+            await ctx.send("Bots cannot participate in PvP fights.", ephemeral=True)
             return
-        voice_effects = None
-        async with client.database.pool.acquire() as con:
-            memberoneeco = await con.fetchrow(
-                "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
-            )
-        if memberoneeco is None:
-            statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
-            newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.author.id, 1500, json.dumps(newjson))
-            async with client.database.pool.acquire() as con:
-                memberoneeco = await con.fetchrow(
-                    "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
-                )
-        memberoneinv = json.loads(memberoneeco["inventory"])
-        async with client.database.pool.acquire() as con:
-            membertwoeco = await con.fetchrow(
-                "SELECT * FROM mceconomy WHERE memberid = $1", member.id
-            )
-        if membertwoeco is None:
-            statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
-            newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, member.id, 1500, json.dumps(newjson))
-            async with client.database.pool.acquire() as con:
-                membertwoeco = await con.fetchrow(
-                    "SELECT * FROM mceconomy WHERE memberid = $1", member.id
-                )
-        membertwoinv = json.loads(membertwoeco["inventory"])
-        self_combat = False
-        if client.user.id == member.id:
-            self_combat = True
-        orechoice = ["Netherite", "Diamond", "Iron", "Leather", "Chainmail", "Golden"]
-        orechoiceemoji = {
-            "Netherite": "🛡️",
-            "Diamond": "🛡️",
-            "Iron": "🛡️",
-            "Leather": "🛡️",
-            "Chainmail": "🛡️",
-            "Golden": "🛡️",
-        }
-        swordchoice = ["Netherite", "Diamond", "Iron", "Stone", "Golden", "Wooden"]
-        swordchoiceemoji = {
-            "Netherite": "⚔️",
-            "Diamond": "⚔️",
-            "Iron": "⚔️",
-            "Stone": "⚔️",
-            "Golden": "⚔️",
-            "Wooden": "⚔️",
-        }
-        armorresist = [85.0, 75.0, 55.0, 28.0, 45.0, 40.0]
-        swordattack = [12.0, 10.0, 9.0, 8.0, 8.5, 5.0]
+        if ctx.interaction is not None and not ctx.interaction.response.is_done():
+            await ctx.defer()
+
         memberone = ctx.author
         membertwo = member
+        memberoneinv, membertwoinv = await asyncio.gather(
+            self._minecraft_inventory(memberone.id),
+            self._minecraft_inventory(membertwo.id),
+        )
+        challenge = discord.Embed(
+            title="Minecraft PvP challenge",
+            description=(
+                f"{memberone.mention} challenged {membertwo.mention}.\n\n"
+                "The duel uses each player's equipped sword and armor. Each fighter "
+                "can guard, strike, or consume one golden apple."
+            ),
+            color=0xF0A830,
+        )
+        challenge.set_thumbnail(url=memberone.display_avatar.url)
+        challenge.add_field(
+            name=memberone.display_name,
+            value=(
+                f"{memberoneinv['orechoice']} armor · "
+                f"{memberoneinv['swordchoice']} sword"
+            ),
+        )
+        challenge.add_field(
+            name=membertwo.display_name,
+            value=(
+                f"{membertwoinv['orechoice']} armor · "
+                f"{membertwoinv['swordchoice']} sword"
+            ),
+        )
+        confirmation = Confirmpvp(member=membertwo.id)
+        challenge_message = await ctx.send(embed=challenge, view=confirmation)
+        confirmation.set_message(challenge_message)
+        await confirmation.wait()
+        if confirmation.value is None:
+            await challenge_message.reply("The invitation expired without a response.")
+            return
+        if confirmation.value is False:
+            return
 
-        escapelist = [
-            "ran away like a coward.",
-            "was scared of a terrible defeat.",
-            "didn't know how to fight.",
-            "escaped in the midst of a battle.",
-            f"was too weak for battling {ctx.author.mention}.",
-            f"was scared of fighting {ctx.author.mention}.",
-        ]
-        if not self_combat:
-            embed = discord.Embed(
-                title="⚔️ Minecraft PvP challenge",
-                description=(
-                    f"{memberone.mention} challenges {membertwo.mention}.\n\n"
-                    "Accept to start a turn-based equipment battle with shields, "
-                    "critical hits, and one golden-apple heal each."
-                ),
-                color=0xF0A830,
-            )
-            embed.set_thumbnail(url=memberone.display_avatar.url)
-            view = Confirmpvp(member=membertwo.id)
-            view.set_message(statmsg := await ctx.send(embed=embed, view=view))
-            await view.wait()
-            if view.value is None:
-                try:
-                    await statmsg.reply(f"{membertwo.name} {random.choice(escapelist)}")
-                    return
-                except Exception:
-                    pass
-            elif view.value:
-                await statmsg.reply("⚔️ Challenge accepted. The fight begins!")
-                # Minecraftpvp
-                memberone_healthpoint = 30 + random.randint(-10, 10)
-                memberone_healthpoint += 1
-                memberone_armor = memberoneinv["orechoice"]
-                memberone_armor_emoji = orechoiceemoji[memberone_armor]
-                memberone_armor_resist = armorresist[orechoice.index(memberone_armor)]
-                memberone_sword = memberoneinv["swordchoice"]
-                memberone_sword_emoji = swordchoiceemoji[memberone_sword]
-                memberone_sword_attack = swordattack[swordchoice.index(memberone_sword)]
-                membertwo_healthpoint = 30 + random.randint(-10, 10)
-                membertwo_healthpoint += 1
-                membertwo_armor = membertwoinv["orechoice"]
-                membertwo_armor_emoji = orechoiceemoji[membertwo_armor]
-                membertwo_armor_resist = armorresist[orechoice.index(membertwo_armor)]
-                membertwo_sword = membertwoinv["swordchoice"]
-                membertwo_sword_emoji = swordchoiceemoji[membertwo_sword]
-                membertwo_sword_attack = swordattack[swordchoice.index(membertwo_sword)]
-            else:
-                return
+        await challenge_message.reply("Challenge accepted. Building the arena…")
+        memberone_healthpoint = float(30 + random.randint(-5, 5))
+        membertwo_healthpoint = float(30 + random.randint(-5, 5))
+        avatar_one, avatar_two = await asyncio.gather(
+            memberone.display_avatar.with_size(256).read(),
+            membertwo.display_avatar.with_size(256).read(),
+        )
+
+        voice_effects = None
         if voice_channel is not None:
             try:
                 voice_effects = await MinecraftVoiceEffects.connect(ctx, voice_channel)
             except (commands.BadArgument, commands.BotMissingPermissions) as error:
                 await ctx.send(
-                    f"🔇 **Voice effects skipped:** {error}\n"
-                    "The fight will continue normally without voice effects."
+                    f"Voice effects are unavailable: {error}\n"
+                    "The duel will continue without audio."
                 )
         embed = discord.Embed(
-            title="⚔️ Minecraft PvP arena",
+            title="Minecraft PvP arena",
             description=(
                 f"**{memberone.display_name}** versus **{membertwo.display_name}**\n"
-                "Choose Strike, Defend, Heal, or Surrender when it is your turn."
+                "Use the controls only when it is your turn. Equipment values and "
+                "the current fight state are shown on the arena board."
             ),
             color=0x55AA55,
         )
-        embed.set_thumbnail(url=memberone.display_avatar.url)
-        embed.add_field(
-            name=f"{memberone.name}'s health ({memberone_healthpoint} ❤️)",
-            value=get_progress(100),
-            inline=False,
-        )
-        embed.add_field(
-            name=f"{membertwo.name}'s health ({membertwo_healthpoint} ❤️)",
-            value=get_progress(100),
-            inline=False,
-        )
-        embed.add_field(
-            name=f"{memberone.name}'s armor {memberone_armor_emoji}",
-            value=f" {memberone_armor} Armor",
-            inline=False,
-        )
-        embed.add_field(
-            name=f"{membertwo.name}'s armor {membertwo_armor_emoji}",
-            value=f" {membertwo_armor} Armor",
-            inline=False,
-        )
-        embed.add_field(
-            name=f"{memberone.name}'s sword {memberone_sword_emoji}",
-            value=f" {memberone_sword} Sword",
-            inline=False,
-        )
-        embed.add_field(
-            name=f"{membertwo.name}'s sword {membertwo_sword_emoji}",
-            value=f" {membertwo_sword} Sword",
-            inline=False,
-        )
         play_minecraft_sound(voice_effects, "Firework_twinkle_far.ogg")
         fight_view = Minecraftpvp(
-            memberone.id,
-            membertwo.id,
-            memberone.name,
-            membertwo.name,
-            memberone_healthpoint,
-            membertwo_healthpoint,
-            memberone_armor_resist,
-            membertwo_armor_resist,
-            memberone_sword_attack,
-            membertwo_sword_attack,
-            voice_effects,
+            memberone_id=memberone.id,
+            membertwo_id=membertwo.id,
+            memberone_name=memberone.display_name,
+            membertwo_name=membertwo.display_name,
+            memberone_health=memberone_healthpoint,
+            membertwo_health=membertwo_healthpoint,
+            memberone_armor=memberoneinv["orechoice"],
+            membertwo_armor=membertwoinv["orechoice"],
+            memberone_sword=memberoneinv["swordchoice"],
+            membertwo_sword=membertwoinv["swordchoice"],
+            memberone_avatar=avatar_one,
+            membertwo_avatar=avatar_two,
+            voice_effects=voice_effects,
         )
+        board = await asyncio.to_thread(
+            fight_view.render_board,
+            event=f"{memberone.display_name} takes the opening turn.",
+        )
+        embed.set_image(url="attachment://minecraft-pvp.png")
         fight_message = await ctx.send(
-            content=f"{memberone.mention}, choose your opening move!",
+            content=f"{memberone.mention}, choose your opening move.",
             embed=embed,
             view=fight_view,
+            file=discord.File(BytesIO(board), filename="minecraft-pvp.png"),
         )
         fight_view.message = fight_message
 
@@ -2731,425 +2693,426 @@ async def translate_message(
 
 
 class Minecraftpvp(discord.ui.View):
+    """Interactive, image-backed Minecraft duel with prompt interaction acks."""
+
     def __init__(
         self,
-        memberoneid,
-        membertwoid,
-        memberonename,
-        membertwoname,
-        memberonehealth,
-        membertwohealth,
-        memberonearmor,
-        membertwoarmor,
-        memberonesword,
-        membertwosword,
-        vc,
-    ):
-        self.moveturn = memberoneid
-        self.memberoneid = memberoneid
-        self.membertwoid = membertwoid
-        self.memberonename = memberonename
-        self.membertwoname = membertwoname
-        self.memberone_healthpoint = memberonehealth
-        self.membertwo_healthpoint = membertwohealth
-        self.total_memberone_healthpoint = memberonehealth
-        self.total_membertwo_healthpoint = membertwohealth
-        self.memberone_armor_resist = memberonearmor
-        self.membertwo_armor_resist = membertwoarmor
-        self.memberone_sword_attack = memberonesword
-        self.membertwo_sword_attack = membertwosword
-        self.memberids = [memberoneid, membertwoid]
+        *,
+        memberone_id: int,
+        membertwo_id: int,
+        memberone_name: str,
+        membertwo_name: str,
+        memberone_health: float,
+        membertwo_health: float,
+        memberone_armor: str,
+        membertwo_armor: str,
+        memberone_sword: str,
+        membertwo_sword: str,
+        memberone_avatar: bytes,
+        membertwo_avatar: bytes,
+        voice_effects: MinecraftVoiceEffects | None,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.moveturn = memberone_id
+        self.memberoneid = memberone_id
+        self.membertwoid = membertwo_id
+        self.memberonename = memberone_name
+        self.membertwoname = membertwo_name
+        self.memberone_healthpoint = memberone_health
+        self.membertwo_healthpoint = membertwo_health
+        self.total_memberone_healthpoint = memberone_health
+        self.total_membertwo_healthpoint = membertwo_health
+        self.memberone_armor = memberone_armor
+        self.membertwo_armor = membertwo_armor
+        self.memberone_sword = memberone_sword
+        self.membertwo_sword = membertwo_sword
+        self.memberone_avatar = memberone_avatar
+        self.membertwo_avatar = membertwo_avatar
+        self.memberids = {memberone_id, membertwo_id}
         self.memberone_resistance = False
         self.membertwo_resistance = False
-        self.memberone_resiscooldown = False
-        self.membertwo_resiscooldown = False
+        self.memberone_guard_ready = True
+        self.membertwo_guard_ready = True
         self.memberone_heal_available = True
         self.membertwo_heal_available = True
-        self.vc = vc
-        self.message = None
-        super().__init__(timeout=300)
+        self.vc = voice_effects
+        self.message: discord.Message | None = None
+        self.last_event = f"{memberone_name} takes the opening turn."
+        self.last_action = "idle"
+        self.finished = False
 
     def _finish(self, *, delay: float = 2.5) -> None:
-        """Stop accepting actions and release optional voice in the background."""
+        """Stop controls and release the temporary voice session."""
+        if self.finished:
+            return
+        self.finished = True
         self.stop()
+        for child in self.children:
+            child.disabled = True
         if isinstance(self.vc, MinecraftVoiceEffects):
             client.create_background_task(
                 self.vc.close(delay=delay), name="minecraft-pvp-voice-cleanup"
             )
 
+    def _side_for(self, user_id: int) -> str:
+        return "left" if user_id == self.memberoneid else "right"
+
+    def _fighter(self, side: str) -> FighterVisual:
+        if side == "left":
+            return FighterVisual(
+                name=self.memberonename,
+                avatar=self.memberone_avatar,
+                health=self.memberone_healthpoint,
+                total_health=self.total_memberone_healthpoint,
+                armor=self.memberone_armor,
+                sword=self.memberone_sword,
+                shield_active=self.memberone_resistance,
+                heal_available=self.memberone_heal_available,
+            )
+        return FighterVisual(
+            name=self.membertwoname,
+            avatar=self.membertwo_avatar,
+            health=self.membertwo_healthpoint,
+            total_health=self.total_membertwo_healthpoint,
+            armor=self.membertwo_armor,
+            sword=self.membertwo_sword,
+            shield_active=self.membertwo_resistance,
+            heal_available=self.membertwo_heal_available,
+        )
+
+    def render_board(
+        self,
+        *,
+        event: str | None = None,
+        action: str | None = None,
+        active_side: str | None = None,
+    ) -> bytes:
+        """Render the current duel state without touching Discord."""
+        if active_side is None and not self.finished:
+            active_side = self._side_for(self.moveturn)
+        return render_pvp_board(
+            self._fighter("left"),
+            self._fighter("right"),
+            active_side=active_side,
+            event=event or self.last_event,
+            action=action or self.last_action,
+        )
+
+    async def _validate_turn(self, interaction: discord.Interaction) -> bool:
+        if self.finished:
+            await interaction.response.send_message(
+                "This duel has already ended.", ephemeral=True
+            )
+            return False
+        if interaction.user.id not in self.memberids:
+            await interaction.response.send_message(
+                "You are spectating this duel.", ephemeral=True
+            )
+            return False
+        if interaction.user.id != self.moveturn:
+            await interaction.response.send_message(
+                "Wait for your turn before choosing an action.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction) -> None:
+        board = await asyncio.to_thread(self.render_board)
+        file = discord.File(BytesIO(board), filename="minecraft-pvp.png")
+        embed = discord.Embed(
+            title="Minecraft PvP arena",
+            description=self.last_event,
+            color=discord.Color.gold() if self.finished else 0x55AA55,
+        )
+        embed.set_image(url="attachment://minecraft-pvp.png")
+        content = None if self.finished else f"<@{self.moveturn}>, choose your move."
+        message = interaction.message or self.message
+        if message is not None:
+            await message.edit(
+                content=content,
+                embed=embed,
+                view=None if self.finished else self,
+                attachments=[file],
+            )
+
+    async def _award(self, winner_id: int, loser_id: int, winner_amount: int) -> None:
+        default_inventory = json.dumps(
+            {"orechoice": "Leather", "swordchoice": "Wooden"}
+        )
+        async with client.database.pool.acquire() as con, con.transaction():
+            for member_id in (winner_id, loser_id):
+                await con.execute(
+                    "INSERT INTO mceconomy (memberid, balance, inventory) "
+                    "VALUES ($1, $2, $3) ON CONFLICT (memberid) DO NOTHING",
+                    member_id,
+                    1500,
+                    default_inventory,
+                )
+            await con.execute(
+                "UPDATE mceconomy SET balance = balance + $1 WHERE memberid = $2",
+                winner_amount,
+                winner_id,
+            )
+            await con.execute(
+                "UPDATE mceconomy SET balance = balance + 5 WHERE memberid = $1",
+                loser_id,
+            )
+            await con.execute(
+                "INSERT INTO leaderboard (mention) VALUES ($1)", str(winner_id)
+            )
+
+    async def _complete_fight(
+        self,
+        interaction: discord.Interaction,
+        *,
+        winner_id: int,
+        winner_name: str,
+        loser_id: int,
+        loser_name: str,
+        surrendered: bool = False,
+    ) -> None:
+        reward = 25 if surrendered else 50
+        await self._award(winner_id, loser_id, reward)
+        self.last_event = (
+            f"{loser_name} yielded. {winner_name} wins (+{reward}); "
+            f"{loser_name} receives +5."
+            if surrendered
+            else f"{winner_name} defeated {loser_name} (+{reward}); "
+            f"{loser_name} receives +5."
+        )
+        self.last_action = f"victory_{self._side_for(winner_id)}"
+        self._finish()
+        play_minecraft_sound(
+            self.vc, "Event_raidhorn4.ogg" if surrendered else "Player_hurt1.ogg"
+        )
+        await self._refresh(interaction)
+
     async def on_timeout(self) -> None:
-        """Expire abandoned fights and release their temporary voice session."""
-        for child in self.children:
-            child.disabled = True
+        if self.finished:
+            return
+        self.last_event = "The duel expired after five minutes without an action."
+        self.last_action = "idle"
+        self._finish(delay=0)
         if self.message is not None:
             with contextlib.suppress(discord.NotFound, discord.HTTPException):
-                await self.message.edit(content="This PvP fight expired.", view=self)
-        self._finish(delay=0)
+                board = await asyncio.to_thread(self.render_board, active_side=None)
+                embed = discord.Embed(
+                    title="Minecraft PvP arena",
+                    description=self.last_event,
+                    color=discord.Color.dark_grey(),
+                )
+                embed.set_image(url="attachment://minecraft-pvp.png")
+                await self.message.edit(
+                    content=None,
+                    embed=embed,
+                    view=None,
+                    attachments=[
+                        discord.File(BytesIO(board), filename="minecraft-pvp.png")
+                    ],
+                )
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        LOGGER.exception(
+            "Minecraft PvP control failed custom_id=%s",
+            getattr(item, "custom_id", None),
+            exc_info=error,
+        )
+        message = "That move failed safely. Try again; the duel state was preserved."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
 
     @discord.ui.button(
-        label="🎌 Surrender",
+        label="Yield",
         style=discord.ButtonStyle.red,
         custom_id="minecraftpvp:surrender",
     )
     async def surrender(
         self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if interaction.user.id not in self.memberids:
+    ) -> None:
+        if self.finished or interaction.user.id not in self.memberids:
             await interaction.response.send_message(
-                "You are spectating this fight, not participating in it.",
-                ephemeral=True,
+                "Only an active fighter can yield.", ephemeral=True
             )
             return
+        await interaction.response.defer()
         if interaction.user.id == self.memberoneid:
-            loser_id, loser_name = self.memberoneid, self.memberonename
             winner_id, winner_name = self.membertwoid, self.membertwoname
+            loser_id, loser_name = self.memberoneid, self.memberonename
         else:
-            loser_id, loser_name = self.membertwoid, self.membertwoname
             winner_id, winner_name = self.memberoneid, self.memberonename
-        await interaction.response.send_message(
-            f"You surrendered. {winner_name} receives the victory.", ephemeral=True
+            loser_id, loser_name = self.membertwoid, self.membertwoname
+        await self._complete_fight(
+            interaction,
+            winner_id=winner_id,
+            winner_name=winner_name,
+            loser_id=loser_id,
+            loser_name=loser_name,
+            surrendered=True,
         )
-        await addmoney(interaction.channel, winner_id, 25)
-        await addmoney(interaction.channel, loser_id, 5)
-        async with client.database.pool.acquire() as con:
-            await con.execute(
-                "INSERT INTO leaderboard (mention) VALUES($1)", str(winner_id)
-            )
-        if interaction.message is not None:
-            embed = interaction.message.embeds[0]
-            embed.title = "PvP victory by surrender 🏳️"
-            embed.description = (
-                f"**{loser_name}** surrendered to **{winner_name}**.\n"
-                "Winner: +25 emeralds • Challenger: +5 emeralds"
-            )
-            embed.color = discord.Color.gold()
-            await interaction.message.edit(content=None, embed=embed, view=None)
-        play_minecraft_sound(self.vc, "Event_raidhorn4.ogg")
-        self._finish()
 
     @discord.ui.button(
-        label="🛡️ Defend",
-        style=discord.ButtonStyle.green,
+        label="Guard",
+        style=discord.ButtonStyle.secondary,
         custom_id="minecraftpvp:defend",
     )
-    async def defend(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in self.memberids:
+    async def defend(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not await self._validate_turn(interaction):
+            return
+        side = self._side_for(interaction.user.id)
+        guard_ready = (
+            self.memberone_guard_ready if side == "left" else self.membertwo_guard_ready
+        )
+        if not guard_ready:
             await interaction.response.send_message(
-                "You are not participating in this pvp fight!",
-                ephemeral=True,
+                "Your guard recharges after you take another action.", ephemeral=True
             )
             return
+        await interaction.response.defer()
+        if side == "left":
+            self.memberone_resistance = True
+            self.memberone_guard_ready = False
+            self.moveturn = self.membertwoid
+            name = self.memberonename
         else:
-            if not interaction.user.id == self.moveturn:
-                await interaction.response.send_message(
-                    "Its not your turn in this pvp fight!",
-                    ephemeral=True,
-                )
-                return
-            if interaction.user.id == self.memberoneid:
-                if not self.memberone_resiscooldown:
-                    self.memberone_resistance = True
-                    self.memberone_resiscooldown = True
-                    self.moveturn = self.membertwoid
-                else:
-                    await interaction.response.send_message(
-                        "You cannot lift your shield , its on cooldown!",
-                        ephemeral=True,
-                    )
-                    return
-            elif interaction.user.id == self.membertwoid:
-                if not self.membertwo_resiscooldown:
-                    self.membertwo_resistance = True
-                    self.membertwo_resiscooldown = True
-                    self.moveturn = self.memberoneid
-                else:
-                    await interaction.response.send_message(
-                        "You cannot lift your shield , its on cooldown!",
-                        ephemeral=True,
-                    )
-                    return
-            _message = interaction.message
-            if _message is not None:
-                embed = _message.embeds[0]
-                play_minecraft_sound(self.vc, "Equip_netherite4.ogg")
-                embed.description = f"`{interaction.user.name} has equipped the shields and its on cooldown for the next move!`"
-                await _message.edit(
-                    content=f"<@{self.moveturn}> 's turn to fight!", embed=embed
-                )
-            await interaction.response.send_message(
-                "You have equipped your shields.", ephemeral=True
-            )
+            self.membertwo_resistance = True
+            self.membertwo_guard_ready = False
+            self.moveturn = self.memberoneid
+            name = self.membertwoname
+        self.last_event = f"{name} raised a shield. The next strike will be blocked."
+        self.last_action = "idle"
+        play_minecraft_sound(self.vc, "Equip_netherite4.ogg")
+        await self._refresh(interaction)
 
     @discord.ui.button(
-        label="🍯 Heal",
-        style=discord.ButtonStyle.blurple,
+        label="Golden apple",
+        style=discord.ButtonStyle.primary,
         custom_id="minecraftpvp:heal",
     )
     async def heal(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        """Consume the player's one golden-apple heal and end their turn."""
-        if interaction.user.id not in self.memberids:
+        if not await self._validate_turn(interaction):
+            return
+        side = self._side_for(interaction.user.id)
+        available = (
+            self.memberone_heal_available
+            if side == "left"
+            else self.membertwo_heal_available
+        )
+        if not available:
             await interaction.response.send_message(
-                "You are spectating this fight, not participating in it.",
-                ephemeral=True,
+                "Your golden apple has already been consumed.", ephemeral=True
             )
             return
-        if interaction.user.id != self.moveturn:
-            await interaction.response.send_message(
-                "Wait for your turn before healing.", ephemeral=True
-            )
-            return
-        if interaction.user.id == self.memberoneid:
-            if not self.memberone_heal_available:
-                await interaction.response.send_message(
-                    "You already consumed your golden apple.", ephemeral=True
-                )
-                return
-            self.memberone_heal_available = False
+        await interaction.response.defer()
+        if side == "left":
             before = self.memberone_healthpoint
             self.memberone_healthpoint = min(
                 self.total_memberone_healthpoint,
                 self.memberone_healthpoint + self.total_memberone_healthpoint * 0.25,
             )
-            health = self.memberone_healthpoint
-            total = self.total_memberone_healthpoint
-            field_index = 0
-            player_name = self.memberonename
+            restored = self.memberone_healthpoint - before
+            self.memberone_heal_available = False
+            self.memberone_guard_ready = True
             self.moveturn = self.membertwoid
+            name = self.memberonename
         else:
-            if not self.membertwo_heal_available:
-                await interaction.response.send_message(
-                    "You already consumed your golden apple.", ephemeral=True
-                )
-                return
-            self.membertwo_heal_available = False
             before = self.membertwo_healthpoint
             self.membertwo_healthpoint = min(
                 self.total_membertwo_healthpoint,
                 self.membertwo_healthpoint + self.total_membertwo_healthpoint * 0.25,
             )
-            health = self.membertwo_healthpoint
-            total = self.total_membertwo_healthpoint
-            field_index = 1
-            player_name = self.membertwoname
+            restored = self.membertwo_healthpoint - before
+            self.membertwo_heal_available = False
+            self.membertwo_guard_ready = True
             self.moveturn = self.memberoneid
-        restored = health - before
-        if interaction.message is not None:
-            embed = interaction.message.embeds[0]
-            embed.description = (
-                f"🍯 **{player_name}** consumed a golden apple and restored "
-                f"**{restored:.1f} health**."
-            )
-            embed.set_field_at(
-                field_index,
-                name=f"{player_name}'s health ({health:.1f}/{total:.1f} ❤️)",
-                value=get_progress(round(health / total * 100)),
-                inline=False,
-            )
-            await interaction.response.edit_message(
-                content=f"<@{self.moveturn}>, choose your move.",
-                embed=embed,
-                view=self,
-            )
-        else:
-            await interaction.response.send_message(
-                f"Restored {restored:.1f} health.", ephemeral=True
-            )
+            name = self.membertwoname
+        self.last_event = f"{name} restored {restored:.1f} health with a golden apple."
+        self.last_action = f"heal_{side}"
         play_minecraft_sound(self.vc, "Random_levelup.ogg")
+        await self._refresh(interaction)
 
     @discord.ui.button(
-        label="⚔️ Attack",
-        style=discord.ButtonStyle.green,
+        label="Strike",
+        style=discord.ButtonStyle.success,
         custom_id="minecraftpvp:attack",
     )
-    async def attack(self, interaction: discord.Interaction, button: discord.ui.Button):
-        attack = ["weak", "strong", "critical"]
-        attackdamage = [0.5, 1.5, 2.0]
-        winmessage = [
-            "was shot by ",
-            "was slain by ",
-            "was pummeled by ",
-            "drowned whilst trying to escape ",
-            "was blown up by ",
-            "hit the ground too hard whilst trying to escape ",
-            "was squashed by a falling anvil whilst fighting ",
-            "was squashed by a falling block whilst fighting ",
-            "was skewered by a falling stalactite whilst fighting ",
-            "walked into fire whilst fighting ",
-            "was burnt to a crisp whilst fighting ",
-            "went off with a bang due to a firework fired by ",
-            "tried to swim in lava to escape ",
-            "was struck by lightning whilst fighting ",
-            "walked into danger zone due to ",
-            "was killed by magic whilst trying to escape ",
-            "was frozen to death by ",
-            "was fireballed by ",
-            "didn't want to live in the same world as ",
-            "was impaled by ",
-            "was killed trying to hurt ",
-            "was poked to death by a sweet berry bush whilst trying to escape ",
-            "withered away whilst fighting ",
-        ]
-        if interaction.user.id not in self.memberids:
-            await interaction.response.send_message(
-                "You are not participating in this pvp fight!",
-                ephemeral=True,
+    async def attack(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not await self._validate_turn(interaction):
+            return
+        await interaction.response.defer()
+        attacker_side = self._side_for(interaction.user.id)
+        if attacker_side == "left":
+            attacker_name = self.memberonename
+            defender_name = self.membertwoname
+            sword = self.memberone_sword
+            armor = self.membertwo_armor
+            shielded = self.membertwo_resistance
+            self.membertwo_resistance = False
+            self.memberone_guard_ready = True
+            self.moveturn = self.membertwoid
+        else:
+            attacker_name = self.membertwoname
+            defender_name = self.memberonename
+            sword = self.membertwo_sword
+            armor = self.memberone_armor
+            shielded = self.memberone_resistance
+            self.memberone_resistance = False
+            self.membertwo_guard_ready = True
+            self.moveturn = self.memberoneid
+
+        attack_type = random.choices(
+            ("steady", "strong", "critical"), weights=(58, 32, 10), k=1
+        )[0]
+        multiplier = {"steady": 0.9, "strong": 1.25, "critical": 1.7}[attack_type]
+        raw_damage = SWORD_DAMAGE[sword] * multiplier
+        damage = max(1.0, raw_damage * (1 - ARMOR_RESISTANCE[armor] / 100))
+        if shielded:
+            damage = 0.0
+        if attacker_side == "left":
+            self.membertwo_healthpoint = max(0.0, self.membertwo_healthpoint - damage)
+            remaining = self.membertwo_healthpoint
+            winner = (self.memberoneid, self.memberonename)
+            loser = (self.membertwoid, self.membertwoname)
+        else:
+            self.memberone_healthpoint = max(0.0, self.memberone_healthpoint - damage)
+            remaining = self.memberone_healthpoint
+            winner = (self.membertwoid, self.membertwoname)
+            loser = (self.memberoneid, self.memberonename)
+
+        if shielded:
+            self.last_event = (
+                f"{defender_name}'s shield blocked {attacker_name}'s strike."
+            )
+            play_minecraft_sound(self.vc, "Shield_block5.ogg")
+        else:
+            self.last_event = (
+                f"{attacker_name} landed a {attack_type} strike on {defender_name} "
+                f"for {damage:.1f} damage."
+            )
+            play_minecraft_sound(self.vc, f"{attack_type.title()}_attack1.ogg")
+        self.last_action = f"attack_{attacker_side}"
+        if remaining <= 0:
+            await self._complete_fight(
+                interaction,
+                winner_id=winner[0],
+                winner_name=winner[1],
+                loser_id=loser[0],
+                loser_name=loser[1],
             )
             return
-        else:
-            if interaction.user.id == self.memberoneid:
-                if not interaction.user.id == self.moveturn:
-                    await interaction.response.send_message(
-                        "Its not your turn in this pvp fight!",
-                        ephemeral=True,
-                    )
-                    return
-                self.memberone_resiscooldown = False
-                self.moveturn = self.membertwoid
-                attackchoice = random.choice(attack)
-                attackvalue = attackdamage[attack.index(attackchoice)]
-                armorresistvalue = 100.0 - self.membertwo_armor_resist
-                damagevalue = (armorresistvalue / 100.0) * (
-                    self.memberone_sword_attack * attackvalue
-                )
-                shielddisabled = self.membertwo_resistance
-                if self.membertwo_resistance:
-                    damagevalue *= 0
-                    self.membertwo_resistance = False
-                self.membertwo_healthpoint -= damagevalue
-                await interaction.response.send_message(
-                    f"You dealt **{damagevalue:.1f}** damage to {self.membertwoname}.",
-                    ephemeral=True,
-                )
-                play_minecraft_sound(self.vc, f"{attackchoice.title()}_attack1.ogg")
-                _message = interaction.message
-                if self.membertwo_healthpoint <= 0:
-                    if _message is not None:
-                        embed = _message.embeds[0]
-                        embed.description = f"`{self.membertwoname} {random.choice(winmessage)}{self.memberonename}`"
-                        embed.set_field_at(
-                            index=0,
-                            name=f"{self.memberonename}",
-                            value="🎊Won +50 Currency",
-                        )
-                        play_minecraft_sound(self.vc, "Player_hurt1.ogg")
-                        await addmoney(interaction.channel, self.memberoneid, 50)
-                        embed.set_field_at(
-                            index=1,
-                            name=f"{self.membertwoname}",
-                            value="🧧Defeated +5 Currency",
-                        )
-                        statement = """INSERT INTO leaderboard (mention) VALUES($1);"""
-                        async with client.database.pool.acquire() as con:
-                            await con.execute(statement, str(self.memberoneid))
-                        await addmoney(interaction.channel, self.membertwoid, 5)
-                        await _message.edit(embed=embed, view=None)
-                        self._finish()
-                        return
-                if _message is not None:
-                    last_message = "."
-                    if shielddisabled:
-                        play_minecraft_sound(self.vc, "Shield_block5.ogg")
-                        last_message = " and broke through their shield!"
-                    embed = _message.embeds[0]
-                    embed.description = (
-                        f"**{self.memberonename}** landed a **{attackchoice}** hit on "
-                        f"**{self.membertwoname}** for **{damagevalue:.1f} damage**"
-                        f"{last_message}"
-                    )
-                    embed.set_field_at(
-                        index=1,
-                        name=f"{self.membertwoname}'s health ",
-                        value=get_progress(
-                            int(
-                                (
-                                    self.membertwo_healthpoint
-                                    / self.total_membertwo_healthpoint
-                                )
-                                * 100
-                            )
-                        ),
-                    )
-                    await _message.edit(
-                        embed=embed, content=f"<@{self.moveturn}> 's turn to fight!"
-                    )
-            elif interaction.user.id == self.membertwoid:
-                if not interaction.user.id == self.moveturn:
-                    await interaction.response.send_message(
-                        "Its not your turn in this pvp fight!",
-                        ephemeral=True,
-                    )
-                    return
-                self.membertwo_resiscooldown = False
-                self.moveturn = self.memberoneid
-                attackchoice = random.choice(attack)
-                attackvalue = attackdamage[attack.index(attackchoice)]
-                armorresistvalue = 100.0 - self.memberone_armor_resist
-                damagevalue = (armorresistvalue / 100.0) * (
-                    self.membertwo_sword_attack * attackvalue
-                )
-                shielddisabled = self.memberone_resistance
-                if self.memberone_resistance:
-                    damagevalue *= 0
-                    self.memberone_resistance = False
-                self.memberone_healthpoint -= damagevalue
-                await interaction.response.send_message(
-                    f"You dealt **{damagevalue:.1f}** damage to {self.memberonename}.",
-                    ephemeral=True,
-                )
-                play_minecraft_sound(self.vc, f"{attackchoice.title()}_attack1.ogg")
-                _message = interaction.message
-                if self.memberone_healthpoint <= 0:
-                    if _message is not None:
-                        embed = _message.embeds[0]
-                        embed.description = f"`{self.memberonename} {random.choice(winmessage)}{self.membertwoname}`"
-                        embed.set_field_at(
-                            index=0,
-                            name=f"{self.memberonename}",
-                            value="🧧Defeated +5 Currency",
-                        )
-                        await addmoney(interaction.channel, self.membertwoid, 50)
-                        embed.set_field_at(
-                            index=1,
-                            name=f"{self.membertwoname}",
-                            value="🎊Won +50 Currency",
-                        )
-                        play_minecraft_sound(self.vc, "Player_hurt1.ogg")
-                        statement = """INSERT INTO leaderboard (mention) VALUES($1);"""
-                        async with client.database.pool.acquire() as con:
-                            await con.execute(statement, str(self.membertwoid))
-                        await addmoney(interaction.channel, self.memberoneid, 5)
-                        await _message.edit(embed=embed, view=None)
-                        self._finish()
-                        return
-                if _message is not None:
-                    last_message = "."
-                    if shielddisabled:
-                        play_minecraft_sound(self.vc, "Shield_block5.ogg")
-                        last_message = " and broke through their shield!"
-                    embed = _message.embeds[0]
-                    embed.description = (
-                        f"**{self.membertwoname}** landed a **{attackchoice}** hit on "
-                        f"**{self.memberonename}** for **{damagevalue:.1f} damage**"
-                        f"{last_message}"
-                    )
-                    embed.set_field_at(
-                        index=0,
-                        name=f"{self.memberonename}'s health ",
-                        value=get_progress(
-                            int(
-                                (
-                                    self.memberone_healthpoint
-                                    / self.total_memberone_healthpoint
-                                )
-                                * 100
-                            )
-                        ),
-                    )
-                    await _message.edit(
-                        embed=embed, content=f"<@{self.moveturn}> 's turn to fight!"
-                    )
+        await self._refresh(interaction)
 
 
 def is_custom_command(command_name):

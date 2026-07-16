@@ -417,6 +417,113 @@ def match_detail_embed(
     return embed
 
 
+def match_rounds_embed(
+    account: dict[str, Any], match: MatchPerformance, index: int
+) -> discord.Embed:
+    """Show a round timeline sourced directly from Riot's completed match DTO."""
+    lines = []
+    for item in match.round_details:
+        result = "W" if item.won is True else "L" if item.won is False else "–"
+        opener = f" · opener {item.opening_result}" if item.opening_result else ""
+        lines.append(
+            f"`R{item.number:02} {result}` **{item.kills}/{item.deaths}/{item.assists}** "
+            f"· {item.damage} dmg{opener}"
+        )
+    midpoint = max(1, (len(lines) + 1) // 2)
+    embed = discord.Embed(
+        title=f"Round review · {match.map_name}",
+        description=(
+            f"Match **#{index}** · {account['accountname']}#{account['accounttag']}\n"
+            "W/L is shown only when Riot returned the winning team for that round."
+        ),
+        color=0xFF4655,
+    )
+    embed.add_field(
+        name="Early rounds",
+        value="\n".join(lines[:midpoint])[:1024] or "No round events returned.",
+        inline=False,
+    )
+    if lines[midpoint:]:
+        embed.add_field(
+            name="Late rounds",
+            value="\n".join(lines[midpoint:])[:1024],
+            inline=False,
+        )
+    embed.set_footer(text="Select Economy or Duels for a different match lens")
+    return embed
+
+
+def match_economy_embed(
+    account: dict[str, Any], match: MatchPerformance, index: int
+) -> discord.Embed:
+    """Show loadout efficiency without manufacturing unavailable team economy."""
+    recorded = [item for item in match.round_details if item.loadout_value]
+    embed = discord.Embed(
+        title=f"Economy review · {match.map_name}",
+        description=(
+            f"Match **#{index}** · {account['accountname']}#{account['accounttag']}\n"
+            "Personal loadout values only; this does not estimate team bank or buys."
+        ),
+        color=0x00BFA5,
+    )
+    if not recorded:
+        embed.description += "\n\nRiot did not return per-round economy for this match."
+        return embed
+    average_loadout = sum(item.loadout_value for item in recorded) / len(recorded)
+    embed.add_field(
+        name="Recorded economy",
+        value=(
+            f"**{len(recorded)}/{match.rounds}** rounds\n"
+            f"`{average_loadout:,.0f}` average loadout\n"
+            f"`{match.economy_efficiency:.1f}` damage / 1k loadout"
+        ),
+        inline=False,
+    )
+    lines = [
+        f"`R{item.number:02}` {item.loadout_value:,} cr · {item.damage} dmg · "
+        f"{item.weapon.rsplit('/', 1)[-1]}"
+        for item in recorded
+    ]
+    midpoint = max(1, (len(lines) + 1) // 2)
+    embed.add_field(name="Early buys", value="\n".join(lines[:midpoint])[:1024])
+    if lines[midpoint:]:
+        embed.add_field(name="Late buys", value="\n".join(lines[midpoint:])[:1024])
+    return embed
+
+
+def match_duels_embed(
+    account: dict[str, Any], match: MatchPerformance, index: int
+) -> discord.Embed:
+    """Show opponent-specific kill/death records from official kill events."""
+    embed = discord.Embed(
+        title=f"Duel matrix · {match.map_name}",
+        description=(
+            f"Match **#{index}** · {account['accountname']}#{account['accounttag']}\n"
+            "Each row is your eliminations and deaths against one opponent."
+        ),
+        color=0x5865F2,
+    )
+    if not match.duels:
+        embed.description += "\n\nNo opponent duel events were returned."
+        return embed
+    for duel in match.duels[:10]:
+        direction = "advantage" if duel.differential > 0 else "pressure"
+        if duel.differential == 0:
+            direction = "even"
+        embed.add_field(
+            name=duel.opponent[:256],
+            value=(
+                f"**{duel.kills} – {duel.deaths}**\n"
+                f"`{duel.differential:+d}` {direction}"
+            ),
+            inline=True,
+        )
+    embed.set_footer(
+        text="Use this to review repeated losing matchups, not player skill"
+    )
+    return embed
+
+
 def coaching_embed(account: dict[str, Any], summary: PlayerSummary) -> discord.Embed:
     """Build transparent post-match review prompts."""
     notes = coaching_notes(summary)
@@ -490,7 +597,6 @@ class MatchSelect(discord.ui.Select):
                     f"{match.acs:.0f} ACS"
                 )[:100],
                 value=str(index - 1),
-                emoji="🟢" if match.won else "🔴",
             )
             for index, match in enumerate(summary.performances, start=1)
         ]
@@ -510,6 +616,39 @@ class MatchSelect(discord.ui.Select):
         await view._show(interaction, f"match:{self.values[0]}")
 
 
+class MatchSectionSelect(discord.ui.Select):
+    """Switch between summary, round, economy, and duel views for one match."""
+
+    def __init__(self, *, disabled: bool) -> None:
+        """Create the match lens selector, disabled until a match is chosen."""
+        super().__init__(
+            placeholder="Choose a match detail lens…",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="Match summary", value="summary"),
+                discord.SelectOption(label="Round timeline", value="rounds"),
+                discord.SelectOption(label="Economy review", value="economy"),
+                discord.SelectOption(label="Duel matrix", value="duels"),
+            ],
+            disabled=disabled,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """Open the selected lens for the active match."""
+        view = self.view
+        if not isinstance(view, ValorantStatsView):
+            return
+        index = view.selected_match_index
+        if index is None:
+            await interaction.response.send_message(
+                "Select a match first.", ephemeral=True
+            )
+            return
+        await view._show(interaction, f"match:{index}:{self.values[0]}")
+
+
 class ValorantStatsView(discord.ui.View):
     """Interactive overview, history, match drill-down, coaching, and guides."""
 
@@ -527,9 +666,12 @@ class ValorantStatsView(discord.ui.View):
         self.account = account
         self.summary = summary
         self.current_page = initial_page
+        self.selected_match_index: int | None = None
         self.message: discord.Message | None = None
         if summary.performances:
             self.add_item(MatchSelect(summary))
+        self.section_select = MatchSectionSelect(disabled=True)
+        self.add_item(self.section_select)
         self._refresh_buttons()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -552,11 +694,18 @@ class ValorantStatsView(discord.ui.View):
         if self.current_page == "breakdown":
             return breakdown_embed(self.account, self.summary)
         if self.current_page.startswith("match:"):
-            index = int(self.current_page.partition(":")[2])
+            parts = self.current_page.split(":")
+            index = int(parts[1])
             if 0 <= index < len(self.summary.performances):
-                return match_detail_embed(
-                    self.account, self.summary.performances[index], index + 1
-                )
+                match = self.summary.performances[index]
+                section = parts[2] if len(parts) > 2 else "summary"
+                if section == "rounds":
+                    return match_rounds_embed(self.account, match, index + 1)
+                if section == "economy":
+                    return match_economy_embed(self.account, match, index + 1)
+                if section == "duels":
+                    return match_duels_embed(self.account, match, index + 1)
+                return match_detail_embed(self.account, match, index + 1)
         return stats_overview_embed(self.account, self.summary)
 
     def _refresh_buttons(self) -> None:
@@ -568,42 +717,41 @@ class ValorantStatsView(discord.ui.View):
 
     async def _show(self, interaction: discord.Interaction, page: str) -> None:
         self.current_page = page
+        if page.startswith("match:"):
+            self.selected_match_index = int(page.split(":")[1])
+        self.section_select.disabled = self.selected_match_index is None
         self._refresh_buttons()
         await interaction.response.edit_message(embed=self.render(), view=self)
 
-    @discord.ui.button(
-        label="Overview", emoji="📊", style=discord.ButtonStyle.secondary
-    )
+    @discord.ui.button(label="Overview", style=discord.ButtonStyle.secondary)
     async def overview_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Show recent aggregate performance."""
         await self._show(interaction, "overview")
 
-    @discord.ui.button(label="Matches", emoji="🗂️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Matches", style=discord.ButtonStyle.secondary)
     async def matches_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Show recent match cards."""
         await self._show(interaction, "matches")
 
-    @discord.ui.button(
-        label="Breakdown", emoji="🧩", style=discord.ButtonStyle.secondary
-    )
+    @discord.ui.button(label="Trends", style=discord.ButtonStyle.secondary)
     async def breakdown_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Show agent, map, and recent-form context."""
         await self._show(interaction, "breakdown")
 
-    @discord.ui.button(label="Coach", emoji="🎯", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Review", style=discord.ButtonStyle.primary)
     async def coaching_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Show post-match coaching prompts."""
         await self._show(interaction, "coaching")
 
-    @discord.ui.button(label="Guide", emoji="ℹ️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Guide", style=discord.ButtonStyle.secondary)
     async def metrics_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:

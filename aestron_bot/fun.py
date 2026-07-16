@@ -26,17 +26,18 @@ def _coinflip_embed(count: int) -> discord.Embed:
     results = [_pick(("Heads", "Tails")) for _ in range(count)]
     heads = results.count("Heads")
     embed = discord.Embed(
-        title="Coin flip 🪙",
-        description=" • ".join(results),
+        title="Coin flip",
+        description=" ".join("H" if result == "Heads" else "T" for result in results),
         color=ACCENT,
     )
-    streak = max(
-        (len(list(group)) for _, group in itertools.groupby(results)), default=1
+    streaks = [(value, len(list(group))) for value, group in itertools.groupby(results)]
+    streak_name, streak = max(streaks, key=lambda item: item[1])
+    embed.add_field(name="Heads", value=f"**{heads}** · {heads / count:.0%}")
+    embed.add_field(
+        name="Tails", value=f"**{count - heads}** · {(count - heads) / count:.0%}"
     )
-    embed.add_field(name="Heads", value=str(heads))
-    embed.add_field(name="Tails", value=str(count - heads))
-    embed.add_field(name="Longest streak", value=str(streak))
-    embed.set_footer(text="Cryptographically secure virtual flips")
+    embed.add_field(name="Longest run", value=f"**{streak}** {streak_name.lower()}")
+    embed.set_footer(text="H = heads · T = tails · secure virtual randomness")
     return embed
 
 
@@ -44,7 +45,7 @@ def _dice_embed(dice: int, sides: int) -> discord.Embed:
     """Build a dice result with individual rolls, total, and average."""
     values = [secrets.randbelow(sides) + 1 for _ in range(dice)]
     embed = discord.Embed(
-        title=f"{dice}d{sides} 🎲",
+        title=f"Roll · {dice}d{sides}",
         description=" + ".join(map(str, values)) + f" = **{sum(values)}**",
         color=ACCENT,
     )
@@ -52,6 +53,17 @@ def _dice_embed(dice: int, sides: int) -> discord.Embed:
         embed.add_field(name="Highest", value=str(max(values)))
         embed.add_field(name="Lowest", value=str(min(values)))
         embed.add_field(name="Average", value=f"{sum(values) / dice:.1f}")
+        frequencies = sorted(
+            ((value, values.count(value)) for value in set(values)),
+            key=lambda item: (-item[1], item[0]),
+        )
+        embed.add_field(
+            name="Most frequent",
+            value=", ".join(
+                f"{value} × {frequency}" for value, frequency in frequencies[:3]
+            ),
+            inline=False,
+        )
     embed.set_footer(text=f"Possible range: {dice}–{dice * sides}")
     return embed
 
@@ -89,14 +101,14 @@ EIGHT_BALL_ANSWERS = (
 )
 
 WOULD_YOU_RATHER = (
-    "Always know when someone is lying, or always get away with one lie a day?",
-    "Explore a new planet, or the deepest point of the ocean?",
-    "Have perfect aim, or perfect game sense?",
-    "Pause time for ten seconds, or rewind time for ten seconds?",
-    "Give up music for a year, or games for a year?",
-    "Be the funniest person in every room, or the smartest?",
-    "Only play ranked, or never play ranked again?",
-    "Have unlimited travel, or unlimited food?",
+    ("Always know when someone is lying", "Get away with one lie a day"),
+    ("Explore a new planet", "Explore the deepest point of the ocean"),
+    ("Have perfect aim", "Have perfect game sense"),
+    ("Pause time for ten seconds", "Rewind time for ten seconds"),
+    ("Give up music for a year", "Give up games for a year"),
+    ("Be the funniest person in every room", "Be the smartest"),
+    ("Only play ranked", "Never play ranked again"),
+    ("Have unlimited travel", "Have unlimited food"),
 )
 
 
@@ -139,7 +151,7 @@ class ReplayView(InvokerView):
         self.replays = 0
         self.replay.label = label
 
-    @discord.ui.button(label="Again", emoji="🔁", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Again", style=discord.ButtonStyle.primary)
     async def replay(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -162,13 +174,14 @@ class DecisionView(InvokerView):
         super().__init__(author_id, timeout=120)
         self.choices = choices.copy()
         self.picks = 0
+        self.eliminated: list[str] = []
 
     def embed(self) -> discord.Embed:
         """Pick an option and show the remaining decision pool."""
         chosen = _pick(self.choices)
         self.picks += 1
-        return discord.Embed(
-            title="Decision made 🎯",
+        embed = discord.Embed(
+            title="Decision room",
             description=f"I choose **{discord.utils.escape_markdown(chosen)}**.",
             color=ACCENT,
         ).add_field(
@@ -178,9 +191,20 @@ class DecisionView(InvokerView):
             )[:1024],
             inline=False,
         )
+        if self.eliminated:
+            embed.add_field(
+                name="Eliminated",
+                value=" · ".join(
+                    discord.utils.escape_markdown(value)
+                    for value in self.eliminated[-5:]
+                )[:1024],
+                inline=False,
+            )
+        embed.set_footer(text=f"Pick {self.picks} · secure virtual randomness")
+        return embed
 
     @discord.ui.button(
-        label="Choose again", emoji="🔁", style=discord.ButtonStyle.primary
+        label="Choose again", style=discord.ButtonStyle.primary
     )
     async def again(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -189,7 +213,7 @@ class DecisionView(InvokerView):
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
     @discord.ui.button(
-        label="Eliminate one", emoji="🗑️", style=discord.ButtonStyle.danger
+        label="Eliminate one", style=discord.ButtonStyle.danger
     )
     async def eliminate(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -202,6 +226,7 @@ class DecisionView(InvokerView):
             )
             return
         removed = self.choices.pop(secrets.randbelow(len(self.choices)))
+        self.eliminated.append(removed)
         embed = self.embed()
         embed.description = f"Eliminated ~~{discord.utils.escape_markdown(removed)}~~\n\n{embed.description}"
         await interaction.response.edit_message(embed=embed, view=self)
@@ -212,7 +237,6 @@ class RockPaperScissorsView(InvokerView):
 
     choices = ("rock", "paper", "scissors")
     wins_against = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
-    emojis = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
 
     def __init__(self, author_id: int) -> None:
         """Start a scoreless first-to-three match."""
@@ -220,6 +244,7 @@ class RockPaperScissorsView(InvokerView):
         self.player_score = 0
         self.bot_score = 0
         self.round = 0
+        self.history: list[str] = []
 
     async def _play(self, interaction: discord.Interaction, choice: str) -> None:
         bot_choice = _pick(self.choices)
@@ -240,22 +265,26 @@ class RockPaperScissorsView(InvokerView):
         )
         if match_finished:
             if self.player_score > self.bot_score:
-                outcome = "Match won! 🏆"
+                outcome = "You won the match"
                 color = discord.Color.green()
             elif self.bot_score > self.player_score:
-                outcome = "Aestron wins the match 🤖"
+                outcome = "Aestron won the match"
                 color = discord.Color.red()
             else:
-                outcome = "Match drawn 🤝"
+                outcome = "The match ended level"
                 color = discord.Color.gold()
         embed = discord.Embed(
             title=outcome,
             description=(
-                f"You chose {self.emojis[choice]} **{choice.title()}**\n"
-                f"I chose {self.emojis[bot_choice]} **{bot_choice.title()}**\n\n"
+                f"You chose **{choice.title()}**\n"
+                f"Aestron chose **{bot_choice.title()}**\n\n"
                 f"**You {self.player_score} — {self.bot_score} Aestron**"
             ),
             color=color,
+        )
+        self.history.append(f"R{self.round}: {choice.title()} vs {bot_choice.title()}")
+        embed.add_field(
+            name="Round log", value="\n".join(self.history[-5:]), inline=False
         )
         embed.set_footer(text=f"Round {self.round} • First to 3 wins")
         if match_finished:
@@ -265,21 +294,21 @@ class RockPaperScissorsView(InvokerView):
         if match_finished:
             self.stop()
 
-    @discord.ui.button(label="Rock", emoji="🪨")
+    @discord.ui.button(label="Rock")
     async def rock(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Play rock."""
         await self._play(interaction, "rock")
 
-    @discord.ui.button(label="Paper", emoji="📄")
+    @discord.ui.button(label="Paper")
     async def paper(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Play paper."""
         await self._play(interaction, "paper")
 
-    @discord.ui.button(label="Scissors", emoji="✂️")
+    @discord.ui.button(label="Scissors")
     async def scissors(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -357,7 +386,7 @@ class TriviaAnswerButton(discord.ui.Button):
                 )
         answer = view.question.choices[view.question.answer]
         embed = discord.Embed(
-            title="Correct! 🎉" if correct else "Not quite",
+            title="Correct" if correct else "Not quite",
             description=(
                 f"**Answer:** {answer}\n\n{view.question.explanation}\n\n"
                 f"**Score:** {view.score}/{view.round_number}"
@@ -382,7 +411,7 @@ class TriviaAgainButton(discord.ui.Button):
 
     def __init__(self) -> None:
         """Create the replay control on a separate row."""
-        super().__init__(label="Another question", emoji="🔁", row=2)
+        super().__init__(label="Another question", row=2)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         """Replace the result with a fresh question for the same player."""
@@ -423,7 +452,7 @@ class TriviaView(InvokerView):
     def embed(self) -> discord.Embed:
         """Render the unanswered question."""
         return discord.Embed(
-            title="Quick trivia 🧠",
+            title="Quick trivia",
             description=self.question.prompt,
             color=ACCENT,
         ).set_footer(
@@ -434,7 +463,9 @@ class TriviaView(InvokerView):
 class WouldYouRatherView(discord.ui.View):
     """Public either-or poll with one vote per member and an invoker-owned next button."""
 
-    def __init__(self, author_id: int, prompt: str | None = None) -> None:
+    def __init__(
+        self, author_id: int, prompt: tuple[str, str] | None = None
+    ) -> None:
         """Start a public vote hosted by the command invoker."""
         super().__init__(timeout=180)
         self.author_id = author_id
@@ -447,20 +478,27 @@ class WouldYouRatherView(discord.ui.View):
         left = sum(vote == "A" for vote in self.votes.values())
         right = len(self.votes) - left
         total = max(len(self.votes), 1)
-        return (
-            discord.Embed(
-                title="Would you rather…? 🤔",
-                description=self.prompt,
-                color=ACCENT,
-            )
-            .add_field(
-                name="Live vote",
-                value=f"🅰️ {left} ({left / total:.0%})  •  🅱️ {right} ({right / total:.0%})",
-                inline=False,
-            )
-            .set_footer(
-                text="Everyone may vote once • The host can load the next prompt"
-            )
+        left_units = round(left / total * 10)
+        right_units = round(right / total * 10)
+        embed = discord.Embed(title="Would you rather?", color=ACCENT)
+        embed.add_field(
+            name="Option A",
+            value=(
+                f"{self.prompt[0]}\n`{'█' * left_units}{'░' * (10 - left_units)}` "
+                f"**{left / total:.0%}** ({left})"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Option B",
+            value=(
+                f"{self.prompt[1]}\n`{'█' * right_units}{'░' * (10 - right_units)}` "
+                f"**{right / total:.0%}** ({right})"
+            ),
+            inline=False,
+        )
+        return embed.set_footer(
+            text="Everyone may vote once · The host can load the next prompt"
         )
 
     async def _vote(self, interaction: discord.Interaction, choice: str) -> None:
@@ -472,21 +510,21 @@ class WouldYouRatherView(discord.ui.View):
         self.votes[interaction.user.id] = choice
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="Option A", emoji="🅰️", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Option A", style=discord.ButtonStyle.primary)
     async def option_a(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Vote for option A."""
         await self._vote(interaction, "A")
 
-    @discord.ui.button(label="Option B", emoji="🅱️", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Option B", style=discord.ButtonStyle.success)
     async def option_b(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Vote for option B."""
         await self._vote(interaction, "B")
 
-    @discord.ui.button(label="Next", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
     async def next_prompt(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -583,7 +621,7 @@ class FunGames(commands.Cog):
 
         def renderer() -> discord.Embed:
             return discord.Embed(
-                title="Magic eight ball 🎱",
+                title="Magic eight ball",
                 description=(
                     f"**Q:** {discord.utils.escape_markdown(question[:500])}\n"
                     f"**A:** {_pick(EIGHT_BALL_ANSWERS)}"
@@ -608,7 +646,7 @@ class FunGames(commands.Cog):
     @commands.hybrid_command(
         with_app_command=False,
         brief="Play rock-paper-scissors.",
-        description="Open an interactive one-round rock-paper-scissors game.",
+        description="Play an interactive first-to-three rock-paper-scissors match.",
         usage="",
     )
     @commands.cooldown(1, 5, commands.BucketType.user)
@@ -678,12 +716,12 @@ class FunGames(commands.Cog):
         first: discord.Member, second: discord.Member, score: int
     ) -> discord.Embed:
         filled = round(score / 10)
-        meter = "💗" * filled + "🖤" * (10 - filled)
+        meter = "█" * filled + "░" * (10 - filled)
         chemistry = (score * 7 + 13) % 101
         teamwork = (score * 11 + 29) % 101
         chaos = (score * 17 + 41) % 101
         embed = discord.Embed(
-            title="Compatibility check 💞",
+            title="Compatibility check",
             description=(
                 f"{first.mention} × {second.mention}\n\n{meter}\n**{score}% compatible**"
             ),
@@ -712,7 +750,7 @@ class FunGames(commands.Cog):
         )
         return (
             discord.Embed(
-                title="Aestron rating lab 🧪",
+                title="Aestron rating lab",
                 description=f"**{discord.utils.escape_markdown(subject)}**\n\n{'▰' * filled}{'▱' * (10 - filled)}\n# **{score}/100**",
                 color=ACCENT,
             )
@@ -775,7 +813,7 @@ class FunGames(commands.Cog):
 
         def renderer() -> discord.Embed:
             return discord.Embed(
-                title="Magic eight ball 🎱",
+                title="Magic eight ball",
                 description=(
                     f"**Q:** {discord.utils.escape_markdown(question[:500])}\n"
                     f"**A:** {_pick(EIGHT_BALL_ANSWERS)}"

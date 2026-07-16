@@ -305,8 +305,29 @@ def test_fun_leveling_and_minecraft_regressions_are_registered():
     assert "con.transaction()" in payment_source
     assert "MinecraftVoiceEffects.connect" in pvp_source
     assert "voice_channel: discord.VoiceChannel | None" in pvp_source
-    view = main.Minecraftpvp(1, 2, "one", "two", 20, 20, 10, 10, 5, 5, None)
+    view = main.Minecraftpvp(
+        memberone_id=1,
+        membertwo_id=2,
+        memberone_name="one",
+        membertwo_name="two",
+        memberone_health=20,
+        membertwo_health=20,
+        memberone_armor="Leather",
+        membertwo_armor="Leather",
+        memberone_sword="Wooden",
+        membertwo_sword="Wooden",
+        memberone_avatar=b"",
+        membertwo_avatar=b"",
+        voice_effects=None,
+    )
     assert view.timeout == 300
+    assert {item.label for item in view.children} == {
+        "Yield",
+        "Guard",
+        "Golden apple",
+        "Strike",
+    }
+    assert len(view.render_board()) > 10_000
 
 
 def test_ticket_views_are_persistent_and_channel_names_are_safe():
