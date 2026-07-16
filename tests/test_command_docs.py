@@ -73,7 +73,9 @@ def test_every_registered_command_has_complete_documentation():
             normalize_command_metadata(bot)
 
             assert len(list(bot.walk_commands())) >= 100
-            assert len(bot.tree.get_commands()) >= 80
+            # Related actions are grouped to stay comfortably below Discord's
+            # 100 global root-command limit.
+            assert len(bot.tree.get_commands()) >= 70
             for command_name in (
                 "ban",
                 "clearwarnings",

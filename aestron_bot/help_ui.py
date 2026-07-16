@@ -45,6 +45,13 @@ def build_command_help_embed(
             value=f"`{command.parent.qualified_name}`",
             inline=False,
         )
+    placeholders = command.extras.get("placeholders")
+    if placeholders:
+        embed.add_field(
+            name="Custom placeholders",
+            value=f"`{str(placeholders).replace(', ', '`, `')}`",
+            inline=False,
+        )
     return embed
 
 
@@ -117,6 +124,7 @@ class InteractiveHelpView(discord.ui.View):
     """Category selection, command details, and pagination for help output."""
 
     page_size = 8
+    category_page_size = 23
 
     def __init__(
         self,
@@ -137,11 +145,13 @@ class InteractiveHelpView(discord.ui.View):
         self.categories = {category.name: category for category in categories}
         self.category_order = list(self.categories)
         self.current_category = initial_category
+        self.category_page = 0
         self.page = 0
         self.message: discord.Message | None = None
 
-        if len(categories) > 1:
-            self.add_item(HelpCategorySelect(categories))
+        if initial_category in self.category_order:
+            self.category_page = self.category_order.index(initial_category) // 23
+        self._refresh_category_select()
         self._refresh_command_select()
         self._refresh_buttons()
 
@@ -157,14 +167,34 @@ class InteractiveHelpView(discord.ui.View):
     def select_category(self, category_name: str) -> None:
         """Select a category and reset its pagination."""
         self.current_category = category_name
+        if category_name in self.category_order:
+            self.category_page = (
+                self.category_order.index(category_name) // self.category_page_size
+            )
         self.page = 0
+        self._refresh_category_select()
         self._refresh_command_select()
         self._refresh_buttons()
 
     def render(self) -> discord.Embed:
         """Render the home page or current category page."""
         if self.current_category is None:
-            return self.home_embed
+            embed = self.home_embed.copy()
+            pages = self._category_pages()
+            for category in pages[self.category_page]:
+                embed.add_field(
+                    name=f"{category.name} ({len(category.commands)})",
+                    value=category.description.splitlines()[0][:180],
+                    inline=True,
+                )
+            if len(pages) > 1:
+                embed.set_footer(
+                    text=(
+                        f"Category page {self.category_page + 1}/{len(pages)} • "
+                        "Choose a category below"
+                    )
+                )
+            return embed
 
         category = self.categories[self.current_category]
         pages = self._pages(category)
@@ -195,6 +225,21 @@ class InteractiveHelpView(discord.ui.View):
             for index in range(0, len(commands_list), self.page_size)
         ] or [tuple()]
 
+    def _category_pages(self) -> list[tuple[HelpCategory, ...]]:
+        categories = [self.categories[name] for name in self.category_order]
+        return [
+            tuple(categories[index : index + self.category_page_size])
+            for index in range(0, len(categories), self.category_page_size)
+        ] or [tuple()]
+
+    def _refresh_category_select(self) -> None:
+        for item in list(self.children):
+            if isinstance(item, HelpCategorySelect):
+                self.remove_item(item)
+        category_page = self._category_pages()[self.category_page]
+        if category_page:
+            self.add_item(HelpCategorySelect(category_page))
+
     def _refresh_command_select(self) -> None:
         for item in list(self.children):
             if isinstance(item, HelpCommandSelect):
@@ -209,8 +254,9 @@ class InteractiveHelpView(discord.ui.View):
     def _refresh_buttons(self) -> None:
         if self.current_category is None:
             self.home_button.disabled = True
-            self.previous_button.disabled = True
-            self.next_button.disabled = True
+            category_pages = self._category_pages()
+            self.previous_button.disabled = self.category_page == 0
+            self.next_button.disabled = self.category_page >= len(category_pages) - 1
             return
         page_count = len(self._pages(self.categories[self.current_category]))
         self.home_button.disabled = False
@@ -229,6 +275,7 @@ class InteractiveHelpView(discord.ui.View):
         """Return to the category overview."""
         self.current_category = None
         self.page = 0
+        self._refresh_category_select()
         self._refresh_command_select()
         self._refresh_buttons()
         await interaction.response.edit_message(embed=self.render(), view=self)
@@ -238,7 +285,11 @@ class InteractiveHelpView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Move to the previous command page."""
-        self.page = max(0, self.page - 1)
+        if self.current_category is None:
+            self.category_page = max(0, self.category_page - 1)
+            self._refresh_category_select()
+        else:
+            self.page = max(0, self.page - 1)
         self._refresh_command_select()
         self._refresh_buttons()
         await interaction.response.edit_message(embed=self.render(), view=self)
@@ -248,7 +299,12 @@ class InteractiveHelpView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Move to the next command page."""
-        if self.current_category is not None:
+        if self.current_category is None:
+            self.category_page = min(
+                len(self._category_pages()) - 1, self.category_page + 1
+            )
+            self._refresh_category_select()
+        else:
             page_count = math.ceil(
                 len(self.categories[self.current_category].commands) / self.page_size
             )

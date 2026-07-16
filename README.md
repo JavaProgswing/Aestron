@@ -10,6 +10,17 @@ The actively maintained runtime features are split into focused modules:
   commands with invoker-only controls and bounded input.
 - `aestron_bot/moderation.py` owns validated moderation commands, native
   timeouts, hierarchy checks, and warning records.
+- `aestron_bot/antiraid.py`, `automod.py`, and `audit_logging.py` provide
+  bounded raid detection, native timeout-based message enforcement, persistent
+  incident/event history, and one server-safety overview.
+- `aestron_bot/tickets.py`, `verification.py`, and `giveaways.py` register
+  stable persistent component IDs so panels continue working after restarts.
+- `aestron_bot/leveling.py` provides cached, anti-spam message progression and
+  rank/leaderboard views without temporary image files.
+- `aestron_bot/calls.py` provides consent-based private DM calls with bounded
+  attachment relay, opt-in privacy, and explicit hangup controls.
+- `aestron_bot/profiles.py` renders bounded Discord profiles without scanning
+  the full ban list or calling unrelated vote services.
 - `aestron_bot/database.py` owns the async PostgreSQL pool lifecycle and
   readiness checks; command code no longer depends on module-level `conn` or
   `pool` globals.
@@ -100,6 +111,48 @@ when the node has no working audio source.
   history is also available from the selector in `/vstats`.
 - `a!rps` and `a!trivia` — interactive invoker-only games. Additional text games
   are `a!coinflip`, `a!roll`, `a!choose`, `a!eightball`, and `a!rate`.
+- `/antiraid enable|disable|status|configure` — configure a bounded destructive
+  audit-event window and choose a quarantine or ban response. Bot owners, the
+  guild owner, and managed roles are protected from automated action.
+- `/automod set|status` — enable spam, link/invite, or Perspective-backed
+  profanity filtering per channel and inspect required permissions. Actions use
+  Discord-native timeouts, notify the member privately when DMs are available,
+  and appear in the event log.
+- `/logs setup|disable|overview` — configure audit/event output and inspect
+  permission health, recent event counts, anti-raid state, AutoMod coverage,
+  verification, active tickets, and active giveaways.
+- `/ticket setup|claim|lock|transcript|close|add|remove` — create a restart-safe
+  ticket panel and manage its channels. Opening is concurrency-safe, transcripts
+  are delivered privately, and closed tickets are archived instead of silently
+  deleted.
+- `/verification setup|status|disable|access|start` — configure a persistent
+  verification panel and issue each member a private, expiring CAPTCHA.
+- `/leveling rank|leaderboard|configure` — inspect progress or configure a
+  channel. Only one message per member every 15 seconds earns progress.
+- `/giveaway start|end|reroll|status` — run database-backed button giveaways
+  that resume after a restart. Native Discord polls remain available through the
+  prefix poll command.
+- `a!daily`, `a!weekly`, `a!pay`, `a!inventory`, `a!shop`, and `a!pvp` — the
+  Minecraft-style economy. Daily/weekly claims use the correct cooldowns,
+  transfers are atomic, and PvP can play optional local effects in a selected
+  voice channel without moving or replacing an active music player. Abandoned
+  fights release their temporary voice connection after five minutes.
+- `/call <member> [reason]`, `/calls privacy|status|hangup`, and `a!hangup` —
+  opt-in private calls. Invitations use DM buttons, only DM messages are relayed,
+  attachments are bounded, and either participant can stop the relay immediately.
+- `/profile [member]` or the **Profile** message context action — show a private,
+  bounded Discord profile including roles, badges, timeout state, and sensitive
+  permissions.
+- `/template backup|list|preview|sync|delete` — private, official-URL-only
+  template management. Mutations are serialized per guild and protected by
+  runtime permission checks and cooldowns; preview never applies or deletes
+  channels.
+
+Ticket, verification, and giveaway buttons are persistent across process
+restarts. Sensitive results such as ticket transcripts, verification challenges,
+configuration confirmations, and help command details are ephemeral or sent by
+DM where Discord supports it. Interactive help and game views remain deliberately
+session-bound because they are tied to the member who invoked them.
 
 ## Website and API
 
@@ -183,8 +236,11 @@ The calculator now accepts bounded arithmetic only and never evaluates Python
 code. Optional integrations fail with a clear response when their environment
 settings are absent.
 
-Create the legacy feature tables below in PostgreSQL before the first start.
-Runtime statistics tables are managed automatically as described afterward.
+The modular safety, ticket, verification, call, giveaway, logging, and leveling
+cogs create and migrate their own tables. For a completely fresh database, the
+remaining economy, prefix, custom-command, and compatibility tables below can be
+created before first start. Runtime statistics tables are managed automatically
+as described afterward.
 
 ```
 CREATE TABLE callsettings

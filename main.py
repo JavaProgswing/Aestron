@@ -1,14 +1,13 @@
 import asyncio
 import contextlib
 import enum
-import io
 import itertools
 import json
 import logging
 import os
 import random
 import re
-import string
+import secrets
 import sys
 import time
 from collections import Counter
@@ -20,10 +19,8 @@ import aiohttp
 import discord
 import mystbin
 import psutil
-import validators
 from aiohttp.client import ClientTimeout
 from bs4 import BeautifulSoup
-from captcha.image import ImageCaptcha
 from discord import Color, app_commands
 from discord.ext import commands
 from discord.ext.commands import BucketType
@@ -47,17 +44,27 @@ from aestron_bot import (
     format_exception,
     normalize_command_metadata,
 )
+from aestron_bot.antiraid import AntiRaid
+from aestron_bot.audit_logging import AuditLogging
+from aestron_bot.automod import AutoMod
 from aestron_bot.calculator import evaluate_expression
-from aestron_bot.feedback import Feedback as ModernFeedback
+from aestron_bot.calls import Calls
+from aestron_bot.feedback import Feedback
 from aestron_bot.fun import FunGames
+from aestron_bot.giveaways import Giveaways
 from aestron_bot.help_ui import (
     HelpCategory,
     InteractiveHelpView,
     build_command_help_embed,
 )
-from aestron_bot.moderation import Moderation as ModernModeration
-from aestron_bot.music import Music as ModernMusic
-from aestron_bot.valorant import Valorant as ModernValorant
+from aestron_bot.leveling import Leveling
+from aestron_bot.moderation import Moderation
+from aestron_bot.music import Music
+from aestron_bot.profiles import build_profile_embed
+from aestron_bot.templates import Templates
+from aestron_bot.tickets import Tickets
+from aestron_bot.valorant import Valorant
+from aestron_bot.verification import Captcha
 
 load_dotenv()
 load_dotenv(dotenv_path="database.env")
@@ -300,11 +307,6 @@ class MyHelp(commands.HelpCommand):
                     commands=tuple(visible),
                 )
             )
-            embed.add_field(
-                name=f"{category} ({len(visible)})",
-                value=summary.splitlines()[0][:180],
-                inline=True,
-            )
         embed.add_field(
             name="Available commands",
             value=(
@@ -320,7 +322,7 @@ class MyHelp(commands.HelpCommand):
             home_embed=embed,
             categories=categories,
         )
-        view.message = await self.context.send(embed=embed, view=view)
+        view.message = await self.context.send(embed=view.render(), view=view)
 
     # !help <command>
     async def send_command_help(self, commandname):
@@ -413,7 +415,7 @@ async def addmoney(ctx, userid, money):
             statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
             newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
             async with client.database.pool.acquire() as con:
-                await con.execute(statement, userid, 500, json.dumps(newjson))
+                await con.execute(statement, userid, 1500, json.dumps(newjson))
             async with client.database.pool.acquire() as con:
                 memberoneeco = await con.fetchrow(
                     "SELECT * FROM mceconomy WHERE memberid = $1", userid
@@ -655,24 +657,24 @@ def get_cog_types():
     return (
         AestronInfo,
         AntiRaid,
-        ModernModeration,
-        Logging,
+        AuditLogging,
+        Moderation,
         AutoMod,
         Templates,
-        SupportTicket,
+        Tickets,
         Captcha,
         MinecraftFun,
         Leveling,
-        ModernValorant,
+        Valorant,
         Misc,
-        Call,
+        Calls,
         Fun,
         FunGames,
         Social,
         Giveaways,
         Support,
-        ModernFeedback,
-        ModernMusic,
+        Feedback,
+        Music,
         YoutubeTogether,
         CustomCommands,
     )
@@ -867,7 +869,6 @@ class MyBot(commands.Bot):
         return await super().is_owner(user)
 
     async def setup_hook(self):
-        self.add_view(Verification())
         await run_bot()
 
     async def close(self):
@@ -903,6 +904,106 @@ client = MyBot(
 
 
 client.start_status = BotStartStatus.WAITING
+
+
+class MinecraftVoiceEffects:
+    """Own one temporary native voice connection for Minecraft PvP sounds."""
+
+    def __init__(self, voice_client: discord.VoiceClient) -> None:
+        self.voice_client = voice_client
+        self._closed = False
+
+    @classmethod
+    async def connect(
+        cls, ctx: commands.Context, channel: discord.VoiceChannel
+    ) -> "MinecraftVoiceEffects":
+        """Connect without moving or replacing a music player."""
+        author_voice = getattr(ctx.author, "voice", None)
+        if author_voice is None or author_voice.channel != channel:
+            raise commands.BadArgument(
+                "Join the selected voice channel before enabling PvP sounds."
+            )
+        if ctx.guild.voice_client is not None:
+            raise commands.BadArgument(
+                "Voice is already in use in this server. Stop music or finish the "
+                "other voice activity, or start PvP without a voice channel."
+            )
+        bot_member = ctx.guild.me
+        if bot_member is None:
+            raise commands.BotMissingPermissions(["connect", "speak"])
+        permissions = channel.permissions_for(bot_member)
+        missing = [
+            name for name in ("connect", "speak") if not getattr(permissions, name)
+        ]
+        if missing:
+            raise commands.BotMissingPermissions(missing)
+        try:
+            voice_client = await channel.connect(timeout=20, reconnect=True)
+        except TimeoutError as error:
+            # Discord can finish the voice handshake immediately after the local
+            # timeout. Reuse that connection instead of reporting a false failure.
+            current = ctx.guild.voice_client
+            if (
+                isinstance(current, discord.VoiceClient)
+                and current.channel == channel
+                and current.is_connected()
+            ):
+                voice_client = current
+            else:
+                raise commands.BadArgument(
+                    "The voice connection timed out. Try again or run PvP without "
+                    "sound effects."
+                ) from error
+        except (discord.ClientException, discord.OpusNotLoaded) as error:
+            raise commands.BadArgument(
+                "Minecraft voice effects could not start on this host."
+            ) from error
+        return cls(voice_client)
+
+    def is_playing(self) -> bool:
+        return self.voice_client.is_playing()
+
+    def stop(self) -> None:
+        self.voice_client.stop()
+
+    def play(self, source: discord.AudioSource) -> None:
+        """Replace the previous short effect with the latest action sound."""
+        if self._closed or not self.voice_client.is_connected():
+            source.cleanup()
+            return
+        if self.voice_client.is_playing():
+            self.voice_client.stop()
+        self.voice_client.play(source)
+
+    async def close(self, *, delay: float = 2.5) -> None:
+        """Let the final effect finish, then release only this owned connection."""
+        if self._closed:
+            return
+        self._closed = True
+        if delay:
+            await asyncio.sleep(delay)
+        if self.voice_client.is_playing():
+            self.voice_client.stop()
+        if self.voice_client.is_connected():
+            await self.voice_client.disconnect(force=True)
+
+
+def minecraft_pvp_audio(filename: str) -> discord.FFmpegPCMAudio:
+    """Create one PvP effect from an absolute deployment-safe path."""
+    path = Path(__file__).resolve().parent / "resources" / "pvp" / filename
+    return discord.FFmpegPCMAudio(str(path))
+
+
+def play_minecraft_sound(
+    voice_effects: MinecraftVoiceEffects | None, filename: str
+) -> None:
+    """Play one optional PvP effect and log host/FFmpeg failures."""
+    if voice_effects is None:
+        return
+    try:
+        voice_effects.play(minecraft_pvp_audio(filename))
+    except (discord.ClientException, OSError):
+        LOGGER.warning("Minecraft PvP sound failed file=%s", filename, exc_info=True)
 
 
 class Confirmpvp(discord.ui.View):
@@ -1021,13 +1122,17 @@ async def on_command_error(ctx, error):
             error_data = (
                 f"The command {ctx.command} can be used in {send_timer}s in this role."
             )
-        if checkstaff(ctx.author):
-            await ctx.reinvoke()
-            return
     elif isinstance(error, commands.DisabledCommand):
         error_data = "This command is currently disabled."
         if SETTINGS.support_server_invite:
             error_data += f" Report the issue at {SETTINGS.support_server_invite}."
+    elif isinstance(error, commands.MaxConcurrencyReached):
+        error_data = (
+            "That command is already running here. Wait for it to finish before "
+            "starting another one."
+        )
+    elif isinstance(error, commands.NoPrivateMessage):
+        error_data = "That command can only be used inside a server."
     elif isinstance(error, commands.BotMissingPermissions):
         missingperms = error.missing_permissions[0]
         missingperms = missingperms.replace("_", " ")
@@ -1053,11 +1158,54 @@ async def on_command_error(ctx, error):
     await send_generic_error_embed(ctx, error_data)
 
 
+@client.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    """Return private, actionable errors for grouped slash commands."""
+    original = getattr(error, "original", error)
+    if isinstance(error, app_commands.CommandOnCooldown):
+        message = f"That command is on cooldown. Try again in {error.retry_after:.1f}s."
+    elif isinstance(error, app_commands.MissingPermissions):
+        message = "You are missing: " + ", ".join(
+            permission.replace("_", " ") for permission in error.missing_permissions
+        )
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        message = "I am missing: " + ", ".join(
+            permission.replace("_", " ") for permission in error.missing_permissions
+        )
+    elif isinstance(error, app_commands.CheckFailure):
+        message = "You do not have permission to use that command."
+    elif isinstance(original, commands.UserInputError):
+        message = str(original) or "One or more command values are invalid."
+    elif isinstance(error, app_commands.TransformerError):
+        message = "One of the supplied values could not be resolved."
+    else:
+        LOGGER.error(
+            "Application command failed command=%s user=%s guild=%s channel=%s",
+            getattr(interaction.command, "qualified_name", None),
+            interaction.user.id,
+            interaction.guild_id,
+            interaction.channel_id,
+            exc_info=(type(original), original, original.__traceback__),
+        )
+        message = "An unexpected error occurred while running that command."
+        if SETTINGS.support_server_invite:
+            message += f" Report it at {SETTINGS.support_server_invite}."
+    embed = discord.Embed(
+        title="🚫 Command error", description=message[:4000], color=Color.dark_red()
+    )
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 async def send_generic_error_embed(ctx, error_data):
     embed = discord.Embed(
         title="🚫 Command Error ", description=error_data, color=Color.dark_red()
     )
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, ephemeral=True)
 
 
 async def send_error_log_embed(ctx, error):
@@ -1080,13 +1228,22 @@ async def send_error_log_embed(ctx, error):
         description=f"Command: {ctx.command}.",
         color=Color.dark_red(),
     )
+    traceback_text = format_exception(original_error)
     try:
         file = mystbin.File(
-            filename=f"AE-{genrandomstr(10)}.txt",
-            content=format_exception(original_error),
+            filename=f"AE-{secrets.token_hex(5)}.txt",
+            content=traceback_text,
         )
         pastecode = await mystbin_client.create_paste(files=[file])
         embederror.add_field(name="Traceback", value=pastecode.url)
+    except Exception:
+        LOGGER.warning("Traceback paste upload failed; using an inline summary")
+        embederror.add_field(
+            name="Traceback summary",
+            value=f"```py\n{traceback_text[-850:]}\n```",
+            inline=False,
+        )
+    try:
         await send_to_configured_channel(CHANNEL_ERROR_LOGGING_ID, embed=embederror)
     except Exception:
         LOGGER.exception("Could not publish the command exception to Discord")
@@ -1157,10 +1314,6 @@ async def loginfo(logguild, title, description, changes):
     return msgsent
 
 
-def convertwords(lst):
-    return " ".join(lst).split()
-
-
 async def uservoted(member: discord.Member):
     if not dbltoken or client.user is None:
         return False
@@ -1201,20 +1354,6 @@ def check_caps_num(sentence):
         if element.isupper():
             count += 1
     return (count / orig_length) * 100
-
-
-def check_caps(sentence):
-    orig_length = len(sentence)
-    count = 0
-    for element in sentence:
-        if element == "":
-            count += 1
-        if element.isupper():
-            count += 1
-    try:
-        return ((count / orig_length) * 100) >= 90
-    except Exception:
-        return False
 
 
 def check_emoji(value):
@@ -1454,15 +1593,6 @@ def convertword(time):
     return val * time_dict[unit]
 
 
-def validurl(theurl):
-    isvalid = False
-    try:
-        isvalid = validators.url(theurl)
-    except Exception:
-        pass
-    return isvalid
-
-
 async def get_url_image(url):
     session = client.session
     headers = {
@@ -1475,12 +1605,6 @@ async def get_url_image(url):
     soup = BeautifulSoup(html, "html.parser")
     meta_og_image = soup.find("meta", property="og:image")
     return meta_og_image.get("content") if meta_og_image else None
-
-
-async def removeguildcaution(guildid):
-    await asyncio.sleep(300)
-    async with client.database.pool.acquire() as con:
-        await con.execute("DELETE FROM cautionraid WHERE guildid = $1", guildid)
 
 
 async def removeguildantiraidlog(guildid):
@@ -1628,1828 +1752,6 @@ class AestronInfo(commands.Cog):
         await ctx.send(embed=embed_var, ephemeral=True)
 
 
-def ismuted(ctx, member):
-    muterole = discord.utils.get(ctx.guild.roles, name="muted")
-    if muterole is None:
-        return False
-    for role in member.roles:
-        if role != ctx.guild.default_role:
-            if muterole == role:
-                return True
-    return False
-
-
-# Compatibility export for integrations that imported ``main.Moderation``.
-Moderation = ModernModeration
-
-
-class Logging(commands.Cog):
-    """Logs guild events such as channel/guild/role creation , deletion , edit ."""
-
-    async def cog_load(self):
-        if not client.database.connected:
-            return
-        async with client.database.pool.acquire() as con:
-            guilds = await con.fetch("SELECT * FROM cautionraid")
-        for guild in guilds:
-            await removeguildcaution(guild["guildid"])
-
-    @commands.hybrid_command(
-        brief="This command removes the logging channel in a guild.",
-        description="This command removes the logging channel in a guild(requires manage guild).",
-        usage="",
-        aliases=["disablelog", "disablelogs", "removelog", "removelogs"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def removeloggingchannel(self, ctx):
-        async with client.database.pool.acquire() as con:
-            await con.execute(
-                "DELETE FROM logchannels WHERE guildid = $1", ctx.guild.id
-            )
-        await ctx.send(
-            "Successfully removed the logging channels in this guild.", ephemeral=True
-        )
-
-    @commands.hybrid_command(
-        brief="This command sets a logging channel in a guild.",
-        description="This command sets a logging channel in a guild(requires manage guild).",
-        usage="#channel",
-        aliases=[
-            "setuplog",
-            "setuplogs",
-            "setlog",
-            "setlogs",
-            "enablelog",
-            "enablelogs",
-        ],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def setloggingchannel(self, ctx, channel: discord.TextChannel = None):
-        if channel is None:
-            channel = ctx.channel
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        if not channel.permissions_for(ctx.guild.me).send_messages:
-            raise commands.BotMissingPermissions(["send_messages"])
-        if not channel.permissions_for(ctx.guild.me).view_channel:
-            raise commands.BotMissingPermissions(["view_channel"])
-        if not channel.permissions_for(ctx.guild.me).embed_links:
-            raise commands.BotMissingPermissions(["embed_links"])
-        if not channel.permissions_for(ctx.guild.me).view_audit_log:
-            raise commands.BotMissingPermissions(["view_audit_log"])
-        async with client.database.pool.acquire() as con:
-            logchannellist = await con.fetchrow(
-                "SELECT * FROM logchannels WHERE guildid = $1", ctx.guild.id
-            )
-        if logchannellist is None:
-            statement = (
-                """INSERT INTO logchannels (guildid,channelid) VALUES($1, $2);"""
-            )
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.guild.id, channel.id)
-        else:
-            async with client.database.pool.acquire() as con:
-                await con.execute(
-                    "UPDATE logchannels SET channelid = $1 WHERE guildid = $2",
-                    channel.id,
-                    ctx.guild.id,
-                )
-        await ctx.send(
-            f"Successfully set logging channel of {ctx.guild} to {channel.mention}.",
-            ephemeral=True,
-        )
-
-
-class AntiRaid(commands.Cog):
-    @commands.hybrid_command(
-        brief="This command disables the anti-raid in a guild and sets the anti-raid log to the channel.",
-        description="This command disables the anti-raid in a guild(requires manage guild).",
-        usage="",
-        aliases=["disableantiraid"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def deactivateantiraid(self, ctx):
-        async with client.database.pool.acquire() as con:
-            cautionlist = await con.fetchrow(
-                "SELECT * FROM cautionraid WHERE guildid = $1", ctx.guild.id
-            )
-        is_raided = cautionlist is not None
-        if is_raided:
-            await ctx.send(
-                f"{ctx.author.mention} tried to disable anti-raid while a suspicious activity was detected , anti-raid was not disabled!",
-                ephemeral=True,
-            )
-            return
-        view = ConfirmDecline()
-        msg = await ctx.send(
-            ":no_entry_sign: Due to security reasons , this command will take `5 minutes` to successfully disable! (Click decline to cancel disabling anti raid)",
-            view=view,
-            ephemeral=True,
-        )
-        await view.wait()
-        if view.value:
-            await ctx.send(
-                f"anti-raid couldn't be disabled due to request by {view.authorcancel}.",
-                ephemeral=True,
-            )
-            return
-        try:
-            await msg.edit(
-                content=":no_entry_sign: anti-raid has been successfully disabled in this guild."
-            )
-        except Exception:
-            pass
-
-    @commands.hybrid_command(
-        brief="This command enables the antiraid in a guild and sets the antiraid log to the channel.",
-        description="This command enables the antiraid in a guild(requires manage guild).",
-        usage="#channel",
-        aliases=["enableantiraid"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def activateantiraid(self, ctx, channel: discord.TextChannel = None):
-        if channel is None:
-            channel = ctx.channel
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        if not channel.permissions_for(ctx.guild.me).send_messages:
-            raise commands.BotMissingPermissions(["send_messages"])
-        if not channel.permissions_for(ctx.guild.me).view_channel:
-            raise commands.BotMissingPermissions(["view_channel"])
-        if not channel.permissions_for(ctx.guild.me).embed_links:
-            raise commands.BotMissingPermissions(["embed_links"])
-        if not channel.permissions_for(ctx.guild.me).view_audit_log:
-            raise commands.BotMissingPermissions(["view_audit_log"])
-        async with client.database.pool.acquire() as con:
-            logchannellist = await con.fetchrow(
-                "SELECT * FROM antiraid WHERE guildid = $1", ctx.guild.id
-            )
-        if logchannellist is None:
-            statement = """INSERT INTO antiraid (guildid,channelid) VALUES($1, $2);"""
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.guild.id, channel.id)
-        else:
-            async with client.database.pool.acquire() as con:
-                await con.execute(
-                    "UPDATE antiraid SET channelid = $1 WHERE guildid = $2",
-                    channel.id,
-                    ctx.guild.id,
-                )
-        await ctx.send(
-            f"Successfully enabled anti-raid and set the anti-raid logging channel to {channel.mention}.",
-            ephemeral=True,
-        )
-
-
-class AutoMod(commands.Cog):
-    """Auto moderation settings for various purposes."""
-
-    @commands.hybrid_command(
-        brief="This command stops checking spammed messages in a channel.",
-        description="This command stops checking for spammed messages in a channel(requires manage guild).",
-        usage="#channel",
-        aliases=["disableantispam", "enablespam", "allowspamming"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def allowspam(self, ctx, channel: discord.TextChannel = None):
-        given_title = ""
-        if channel is None:
-            channel = ctx.channel
-
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        given_title = channel.name
-        channel = [channel]
-        embed = discord.Embed(title=f"{given_title}")
-        count = 0
-        loopexited = False
-        for chn in channel:
-            loopexited = False
-            async with client.database.pool.acquire() as con:
-                spamlist = await con.fetchrow(
-                    "SELECT * FROM spamchannels WHERE channelid = $1", chn.id
-                )
-            if spamlist is not None:
-                async with client.database.pool.acquire() as con:
-                    await con.execute(
-                        "DELETE FROM spamchannels WHERE channelid = $1", chn.id
-                    )
-                embed.add_field(
-                    value=f"Message spam is now allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            else:
-                embed.add_field(
-                    value=f"Message spam is already allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            if count >= 12:
-                await ctx.send(embed=embed, ephemeral=True)
-                count = 0
-                embed = discord.Embed(title="** **")
-                loopexited = True
-        if not loopexited:
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command checks spam messages in a channel and mutes the member.",
-        description="This command checks spam messages in a channel and mutes the member(requires manage guild).",
-        usage="#channel",
-        aliases=["enableantispam", "disablespam", "disallowspamming"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def disallowspam(self, ctx, channel: discord.TextChannel = None):
-        given_title = ""
-        if channel is None:
-            channel = ctx.channel
-
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        given_title = channel.name
-        channel = [channel]
-        embed = discord.Embed(title=f"{given_title}")
-        count = 0
-        loopexited = False
-        for chn in channel:
-            loopexited = False
-            async with client.database.pool.acquire() as con:
-                spamlist = await con.fetchrow(
-                    "SELECT * FROM spamchannels WHERE channelid = $1", chn.id
-                )
-            if spamlist is not None:
-                embed.add_field(
-                    value=f"Message spam is already not allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            else:
-                statement = """INSERT INTO spamchannels (channelid) VALUES($1);"""
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, chn.id)
-                embed.add_field(
-                    value=f"Message spam is now not allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            if count >= 12:
-                await ctx.send(embed=embed, ephemeral=True)
-                count = 0
-                embed = discord.Embed(title="** **")
-                loopexited = True
-        if not loopexited:
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command shows the current moderation settings in a channel.",
-        description="This command shows the current moderation settings in a channel(requires manage guild).",
-        usage="#channel",
-        aliases=["settings"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def modsettings(self, ctx, channel: discord.TextChannel = None):
-        if channel is None:
-            channel = ctx.channel
-        embed_var = discord.Embed(
-            title=f"{channel.name} moderation settings",
-            description="",
-            color=Color.blue(),
-        )
-        try:
-            prefix = ctx.prefix
-        except Exception:
-            prefix = "/"
-        guild_prefix = prefix
-        spam_emoji = "❌"
-        async with client.database.pool.acquire() as con:
-            spamlist = await con.fetchrow(
-                "SELECT * FROM spamchannels WHERE channelid = $1", channel.id
-            )
-        if spamlist is not None:
-            spam_emoji = "✅"
-        embed_var.add_field(
-            name=f"Message spamming checks : {spam_emoji}",
-            value=f"Do {guild_prefix}allowspam to disable spam message checks and {guild_prefix}disallowspam to enable spam message checks.",
-            inline=False,
-        )
-        link_emoji = "❌"
-        async with client.database.pool.acquire() as con:
-            linklist = await con.fetchrow(
-                "SELECT * FROM linkchannels WHERE channelid = $1", channel.id
-            )
-        if linklist is not None:
-            link_emoji = "✅"
-        embed_var.add_field(
-            name=f"Message link and server invite checks : {link_emoji}",
-            value=f"Do {guild_prefix}allowlinks to disable link and server invite checks and {guild_prefix}disallowlinks to enable link and server invite checks.",
-            inline=False,
-        )
-        profane_emoji = "❌"
-        async with client.database.pool.acquire() as con:
-            profanelist = await con.fetchrow(
-                "SELECT * FROM profanechannels WHERE channelid = $1", channel.id
-            )
-        if profanelist is not None:
-            profane_emoji = "✅"
-        embed_var.add_field(
-            name=f"Message profane checks : {profane_emoji}",
-            value=f"Do {guild_prefix}allowprofane to disable profane text checks and {guild_prefix}disallowprofane to enable profane text checks.",
-            inline=False,
-        )
-        await ctx.send(embed=embed_var, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command checks for profanity(hurtful text) in a channel.",
-        description="This command checks for profanity(hurtful text) in a channel(requires manage guild).",
-        usage="#channel",
-        aliases=["enableprofanefilter", "disableprofane", "enablefilter"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def disallowprofane(self, ctx, channel: discord.TextChannel = None):
-        given_title = ""
-        if channel is None:
-            channel = ctx.channel
-
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        given_title = channel.name
-        channel = [channel]
-        embed = discord.Embed(title=f"{given_title}")
-        count = 0
-        loopexited = False
-        for chn in channel:
-            loopexited = False
-            async with client.database.pool.acquire() as con:
-                profanelist = await con.fetchrow(
-                    "SELECT * FROM profanechannels WHERE channelid = $1", chn.id
-                )
-            if profanelist is not None:
-                embed.add_field(
-                    value=f"Profane text is already not allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            else:
-                statement = """INSERT INTO profanechannels (channelid) VALUES($1);"""
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, chn.id)
-                embed.add_field(
-                    value=f"Profane text is now not allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            if count >= 12:
-                await ctx.send(embed=embed, ephemeral=True)
-                count = 0
-                embed = discord.Embed(title="** **")
-                loopexited = True
-        if not loopexited:
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command stops checking for profanity in a channel.",
-        description="This command stops checking for profanity in a channel(requires manage guild).",
-        usage="#channel",
-        aliases=["disableprofanefilter", "enableprofane", "disablefilter"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def allowprofane(self, ctx, channel: discord.TextChannel = None):
-        given_title = ""
-        if channel is None:
-            channel = ctx.channel
-
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        given_title = channel.name
-        channel = [channel]
-        embed = discord.Embed(title=f"{given_title}")
-        count = 0
-        loopexited = False
-        for chn in channel:
-            loopexited = False
-            async with client.database.pool.acquire() as con:
-                profanelist = await con.fetchrow(
-                    "SELECT * FROM profanechannels WHERE channelid = $1", chn.id
-                )
-            if profanelist is not None:
-                async with client.database.pool.acquire() as con:
-                    await con.execute(
-                        "DELETE FROM profanechannels WHERE channelid = $1", chn.id
-                    )
-                embed.add_field(
-                    value=f"Profane text is now allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            else:
-                embed.add_field(
-                    value=f"Profane text is already allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            if count >= 12:
-                await ctx.send(embed=embed, ephemeral=True)
-                count = 0
-                embed = discord.Embed(title="** **")
-                loopexited = True
-        if not loopexited:
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command checks for links in a channel.",
-        description="This command checks for links in a channel(requires manage guild).",
-        usage="#channel",
-        aliases=["enableantilink", "disablelink", "disablelinks"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def disallowlinks(self, ctx, channel: discord.TextChannel = None):
-        given_title = ""
-        if channel is None:
-            channel = ctx.channel
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        given_title = channel.name
-        channel = [channel]
-        embed = discord.Embed(title=f"{given_title}")
-        count = 0
-        loopexited = False
-        for chn in channel:
-            loopexited = False
-            async with client.database.pool.acquire() as con:
-                linklist = await con.fetchrow(
-                    "SELECT * FROM linkchannels WHERE channelid = $1", chn.id
-                )
-            if linklist is not None:
-                embed.add_field(
-                    value=f"Links and server invites are already not allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            else:
-                statement = """INSERT INTO linkchannels (channelid) VALUES($1);"""
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, chn.id)
-                embed.add_field(
-                    value=f"Links and server invites are now not allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            if count >= 12:
-                await ctx.send(embed=embed, ephemeral=True)
-                count = 0
-                embed = discord.Embed(title="** **")
-                loopexited = True
-        if not loopexited:
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command stops checking for links in a channel.",
-        description="This command stops checking for links in a channel(requires manage guild).",
-        usage="#channel",
-        aliases=["disableantilink", "enablelink", "enablelinks"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def allowlinks(self, ctx, channel: discord.TextChannel = None):
-        given_title = ""
-        if channel is None:
-            channel = ctx.channel
-
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        given_title = channel.name
-        channel = [channel]
-        embed = discord.Embed(title=f"{given_title}")
-        count = 0
-        loopexited = False
-        for chn in channel:
-            loopexited = False
-            async with client.database.pool.acquire() as con:
-                linklist = await con.fetchrow(
-                    "SELECT * FROM linkchannels WHERE channelid = $1", chn.id
-                )
-            if linklist is not None:
-                async with client.database.pool.acquire() as con:
-                    await con.execute(
-                        "DELETE FROM linkchannels WHERE channelid = $1", chn.id
-                    )
-                embed.add_field(
-                    value=f"Links and server invites are now allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            else:
-                embed.add_field(
-                    value=f"Links and server invites are already allowed ✅ in {chn.mention}",
-                    name="** **",
-                )
-                count = count + 1
-            if count >= 12:
-                await ctx.send(embed=embed, ephemeral=True)
-                count = 0
-                embed = discord.Embed(title="** **")
-                loopexited = True
-        if not loopexited:
-            await ctx.send(embed=embed, ephemeral=True)
-
-
-def gencharstr(n, ch):
-    res = ""
-    for i in range(n):
-        res = res + ch
-    return res
-
-
-def genvalidatecode(code):
-    import hashlib
-
-    codehash = int(hashlib.sha256(code.encode("utf-8")).hexdigest(), 16) % 10**8
-    epochhash = int(time.time()) // 30
-    random.seed(codehash + epochhash)
-    return random.random()
-
-
-def genrandomstr(n):
-    res = "".join(random.choices(string.ascii_uppercase + string.digits + ".", k=n))
-    return res
-
-
-class Templates(commands.Cog):
-    """Can restore all channel , roles and guild settings from a template and can save into one."""
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["genbackuptemplate", "backup"],
-        brief="This command generates a backup template for the server.",
-        description="This command generates a backup template for the server(requires manage guild).",
-        usage="",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def backuptemplate(self, ctx):
-        check_ensure_permissions(
-            ctx, ctx.guild.me, ["manage_roles", "manage_channels", "manage_guild"]
-        )
-        try:
-            exist_temp = await ctx.guild.templates()
-            exist_temp = exist_temp[0]
-            await exist_temp.delete()
-        except Exception:
-            pass
-        try:
-            backup_template = await ctx.guild.create_template(
-                name=f"Backup template V{genrandomstr(5)}"
-            )
-            backup_template = backup_template.code
-        except Exception:
-            backup_template = "⚫ No permissions"
-            await send_generic_error_embed(
-                ctx,
-                error_data=" I don't have manage guild permissions to create a backup template.",
-            )
-            return
-        embed = discord.Embed(
-            title=f"{ctx.guild}'s backup template",
-            description=f"https://discord.new/{backup_template}",
-            timestamp=discord.utils.utcnow(),
-        )
-        try:
-            await ctx.author.send(embed=embed)
-        except Exception:
-            f = discord.File("./resources/common/dmEnable.jpg", filename="dmEnable.jpg")
-            e = discord.Embed(
-                title="Dms disabled",
-                description="Kindly enable your dms for sending the template.",
-            )
-            e.add_field(
-                name="Command author", value=f"{ctx.author.mention}", inline=False
-            )
-            e.set_image(url="attachment://dmEnable.jpg")
-            mention_mes = await ctx.send(ctx.author.mention, ephemeral=True)
-            await asyncio.sleep(1)
-            await mention_mes.delete()
-            await ctx.send(file=f, embed=e, ephemeral=True)
-            return
-        await ctx.send(
-            f"Hey {ctx.author.mention} I have dmed you the secret backup template.",
-            ephemeral=True,
-        )
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        brief="This command resets all channels from a discord template.",
-        description="This command resets all channels from a discord template(requires manage guild).",
-        usage="template-url",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def settemplate(self, ctx, copytemplate: str):
-        check_ensure_permissions(
-            ctx, ctx.guild.me, ["manage_roles", "manage_channels", "manage_guild"]
-        )
-        try:
-            template = await client.fetch_template(copytemplate)
-        except Exception:
-            try:
-                lastindex = copytemplate.rindex("/")
-                thecode = copytemplate[lastindex + 1 :]
-            except Exception:
-                thecode = copytemplate
-            if thecode is None:
-                await send_generic_error_embed(
-                    ctx, error_data=f"Unknown template with id `{thecode}`"
-                )
-                return
-            copytemplate = "https://discord.new/" + thecode
-            try:
-                template = await client.fetch_template(copytemplate)
-            except Exception:
-                await send_generic_error_embed(
-                    ctx, error_data=f"Unknown template with id `{thecode}`"
-                )
-                return
-        try:
-            exist_temp = await ctx.guild.templates()
-            exist_temp = exist_temp[0]
-            await exist_temp.delete()
-        except Exception:
-            pass
-        try:
-            backup_template = await ctx.guild.create_template(
-                name=f"Backup template V{genrandomstr(5)}"
-            )
-            backup_template = backup_template.code
-        except Exception:
-            backup_template = "⚫ No permissions"
-            await send_generic_error_embed(
-                ctx,
-                error_data="I don't have manage guild permissions to create a backup template.",
-            )
-            return
-        roles = ctx.guild.me.roles
-        sum = roles[0].permissions
-        for r in roles:
-            sum += r.permissions
-
-        embed = discord.Embed(
-            title=f"{ctx.guild}'s backup template",
-            description=f"https://discord.new/{backup_template}",
-            timestamp=discord.utils.utcnow(),
-        )
-        embed_status_del = discord.Embed(
-            title="Deleting old channels/roles",
-            description="Status ⏳",
-        )
-        messagesent = await ctx.send(embed=embed_status_del, ephemeral=True)
-        changesstr_del = ""
-        for channel in ctx.guild.channels:
-            if channel == ctx.channel:
-                continue
-            try:
-                await channel.delete()
-                changesstr_del = changesstr_del + (
-                    f"(Channel) {channel.name} deleted.\n"
-                )
-            except Exception:
-                changesstr_del = changesstr_del + (
-                    f"(Channel) {channel.name} was not deleted.\n"
-                )
-
-        for role in ctx.guild.roles:
-            try:
-                if role.name == "muted" or role.name == "blacklisted":
-                    changesstr_del = changesstr_del + (
-                        f"(Role) {role.name} was not deleted as its punishment role.\n"
-                    )
-                elif (role not in ctx.guild.me.roles) and (
-                    not ctx.guild.default_role == role
-                ):
-                    await role.delete()
-                    changesstr_del = changesstr_del + (f"(Role) {role.name} deleted.\n")
-                else:
-                    changesstr_del = changesstr_del + (
-                        f"(Role) {role.name} was not deleted as its my role.\n"
-                    )
-            except Exception:
-                changesstr_del = changesstr_del + (
-                    f"(Role) {role.name} was not deleted.\n"
-                )
-        my_file_del = discord.File(
-            io.StringIO(str(changesstr_del)), filename="DELETEDchanges.text"
-        )
-        await ctx.send(file=my_file_del)
-        for embed_loop in messagesent.embeds:
-            embed_loop.description = "Status ✅"
-            embed_loop.color = Color.green()
-            await messagesent.edit(embed=embed_loop)
-        try:
-            await ctx.author.send(embed=embed)
-        except Exception:
-            pass
-        embed_status = discord.Embed(
-            title="Creating channels/roles",
-            description="Status ⏳",
-        )
-        messagesent = None
-        changesstr = ""
-        firsttxtchnl = None
-        for recoveryrole in template.source_guild.roles:
-            try:
-                createdrole = await ctx.guild.create_role(
-                    name=recoveryrole.name,
-                    permissions=recoveryrole.permissions,
-                    colour=recoveryrole.colour,
-                    mentionable=recoveryrole.mentionable,
-                    hoist=recoveryrole.hoist,
-                )
-                changesstr = changesstr + (f"(Role) {createdrole.name} created.\n")
-            except Exception:
-                try:
-                    createdrole = await ctx.guild.create_role(
-                        name=recoveryrole.name,
-                        permissions=sum,
-                        colour=recoveryrole.colour,
-                        mentionable=recoveryrole.mentionable,
-                        hoist=recoveryrole.hoist,
-                    )
-                    changesstr = changesstr + (f"(Role) {createdrole.name} created.\n")
-                except Exception:
-                    changesstr = changesstr + (
-                        f"I couldn't create {recoveryrole.name} with {recoveryrole.permissions} and {recoveryrole.colour} colour.\n"
-                    )
-        copycategory = None
-        txtchannel = None
-        for recoverycategory in template.source_guild.by_category():
-            try:
-                copyname = recoverycategory[0].name
-            except Exception:
-                copyname = "General"
-            copycategory = await ctx.guild.create_category(copyname)
-            for copychannel in recoverycategory[1]:
-                if copychannel.type == discord.ChannelType.text:
-                    try:
-                        txtchannel = await copycategory.create_text_channel(
-                            copychannel.name,
-                            overwrites=copychannel.overwrites,
-                            nsfw=copychannel.nsfw,
-                            slowmode_delay=copychannel.slowmode_delay,
-                        )
-                        if firsttxtchnl is None:
-                            firsttxtchnl = txtchannel
-                            messagesent = await firsttxtchnl.send(
-                                embed=embed_status, message=ctx.author.mention
-                            )
-                        changesstr = changesstr + (
-                            f"(Text-Channel) {txtchannel.name} created.\n"
-                        )
-                    except Exception:
-                        changesstr = changesstr + (
-                            f"I couldn't create text channel named {copychannel.name}\n"
-                        )
-
-                elif copychannel.type == discord.ChannelType.voice:
-                    try:
-                        txtchannel = await copycategory.create_voice_channel(
-                            copychannel.name, overwrites=copychannel.overwrites
-                        )
-                        changesstr = changesstr + (
-                            f"(Voice-Channel) {txtchannel.name} created.\n"
-                        )
-                    except Exception:
-                        changesstr = changesstr + (
-                            f"I couldn't create voice channel named {copychannel.name}\n"
-                        )
-                elif copychannel.type == discord.ChannelType.stage_voice:
-                    try:
-                        txtchannel = await copycategory.create_stage_channel(
-                            copychannel.name
-                        )
-                        changesstr = changesstr + (
-                            f"(Stage-Channel) {txtchannel.name} created.\n"
-                        )
-                    except Exception:
-                        changesstr = changesstr + (
-                            f"I couldn't create stage channel named {copychannel.name}\n"
-                        )
-        if messagesent:
-            for embed_loop in messagesent.embeds:
-                embed_loop.description = "✅ Created."
-                embed_loop.color = Color.green()
-                await messagesent.edit(embed=embed_loop)
-        if firsttxtchnl:
-            my_file = discord.File(
-                io.StringIO(str(changesstr)), filename="CREATEDchanges.text"
-            )
-            my_file_del = discord.File(
-                io.StringIO(str(changesstr_del)), filename="DELETEDchanges.text"
-            )
-            await firsttxtchnl.send(file=my_file_del)
-            embed_status_del.description = "Status ✅"
-            embed_status_del.color = Color.green()
-            await firsttxtchnl.send(embed=embed_status_del)
-            await firsttxtchnl.send(file=my_file)
-        await ctx.channel.delete()
-        guild = ctx.guild
-        muterole = discord.utils.get(guild.roles, name="muted")
-        if muterole is None:
-            perms = discord.Permissions(
-                send_messages=False,
-                add_reactions=False,
-                connect=False,
-                change_nickname=False,
-            )
-            try:
-                await guild.create_role(name="muted", permissions=perms)
-            except Exception:
-                raise commands.BotMissingPermissions(["manage_roles"])
-            muterole = discord.utils.get(guild.roles, name="muted")
-            for channelloop in guild.channels:
-                if channelloop.type == discord.ChannelType.text:
-                    await channelloop.set_permissions(
-                        muterole,
-                        read_messages=None,
-                        send_messages=False,
-                        add_reactions=False,
-                        create_public_threads=False,
-                        create_private_threads=False,
-                    )
-                elif channelloop.type == discord.ChannelType.voice:
-                    await channelloop.set_permissions(muterole, view_channel=False)
-        else:
-            perms = discord.Permissions(
-                send_messages=False,
-                add_reactions=False,
-                connect=False,
-                change_nickname=False,
-            )
-            try:
-                await muterole.edit(permissions=perms)
-            except Exception:
-                raise commands.BotMissingPermissions(["manage_roles"])
-            for channelloop in guild.channels:
-                if channelloop.type == discord.ChannelType.text:
-                    await channelloop.set_permissions(
-                        muterole,
-                        read_messages=None,
-                        send_messages=False,
-                        add_reactions=False,
-                        create_public_threads=False,
-                        create_private_threads=False,
-                    )
-                elif channelloop.type == discord.ChannelType.voice:
-                    await channelloop.set_permissions(muterole, view_channel=False)
-        blacklistrole = discord.utils.get(guild.roles, name="blacklisted")
-        if blacklistrole is None:
-            perms = discord.Permissions(send_messages=False, read_messages=False)
-            try:
-                await guild.create_role(name="blacklisted", permissions=perms)
-            except Exception:
-                raise commands.BotMissingPermissions(["manage_roles"])
-            blacklistrole = discord.utils.get(guild.roles, name="blacklisted")
-            for channelloop in guild.channels:
-                await channelloop.set_permissions(blacklistrole, view_channel=False)
-        else:
-            perms = discord.Permissions(send_messages=False, read_messages=False)
-            try:
-                await blacklistrole.edit(permissions=perms)
-            except Exception:
-                raise commands.BotMissingPermissions(["manage_roles"])
-            for channelloop in guild.channels:
-                await channelloop.set_permissions(blacklistrole, view_channel=False)
-
-
-class SupportTicket(commands.Cog):
-    """Creates a support ticket for a member and can be customized ."""
-
-    @commands.hybrid_command(
-        brief="This command creates a support ticket panel.",
-        description="This command creates a support ticket panel(requires manage guild).",
-        usage="channel supportrole reaction supportmessage",
-        aliases=["createticket", "supportticket", "supportpanel"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def createticketpanel(
-        self,
-        ctx,
-        channelname: discord.TextChannel,
-        supportrole: discord.Role = None,
-        reaction: str = None,
-        *,
-        supportmessage: str = None,
-    ):
-        check_ensure_permissions(
-            ctx,
-            ctx.guild.me,
-            [
-                "manage_roles",
-                "manage_channels",
-                "add_reactions",
-                "send_messages",
-                "embed_links",
-            ],
-        )
-        if channelname.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data="The channel provided was not in this guild."
-            )
-            return
-        channel = channelname
-
-        if channelname is None:
-            channelname = "Support-channel"
-        if supportrole is None:
-            supportrole = discord.utils.get(ctx.guild.roles, name="Support-staff")
-            if supportrole is None:
-                supportrole = await ctx.guild.create_role(name="Support-staff")
-
-        if reaction is None:
-            reaction = "🙋"
-        if supportmessage is None:
-            supportmessage = f"Want to create a support ticket ? , click on the {reaction} on this message."
-        embedone = discord.Embed(
-            title="Support ticket", description=supportmessage, color=Color.green()
-        )
-        messagesent = await channel.send(embed=embedone)
-        emojis = [reaction]
-        for emoji in emojis:
-            await messagesent.add_reaction(emoji)
-        async with client.database.pool.acquire() as con:
-            ticketlist = await con.fetchrow(
-                "SELECT * FROM ticketchannels WHERE channelid = $1", channel.id
-            )
-        if ticketlist:
-            async with client.database.pool.acquire() as con:
-                await con.execute(
-                    "DELETE FROM ticketchannels WHERE channelid = $1", channel.id
-                )
-        statement = """INSERT INTO ticketchannels (channelid,messageid,roleid,emoji) VALUES($1,$2,$3,$4);"""
-        async with client.database.pool.acquire() as con:
-            await con.execute(
-                statement, channel.id, messagesent.id, supportrole.id, emoji
-            )
-        await ctx.send(
-            f"The channel ({channel.mention}) was successfully created as a ticket panel.",
-            ephemeral=True,
-        )
-
-
-async def lockticket(user, userone, supportchannel):
-    overw = supportchannel.overwrites
-    overw[supportchannel.guild.me] = discord.PermissionOverwrite(
-        view_channel=True,
-        read_messages=True,
-        send_messages=True,
-    )
-    overw[user] = discord.PermissionOverwrite(
-        view_channel=True,
-        read_messages=True,
-        send_messages=False,
-    )
-    await supportchannel.edit(overwrites=overw)
-    await supportchannel.send(f"This channel has been locked by {userone.mention}.")
-
-
-async def unlockticket(user, userone, supportchannel):
-    overw = supportchannel.overwrites
-    overw[supportchannel.guild.me] = discord.PermissionOverwrite(
-        view_channel=True,
-        read_messages=True,
-        send_messages=True,
-    )
-    overw[user] = discord.PermissionOverwrite(
-        view_channel=True,
-        read_messages=True,
-        send_messages=True,
-    )
-    await supportchannel.edit(overwrites=overw)
-    await supportchannel.send(f"This channel has been unlocked by {userone.mention}.")
-
-
-async def deleteticket(user, userone, supportchannel, channelorig, guild):
-    await supportchannel.send(
-        f"This channel will be deleted in 5 seconds requested by {userone.mention}."
-    )
-    await asyncio.sleep(5)
-    await supportchannel.delete()
-
-
-async def createticket(user, guild, category, channelorig, role: discord.Role):
-    if isinstance(role, int):
-        role = guild.get_role(role)
-    ov = channelorig.overwrites
-    ov[user] = discord.PermissionOverwrite(
-        view_channel=False,
-        read_messages=False,
-        send_messages=False,
-    )
-    await channelorig.edit(overwrites=ov)
-    overwriteperm = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=False,
-            read_messages=False,
-            send_messages=False,
-        ),
-        role: discord.PermissionOverwrite(
-            view_channel=True,
-            read_messages=True,
-            send_messages=True,
-        ),
-        user: discord.PermissionOverwrite(
-            view_channel=True,
-            read_messages=True,
-            send_messages=True,
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True,
-            read_messages=True,
-            send_messages=True,
-        ),
-    }
-    supportchannel = await guild.create_text_channel(
-        f"{user.name}'s support-ticket", category=category
-    )
-    await supportchannel.edit(overwrites=overwriteperm)
-    embedtwo = discord.Embed(
-        title=f"{user.name}'s Support ticket",
-        description="Click on the following reactions to close/edit ticket",
-        color=Color.green(),
-    )
-    messagesent = await supportchannel.send(embed=embedtwo)
-    embed_info = discord.Embed(
-        title="Ticket opened ",
-        description=f"You claimed {supportchannel.mention}",
-        color=Color.green(),
-    )
-    channel_jump_url = f'[Jump to message!]({messagesent.jump_url} "Click this link to go to support message!") '
-    embed_info.add_field(name="Conversation", value=channel_jump_url, inline=False)
-    try:
-        await user.send(embed=embed_info)
-    except Exception:
-        pass
-    ghostping = await supportchannel.send(user.mention)
-    await ghostping.delete()
-    emojis = ["🟥", "🔒", "🔓"]
-    for emoji in emojis:
-        await messagesent.add_reaction(emoji)
-
-    def check(reaction, userone):
-        if userone == client.user:
-            return False
-        if userone == user:
-            return False
-        if not reaction.message == messagesent:
-            return False
-        client.create_background_task(
-            messagesent.remove_reaction(reaction, userone),
-            name="ticket-remove-reaction",
-        )
-        if str(reaction) == "🟥":
-            client.create_background_task(
-                deleteticket(user, userone, supportchannel, channelorig, guild),
-                name="ticket-delete",
-            )
-            return False
-        if str(reaction) == "🔒":
-            client.create_background_task(
-                lockticket(user, userone, supportchannel), name="ticket-lock"
-            )
-            return False
-        if str(reaction) == "🔓":
-            client.create_background_task(
-                unlockticket(user, userone, supportchannel), name="ticket-unlock"
-            )
-            return False
-        return False
-
-    try:
-        reaction, user = await client.wait_for("reaction_add", check=check)
-    except TimeoutError:
-        await supportchannel.send(
-            " Please run the command again , this command has timed out."
-        )
-    else:
-        pass
-
-
-def rand_str(chars=string.ascii_uppercase + string.digits, n=4):
-    return "".join(random.choice(chars) for _ in range(n))
-
-
-class Verification(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Verify", style=discord.ButtonStyle.green, custom_id="verification:green"
-    )
-    async def green(self, interaction: discord.Interaction, button: discord.ui.Button):
-        verifyrole = discord.utils.get(interaction.guild.roles, name="Verified")
-        if verifyrole is None:
-            await interaction.response.send_message(
-                content="Run the **setupverification** command before this command for setting up the roles."
-            )
-            return
-        if verifyrole in interaction.user.roles:
-            await interaction.response.send_message(
-                content="You are already verified.", ephemeral=True
-            )
-            return
-        captcha_message = rand_str()
-        image = ImageCaptcha()
-        await asyncio.to_thread(
-            image.write,
-            captcha_message,
-            f"./resources/temp/captcha_{interaction.user.id}_{interaction.guild.id}.jpg",
-        )
-        f = discord.File(
-            f"./resources/temp/captcha_{interaction.user.id}_{interaction.guild.id}.jpg",
-            filename=f"captcha_{interaction.user.id}_{interaction.guild.id}.jpg",
-        )
-        e = discord.Embed(
-            title=f"{interaction.guild} Verification",
-            description="""Hello! You are required to complete a captcha before entering the server.
-NOTE: This is Case Sensitive.
-
-Why?
-This is to protect the server against
-targeted attacks using automated user accounts.""",
-        )
-        e.add_field(name="Your captcha :", value="** **")
-        e.set_image(
-            url=f"attachment://captcha_{interaction.user.id}_{interaction.guild.id}.jpg"
-        )
-        try:
-            await interaction.user.send(file=f, embed=e)
-        except Exception:
-            f = discord.File("./resources/common/dmEnable.jpg", filename="dmEnable.jpg")
-            e = discord.Embed(title="Dms disabled")
-            e.add_field(
-                name="Command author", value=f"{interaction.user.mention}", inline=False
-            )
-            e.set_image(url="attachment://dmEnable.jpg")
-            await interaction.response.send_message(file=f, embed=e, ephemeral=True)
-            return
-        await interaction.response.send_message(
-            content="Check your dms for verification!.", ephemeral=True
-        )
-
-        def check(m):
-            return interaction.user.id == m.author.id and not m.guild
-
-        msg = await client.wait_for("message", check=check)
-        if msg.content == captcha_message:
-            ea = discord.Embed(
-                title="Thank you for verifying!",
-                description=f"You have gained access to channels by getting verified in {interaction.guild}",
-            )
-            warning = ""
-            if newaccount(interaction.user):
-                warning = "(:octagonal_sign: New account)"
-            await loginfo(
-                interaction.guild,
-                "Verification logging",
-                "** **",
-                f"{interaction.user.mention} has completed captcha verification at <t:{int(time.time())}:R> {warning}.",
-            )
-            await interaction.user.send(embed=ea)
-            try:
-                await interaction.user.add_roles(verifyrole)
-            except Exception:
-                await send_generic_error_embed(
-                    interaction.channel,
-                    error_data=f"I don't have permissions to add the verify role ({verifyrole.mention}) to {interaction.user.mention}.",
-                )
-                return
-        else:
-            await interaction.user.send(
-                "The captcha entered is invalid , regenerate a new captcha for verification."
-            )
-            if checkstaff(interaction.user):
-                await interaction.user.send(
-                    f"Debug: The captcha was **'{captcha_message}'**."
-                )
-
-
-class Captcha(commands.Cog):
-    """Captcha verification commands"""
-
-    @commands.hybrid_command(
-        brief="This command adds the channels from the verification role.",
-        description="This command adds the channels from the verification role(requires manage guild).",
-        usage="#channelone #channeltwo ...",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_channels=True))
-    async def verifyreadadd(self, ctx, *, list_textstagevoicechannels: str):
-        check_ensure_permissions(ctx, ctx.guild.me, ["manage_channels"])
-        verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole is None:
-            await send_generic_error_embed(
-                ctx,
-                error_data=" The verification role was not found , run the setupverification command for setting this up .",
-            )
-            return
-        embed = discord.Embed(title="Added channels", description=verifyrole.mention)
-        channelnames = list_textstagevoicechannels.replace(" ", ",")
-        channels = []
-        for channelname in channelnames.split(","):
-            try:
-                channel = await commands.TextChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-            try:
-                channel = await commands.StageChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-            try:
-                channel = await commands.VoiceChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-        if len(channels) == 0:
-            raise commands.BadArgument("Nothing")
-        for channel in channels:
-            is_done = "✅ Successfully added"
-            try:
-                overwrite = discord.PermissionOverwrite()
-                overwrite.view_channel = True
-                overwrite.send_messages = False
-                overwrite.read_message_history = True
-                await channel.set_permissions(verifyrole, overwrite=overwrite)
-            except Exception:
-                is_done = "🚫 Error"
-            embed.add_field(name=is_done, value=channel.mention)
-        await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command removes the channels from the verification role.",
-        description="This command removes the channels from the verification role(requires manage guild).",
-        usage="#channelone #channeltwo ...",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_channels=True))
-    async def verifyreadremove(self, ctx, *, list_textstagevoicechannels: str):
-        check_ensure_permissions(ctx, ctx.guild.me, ["manage_channels"])
-        verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole is None:
-            await send_generic_error_embed(
-                ctx,
-                error_data=" The verification role was not found , run the setupverification command for setting this up .",
-            )
-            return
-        embed = discord.Embed(title="Removed channels", description=verifyrole.mention)
-        channelnames = list_textstagevoicechannels.replace(" ", ",")
-        channels = []
-        for channelname in channelnames.split(","):
-            try:
-                channel = await commands.TextChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-            try:
-                channel = await commands.StageChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-            try:
-                channel = await commands.VoiceChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-
-        if len(channels) == 0:
-            raise commands.BadArgument("Nothing")
-        for channel in channels:
-            is_done = "✅ Successfully removed"
-            try:
-                overwrite = discord.PermissionOverwrite()
-                overwrite.view_channel = False
-                overwrite.send_messages = False
-                overwrite.read_message_history = False
-                await channel.set_permissions(verifyrole, overwrite=overwrite)
-            except Exception:
-                is_done = "🚫 Error"
-
-            embed.add_field(name=is_done, value=channel.mention)
-        await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command adds the channels from the verification role.",
-        description="This command adds the channels from the verification role(requires manage guild).",
-        usage="#channelone #channeltwo ...",
-        aliases=["verifyadd", "verifywriteadd", "verifysendadd"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_channels=True))
-    async def verifyfulladd(self, ctx, *, list_textstagevoicechannels: str):
-        check_ensure_permissions(ctx, ctx.guild.me, ["manage_channels"])
-        verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole is None:
-            await send_generic_error_embed(
-                ctx,
-                error_data=" The verification role was not found , run the setupverification command for setting this up .",
-            )
-            return
-        embed = discord.Embed(title="Added channels", description=verifyrole.mention)
-        channelnames = list_textstagevoicechannels.replace(" ", ",")
-        channels = []
-        for channelname in channelnames.split(","):
-            try:
-                channel = await commands.TextChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-            try:
-                channel = await commands.StageChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-            try:
-                channel = await commands.VoiceChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-
-        if len(channels) == 0:
-            raise commands.BadArgument("Nothing")
-        for channel in channels:
-            is_done = "✅ Successfully added"
-            try:
-                overwrite = discord.PermissionOverwrite()
-                overwrite.view_channel = True
-                overwrite.send_messages = True
-                overwrite.read_message_history = True
-                await channel.set_permissions(verifyrole, overwrite=overwrite)
-            except Exception:
-                is_done = "🚫 Error"
-            embed.add_field(name=is_done, value=channel.mention)
-        await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command removes the channels from the verification role.",
-        description="This command removes the channels from the verification role(requires manage guild).",
-        usage="#channelone #channeltwo ...",
-        aliases=["verifyremove", "verifywriteremove", "verifysendremove"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_channels=True))
-    async def verifyfullremove(self, ctx, *, list_textstagevoicechannels: str):
-        check_ensure_permissions(ctx, ctx.guild.me, ["manage_channels"])
-        verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole is None:
-            await send_generic_error_embed(
-                ctx,
-                error_data=" The verification role was not found , run the setupverification command for setting this up .",
-            )
-            return
-        embed = discord.Embed(title="Removed channels", description=verifyrole.mention)
-        channelnames = list_textstagevoicechannels.replace(" ", ",")
-        channels = []
-        for channelname in channelnames.split(","):
-            try:
-                channel = await commands.TextChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-            try:
-                channel = await commands.StageChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-            try:
-                channel = await commands.VoiceChannelConverter().convert(
-                    ctx, channelname
-                )
-                channels.append(channel)
-            except Exception:
-                pass
-
-        if len(channels) == 0:
-            raise commands.BadArgument("Nothing")
-        for channel in channels:
-            is_done = "✅ Successfully removed"
-            try:
-                overwrite = discord.PermissionOverwrite()
-                overwrite.view_channel = False
-                overwrite.send_messages = False
-                overwrite.read_message_history = False
-                await channel.set_permissions(verifyrole, overwrite=overwrite)
-            except Exception:
-                is_done = "🚫 Error"
-
-            embed.add_field(name=is_done, value=channel.mention)
-        await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        brief="This command shows the channels verification role can access.",
-        description="This command shows the channels verification role can access(requires manage guild).",
-        usage="",
-        aliases=["verifychannels"],
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def verificationchannels(self, ctx):
-        verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole is None:
-            await send_generic_error_embed(
-                ctx,
-                error_data=" The verification role was not found , run the setupverification command for setting this up .",
-            )
-            return
-        embed = discord.Embed(
-            title="", description=f"{verifyrole.name} role's channels"
-        )
-        maxcount = 18
-        count = 0
-        for channelloop in ctx.guild.channels:
-            if count >= maxcount:
-                count = 0
-                await ctx.send(embed=embed, ephemeral=True)
-                embed = discord.Embed(title="", description="** **")
-            if channelloop.type == discord.ChannelType.category:
-                continue
-            permission = channelloop.overwrites_for(verifyrole)
-            readverify = permission.view_channel
-            writeverify = permission.send_messages
-            if readverify and writeverify:
-                embed.add_field(
-                    name="Permitted channel (Read and write)📝",
-                    value=channelloop.mention,
-                )
-                count = count + 1
-            elif readverify and not writeverify:
-                embed.add_field(
-                    name="Permitted channel (Read)📖", value=channelloop.mention
-                )
-                count = count + 1
-            elif not readverify and writeverify:
-                embed.add_field(
-                    name="Permitted channel (Write)✍️", value=channelloop.mention
-                )
-                count = count + 1
-            else:
-                embed.add_field(
-                    name="Non permitted channel ", value=channelloop.mention
-                )
-                count = count + 1
-        embed.set_footer(
-            text="Want to add/remove a channel? Do the verifyreadadd/verifyreadremove and verifywriteadd/verifywriteremove command."
-        )
-        if count != 0:
-            await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.hybrid_command(
-        aliases=["unsetverificationchannel"],
-        brief="This command removes a verification channel in the guild.",
-        description="This command removes a verification channel in the guild(requires manage guild).",
-        usage="",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def removeverification(self, ctx):
-        statement = """DELETE FROM verifychannels WHERE guildid = $1"""
-        async with client.database.pool.acquire() as con:
-            await con.execute(statement, ctx.guild.id)
-        statement = """SELECT * FROM verifymsg WHERE guildid = $1"""
-        async with client.database.pool.acquire() as con:
-            row = await con.fetchrow(statement, ctx.guild.id)
-        if row:
-            guild = ctx.guild
-            verifychannel = guild.get_channel(row["channelid"])
-            verifymessage = await verifychannel.fetch_message(row["messageid"])
-            try:
-                await verifymessage.delete()
-            except Exception:
-                pass
-        statement = """DELETE FROM verifymsg WHERE guildid = $1"""
-        async with client.database.pool.acquire() as con:
-            await con.execute(statement, ctx.guild.id)
-        await ctx.send("Successfully removed the verification channel.", ephemeral=True)
-
-    @commands.hybrid_command(
-        aliases=["setverificationchannel"],
-        brief="This command sets up a verification channel in the guild.",
-        description="This command sets up a verification channel in the guild(requires manage guild).",
-        usage="#channel",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def setupverification(self, ctx, verifychannel: discord.TextChannel):
-        check_ensure_permissions(
-            ctx,
-            ctx.guild.me,
-            [
-                "manage_channels",
-                "manage_roles",
-                "add_reactions",
-                "manage_messages",
-                "read_message_history",
-                "send_messages",
-                "view_channel",
-                "embed_links",
-            ],
-        )
-        if verifychannel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole is None:
-            perms = discord.Permissions(view_channel=True)
-            verifyrole = await ctx.guild.create_role(name="Verified", permissions=perms)
-        for channelloop in ctx.guild.channels:
-            original_default = channelloop.overwrites_for(ctx.guild.default_role)
-            locked_default = channelloop.overwrites_for(ctx.guild.default_role)
-            locked_default.update(
-                view_channel=False,
-                read_messages=False,
-                send_messages=False,
-            )
-            bot_overwrite = channelloop.overwrites_for(ctx.guild.me)
-            bot_overwrite.update(
-                view_channel=True,
-                read_messages=True,
-                send_messages=True,
-                read_message_history=True,
-            )
-            try:
-                await channelloop.set_permissions(
-                    verifyrole, overwrite=original_default
-                )
-                await channelloop.set_permissions(
-                    ctx.guild.default_role, overwrite=locked_default
-                )
-                await channelloop.set_permissions(ctx.guild.me, overwrite=bot_overwrite)
-            except discord.HTTPException:
-                LOGGER.exception(
-                    "Could not configure verification permissions guild_id=%s "
-                    "channel_id=%s",
-                    ctx.guild.id,
-                    channelloop.id,
-                )
-        statement = """DELETE FROM verifychannels WHERE guildid = $1"""
-        async with client.database.pool.acquire() as con:
-            await con.execute(statement, ctx.guild.id)
-        statement = """INSERT INTO verifychannels (channelid,guildid) VALUES($1,$2);"""
-        async with client.database.pool.acquire() as con:
-            await con.execute(statement, verifychannel.id, ctx.guild.id)
-        public_overwrite = verifychannel.overwrites_for(ctx.guild.default_role)
-        public_overwrite.update(
-            view_channel=True,
-            read_messages=True,
-            send_messages=True,
-            read_message_history=True,
-        )
-        bot_overwrite = verifychannel.overwrites_for(ctx.guild.me)
-        bot_overwrite.update(
-            view_channel=True,
-            read_messages=True,
-            send_messages=True,
-            read_message_history=True,
-        )
-        try:
-            await verifychannel.set_permissions(
-                ctx.guild.default_role, overwrite=public_overwrite
-            )
-            await verifychannel.set_permissions(ctx.guild.me, overwrite=bot_overwrite)
-        except discord.HTTPException:
-            await send_generic_error_embed(
-                ctx,
-                error_data=f"I don't have permissions to edit {verifychannel.mention}.",
-            )
-            return
-        historyexists = False
-        async for _ in verifychannel.history(limit=1):
-            historyexists = True
-            break
-        if historyexists:
-            messagetwo = await verifychannel.send(
-                "It is recommended to purge the channel before you continue , wanna purge the channel ?"
-            )
-            await messagetwo.add_reaction("👍")
-
-            def check(reaction, user):
-                return (
-                    user == ctx.author
-                    and str(reaction.emoji) == "👍"
-                    and reaction.message == messagetwo
-                )
-
-            try:
-                reaction, user = await client.wait_for(
-                    "reaction_add", timeout=10.0, check=check
-                )
-            except TimeoutError:
-                messageone = await verifychannel.send(
-                    "Ok I am not purging the channel."
-                )
-                await messagetwo.delete()
-                await asyncio.sleep(5)
-                await messageone.delete()
-            else:
-                clonedchannel = await verifychannel.clone()
-                await verifychannel.send("Ok I am purging the channel.")
-                await verifychannel.send(
-                    f"Hey go to {clonedchannel} for a new purged channel ."
-                )
-                statement = """DELETE FROM verifychannels WHERE guildid = $1"""
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, ctx.guild.id)
-                await verifychannel.delete()
-                verifychannel = clonedchannel
-                statement = (
-                    """INSERT INTO verifychannels (channelid,guildid) VALUES($1,$2);"""
-                )
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, verifychannel.id, ctx.guild.id)
-        e = discord.Embed(
-            title=f"{ctx.guild} Verification",
-            description="""Hello! You are required to complete a captcha 🔐 before entering the server.
-NOTE: This is Case Sensitive.
-
-Why?
-This is to protect the server against
-targeted attacks using automated user accounts.""",
-        )
-        try:
-            prefix = ctx.prefix
-        except Exception:
-            prefix = "/"
-        e.add_field(
-            name=f"Type {prefix}verify to get verified and gain access to channels.",
-            value="** **",
-        )
-        msg = await verifychannel.send(embed=e, view=Verification())
-        if msg is not None:
-            statement = """INSERT INTO verifymsg (guildid,channelid,messageid) VALUES($1,$2,$3);"""
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.guild.id, verifychannel.id, msg.id)
-        try:
-            messageone = await ctx.send(
-                "Server verification setup was successful , It is recommended to run the verificationchannels command to view which channels the verified role can access. ",
-                ephemeral=True,
-            )
-            await asyncio.sleep(60)
-            await messageone.delete()
-        except Exception:
-            pass
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        brief="This command verifies you in the guild.",
-        description="This command verifies you in the guild.",
-        usage="",
-    )
-    @commands.guild_only()
-    async def verify(self, ctx):
-        check_ensure_permissions(ctx, ctx.guild.me, ["attach_files"])
-        try:
-            await ctx.message.delete()
-        except Exception:
-            pass
-        verifyrole = discord.utils.get(ctx.guild.roles, name="Verified")
-        if verifyrole is None:
-            await ctx.send(
-                "Run the **setupverification** command before this command for setting up the roles.",
-                ephemeral=True,
-            )
-            return
-        if verifyrole in ctx.author.roles:
-            await ctx.author.send(content="You are already verified.", delete_after=4)
-            return
-        captcha_message = rand_str()
-        image = ImageCaptcha()
-        await asyncio.to_thread(
-            image.write,
-            captcha_message,
-            f"./resources/temp/captcha_{ctx.author.id}_{ctx.guild.id}.jpg",
-        )
-        f = discord.File(
-            f"./resources/temp/captcha_{ctx.author.id}_{ctx.guild.id}.jpg",
-            filename=f"captcha_{ctx.author.id}_{ctx.guild.id}.jpg",
-        )
-        e = discord.Embed(
-            title=f"{ctx.guild} Verification",
-            description="""Hello! You are required to complete a captcha before entering the server.
-NOTE: This is Case Sensitive.
-
-Why?
-This is to protect the server against
-targeted attacks using automated user accounts.""",
-        )
-        e.add_field(name="Your captcha :", value="** **")
-        e.set_image(url="attachment://captcha.png")
-        try:
-            await ctx.author.send(file=f, embed=e)
-        except Exception:
-            f = discord.File("./resources/common/dmEnable.jpg", filename="dmEnable.jpg")
-            e = discord.Embed(title="Dms disabled")
-            e.add_field(
-                name="Command author", value=f"{ctx.author.mention}", inline=False
-            )
-            e.set_image(url="attachment://dmEnable.jpg")
-            mention_mes = await ctx.send(ctx.author.mention, ephemeral=True)
-            await asyncio.sleep(1)
-            await mention_mes.delete()
-            dm_warnings = await ctx.send(file=f, embed=e, ephemeral=True)
-            await asyncio.sleep(5)
-            await dm_warnings.delete()
-            return
-
-        def check(m):
-            return ctx.author == m.author and not m.guild
-
-        msg = await client.wait_for("message", check=check)
-        if msg.content == captcha_message:
-            ea = discord.Embed(
-                title="Thank you for verifying!",
-                description=f"You have gained access to channels by getting verified in {ctx.guild}",
-            )
-            warning = ""
-            if newaccount(ctx.author):
-                warning = "(:octagonal_sign: New account)"
-            await loginfo(
-                ctx.guild,
-                "Verification logging",
-                "** **",
-                f"{ctx.author.mention} has completed captcha verification at <t:{int(time.time())}:R> {warning}.",
-            )
-            await ctx.author.send(embed=ea)
-            try:
-                await ctx.author.add_roles(verifyrole)
-            except Exception:
-                await send_generic_error_embed(
-                    ctx,
-                    error_data=f"I don't have permissions to add the verify role ({verifyrole.mention}) to {ctx.author.mention}.",
-                )
-                return
-        else:
-            await ctx.author.send(
-                "The captcha entered is invalid , regenerate a new captcha for verification."
-            )
-
-
 class MinecraftFun(commands.Cog):
     """Minecraft game related fun commands"""
 
@@ -3481,11 +1783,14 @@ class MinecraftFun(commands.Cog):
         )
         await ctx.send(embed=embed, ephemeral=True)
 
-    @commands.cooldown(1, 604000, BucketType.member)
+    @commands.cooldown(1, 604800, BucketType.member)
     @commands.hybrid_command(
         aliases=["weekly"],
-        brief="This command is used to claim weekly rewards!.",
-        description="This command is used to claim weekly rewards!",
+        brief="Claim the weekly Minecraft currency reward.",
+        description=(
+            "Claim 1,500 Minecraft currency after voting on Top.gg. "
+            "The cooldown resets when the vote requirement is not met."
+        ),
         usage="",
     )
     @commands.guild_only()
@@ -3516,11 +1821,14 @@ class MinecraftFun(commands.Cog):
             )
             return
 
-    @commands.cooldown(1, 43200, BucketType.member)
+    @commands.cooldown(1, 86400, BucketType.member)
     @commands.hybrid_command(
         aliases=["daily"],
-        brief="This command is used to claim daily rewards!.",
-        description="This command is used to claim daily rewards!",
+        brief="Claim the daily Minecraft currency reward.",
+        description=(
+            "Claim 150 Minecraft currency after voting on Top.gg. "
+            "The cooldown resets when the vote requirement is not met."
+        ),
         usage="",
     )
     @commands.guild_only()
@@ -3538,7 +1846,7 @@ class MinecraftFun(commands.Cog):
                 memberoneeco = await con.fetchrow(
                     "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
                 )
-        if uservoted(ctx.author) or checkstaff(ctx.author):
+        if await uservoted(ctx.author) or checkstaff(ctx.author):
             await ctx.send(
                 "Nice , you have claimed your daily of 150 for today!", ephemeral=True
             )
@@ -3557,9 +1865,12 @@ class MinecraftFun(commands.Cog):
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
         aliases=["give", "pay"],
-        brief="This command is used to give currency.",
-        description="This command is used to give currency.",
-        usage="",
+        brief="Transfer Minecraft currency to another member.",
+        description=(
+            "Atomically transfer a positive amount from your balance to another "
+            "member without allowing self-payments or overdrafts."
+        ),
+        usage="<amount> <member>",
     )
     @commands.guild_only()
     async def payment(self, ctx, price: int, member: discord.Member):
@@ -3575,8 +1886,54 @@ class MinecraftFun(commands.Cog):
                 ctx, error_data=" You cannot pay a negative/zero amount."
             )
             return
-        await addmoney(ctx, ctx.author.id, (-1 * price))
-        await addmoney(ctx, member.id, price)
+        if member.id == ctx.author.id:
+            raise commands.BadArgument("You cannot pay yourself.")
+        default_inventory = json.dumps(
+            {"orechoice": "Leather", "swordchoice": "Wooden"}
+        )
+        async with client.database.pool.acquire() as con, con.transaction():
+            sender = await con.fetchrow(
+                "SELECT balance FROM mceconomy WHERE memberid = $1 FOR UPDATE",
+                ctx.author.id,
+            )
+            if sender is None:
+                await con.execute(
+                    "INSERT INTO mceconomy (memberid, balance, inventory) "
+                    "VALUES ($1, $2, $3)",
+                    ctx.author.id,
+                    1500,
+                    default_inventory,
+                )
+                sender_balance = 1500
+            else:
+                sender_balance = int(sender["balance"])
+            if sender_balance < price:
+                raise commands.BadArgument(
+                    f"You need {price} currency but only have {sender_balance}."
+                )
+            recipient = await con.fetchrow(
+                "SELECT balance FROM mceconomy WHERE memberid = $1 FOR UPDATE",
+                member.id,
+            )
+            if recipient is None:
+                await con.execute(
+                    "INSERT INTO mceconomy (memberid, balance, inventory) "
+                    "VALUES ($1, $2, $3)",
+                    member.id,
+                    1500 + price,
+                    default_inventory,
+                )
+            else:
+                await con.execute(
+                    "UPDATE mceconomy SET balance = balance + $1 WHERE memberid = $2",
+                    price,
+                    member.id,
+                )
+            await con.execute(
+                "UPDATE mceconomy SET balance = balance - $1 WHERE memberid = $2",
+                price,
+                ctx.author.id,
+            )
         await ctx.send(
             f"You have successfully paid {member.name}#{member.discriminator} , {price} currency.",
             ephemeral=True,
@@ -3660,12 +2017,21 @@ class MinecraftFun(commands.Cog):
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
-        brief="This command is used to fight other users in minecraft style.",
-        description="This command is used to fight other users in a minecraft style.",
-        usage="@member #voicechannel",
+        brief="Challenge another member to a Minecraft-style fight.",
+        description=(
+            "Start an interactive text battle using both players' equipped Minecraft "
+            "items. Optionally choose the voice channel you are in for short "
+            "Minecraft-style action sounds. Existing music is never interrupted."
+        ),
+        usage="<member> [voice_channel]",
     )
     @commands.guild_only()
-    async def pvp(self, ctx, member: discord.Member, vhc: discord.VoiceChannel = None):
+    async def pvp(
+        self,
+        ctx,
+        member: discord.Member,
+        voice_channel: discord.VoiceChannel | None = None,
+    ):
         if member == ctx.author:
             await ctx.send(
                 "Trying to battle yourself will only have major consequences !",
@@ -3677,14 +2043,7 @@ class MinecraftFun(commands.Cog):
                 "You cannot battle bots,we cannot be defeated!", ephemeral=True
             )
             return
-        if vhc is not None:
-            await vhc.connect()
-        if ctx.voice_client is None:
-            if ctx.author.voice:
-                await ctx.author.voice.channel.connect()
-        elif ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
-        vc = ctx.voice_client
+        voice_effects = None
         async with client.database.pool.acquire() as con:
             memberoneeco = await con.fetchrow(
                 "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
@@ -3754,9 +2113,7 @@ class MinecraftFun(commands.Cog):
             )
             embed.set_thumbnail(url=memberone.display_avatar.url)
             view = Confirmpvp(member=membertwo.id)
-            view.set_message(
-                statmsg := await ctx.send(embed=embed, view=view, ephemeral=True)
-            )
+            view.set_message(statmsg := await ctx.send(embed=embed, view=view))
             await view.wait()
             if view.value is None:
                 try:
@@ -3785,6 +2142,14 @@ class MinecraftFun(commands.Cog):
                 membertwo_sword_attack = swordattack[swordchoice.index(membertwo_sword)]
             else:
                 return
+        if voice_channel is not None:
+            try:
+                voice_effects = await MinecraftVoiceEffects.connect(ctx, voice_channel)
+            except (commands.BadArgument, commands.BotMissingPermissions) as error:
+                await ctx.send(
+                    f"🔇 **PvP sounds unavailable:** {error}\n"
+                    "The fight will continue normally without voice effects."
+                )
         embed = discord.Embed(
             title="Pvp challenge",
             description=f"`{memberone.name}(Challenger) vs {membertwo.name}`",
@@ -3820,30 +2185,26 @@ class MinecraftFun(commands.Cog):
             value=f" {membertwo_sword} Sword",
             inline=False,
         )
-        try:
-            if vc.is_playing():
-                vc.stop()
-            vc.play(discord.FFmpegPCMAudio("./resources/pvp/Firework_twinkle_far.ogg"))
-        except Exception:
-            pass
-        await ctx.send(
+        play_minecraft_sound(voice_effects, "Firework_twinkle_far.ogg")
+        fight_view = Minecraftpvp(
+            memberone.id,
+            membertwo.id,
+            memberone.name,
+            membertwo.name,
+            memberone_healthpoint,
+            membertwo_healthpoint,
+            memberone_armor_resist,
+            membertwo_armor_resist,
+            memberone_sword_attack,
+            membertwo_sword_attack,
+            voice_effects,
+        )
+        fight_message = await ctx.send(
             content=f"{memberone.mention}'s turn to fight!",
             embed=embed,
-            view=Minecraftpvp(
-                memberone.id,
-                membertwo.id,
-                memberone.name,
-                membertwo.name,
-                memberone_healthpoint,
-                membertwo_healthpoint,
-                memberone_armor_resist,
-                membertwo_armor_resist,
-                memberone_sword_attack,
-                membertwo_sword_attack,
-                vc,
-            ),
-            ephemeral=True,
+            view=fight_view,
         )
+        fight_view.message = fight_message
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
@@ -4049,294 +2410,6 @@ class PaginateEmbed(discord.ui.View):  # EMBED PAGINATOR
                 await self._message.edit(embed=self.embed)
         except Exception:
             pass
-
-
-class Leveling(commands.Cog):
-    """Levelling chat commands."""
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["messageconfig", "levelset", "messageperlevel"],
-        brief="This command can be used to set the messages required per level gained.",
-        description="This command can be used to set the messages required per level gained(requires manage guild).",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def setlevelmessage(
-        self, ctx, messagecount: int, channels: discord.TextChannel = None
-    ):
-        try:
-            messagecount = int(messagecount)
-        except Exception:
-            await send_generic_error_embed(
-                ctx, error_data="Enter a valid number to set message per level count."
-            )
-            return
-        if messagecount < 20:
-            await send_generic_error_embed(
-                ctx,
-                error_data="You cannot set the message per level requirement to below 20 messages.",
-            )
-            return
-        if channels is None:
-            channels = ctx.guild.text_channels
-        else:
-            channels = [channels]
-        for ch in channels:
-            async with client.database.pool.acquire() as con:
-                levelconfiglist = await con.fetchrow(
-                    "SELECT * FROM levelconfig WHERE channelid = $1", ch.id
-                )
-            if levelconfiglist is None:
-                statement = """INSERT INTO levelconfig (channelid,messagecount) VALUES($1,$2);"""
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, ch.id, messagecount)
-            else:
-                async with client.database.pool.acquire() as con:
-                    await con.execute(
-                        "UPDATE levelconfig SET messagecount = $1 WHERE channelid = $2",
-                        messagecount,
-                        ch.id,
-                    )
-        await ctx.send(
-            f"Successfully set {messagecount} per level for the provided channels.",
-            ephemeral=True,
-        )
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["lb", "leaderboard"],
-        brief="This command can be used to get the leaderboard in a guild.",
-        description="This command can be used to get the leaderboard in a guild.",
-    )
-    @commands.guild_only()
-    async def levelrank(self, ctx, member: discord.Member = None):
-        check_ensure_permissions(ctx, ctx.guild.me, ["attach_files"])
-        if member is None:
-            member = ctx.author
-        async with client.database.pool.acquire() as con:
-            warninglist = await con.fetchrow(
-                "SELECT * FROM levelsettings WHERE channelid = $1", ctx.channel.id
-            )
-        try:
-            prefix = ctx.prefix
-        except Exception:
-            prefix = "/"
-        if warninglist is None:
-            statement = (
-                """INSERT INTO levelsettings (channelid,setting) VALUES($1,$2);"""
-            )
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.channel.id, True)
-            async with client.database.pool.acquire() as con:
-                warninglist = await con.fetchrow(
-                    "SELECT * FROM levelsettings WHERE channelid = $1", ctx.channel.id
-                )
-            await ctx.send(
-                f"Alert: leveling was automatically enabled in this channel, do {prefix}leveltoggle to turn off leveling!",
-                ephemeral=True,
-            )
-        if not warninglist["setting"]:
-            await send_generic_error_embed(
-                ctx,
-                error_data=f"The leveling setting has been disabled in this channel , do {prefix}leveltoggle to turn on leveling.",
-            )
-            return
-        async with client.database.pool.acquire() as con:
-            levellist = await con.fetch(
-                "SELECT * FROM leveling WHERE guildid = $1", ctx.guild.id
-            )
-        memberlist = []
-        for memberloop in levellist:
-            jsonmember = {}
-            jsonmember["name"] = memberloop["memberid"]
-            jsonmember["count"] = memberloop["messagecount"]
-            memberlist.append(jsonmember)
-        memberlist.sort(key=get_count, reverse=True)
-        count = 0
-        topmember = []
-        memberconv = commands.MemberConverter()
-        async with client.database.pool.acquire() as con:
-            levelconfiglist = await con.fetchrow(
-                "SELECT * FROM levelconfig WHERE channelid = $1", ctx.channel.id
-            )
-        if levelconfiglist is None:
-            statement = (
-                """INSERT INTO levelconfig (channelid,messagecount) VALUES($1,$2);"""
-            )
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.channel.id, 25)
-            async with client.database.pool.acquire() as con:
-                levelconfiglist = await con.fetchrow(
-                    "SELECT * FROM levelconfig WHERE channelid = $1", ctx.channel.id
-                )
-        levelmsgcount = levelconfiglist["messagecount"]
-        for memberloop in memberlist:
-            jsonmember = {}
-            try:
-                tempobj = await memberconv.convert(ctx, str(memberloop["name"]))
-                jsonmember["name"] = tempobj.name
-                jsonmember["level"] = memberloop["count"] // levelmsgcount
-                asset = tempobj.display_avatar.with_size(128)
-                jsonmember["avatar_bytes"] = await asset.read()
-                topmember.append(jsonmember)
-                count = count + 1
-            except Exception:
-                pass
-            if count == 5:
-                break
-        if len(topmember) < 5:
-            await send_generic_error_embed(
-                ctx, error_data="Not enough members to show a leaderboard!"
-            )
-            return
-        destination = f"./resources/temp/levelrank_{ctx.guild.id}.jpg"
-        await asyncio.to_thread(render_level_rank_image, topmember, destination)
-        file = discord.File(destination)
-        embed = discord.Embed()
-        embed.set_image(url=f"attachment://levelrank_{ctx.guild.id}.jpg")
-        await ctx.send(file=file, embed=embed, ephemeral=True)
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["rank", "levels"],
-        brief="This command can be used to get the current level in a guild.",
-        description="This command can be used to get the current level in a guild.",
-        usage="@member",
-    )
-    @commands.guild_only()
-    async def level(self, ctx, member: discord.Member = None):
-        check_ensure_permissions(ctx, ctx.guild.me, ["attach_files"])
-        if member is None:
-            member = ctx.author
-        async with client.database.pool.acquire() as con:
-            warninglist = await con.fetchrow(
-                "SELECT * FROM levelsettings WHERE channelid = $1", ctx.channel.id
-            )
-        try:
-            prefix = ctx.prefix
-        except Exception:
-            prefix = "/"
-        if warninglist is None:
-            statement = (
-                """INSERT INTO levelsettings (channelid,setting) VALUES($1,$2);"""
-            )
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.channel.id, True)
-            async with client.database.pool.acquire() as con:
-                warninglist = await con.fetchrow(
-                    "SELECT * FROM levelsettings WHERE channelid = $1", ctx.channel.id
-                )
-            await ctx.send(
-                f"Alert: leveling was automatically enabled in this channel, do {prefix}leveltoggle to turn off leveling!",
-                ephemeral=True,
-            )
-        if not warninglist["setting"]:
-            await send_generic_error_embed(
-                ctx,
-                error_data=f"The leveling setting has been disabled in this channel , do {prefix}leveltoggle to turn on leveling.",
-            )
-            return
-        async with client.database.pool.acquire() as con:
-            levellist = await con.fetch(
-                "SELECT * FROM leveling WHERE guildid = $1", ctx.guild.id
-            )
-        memberlist = []
-        for memberloop in levellist:
-            jsonmember = {}
-            jsonmember["name"] = memberloop["memberid"]
-            jsonmember["count"] = memberloop["messagecount"]
-            memberlist.append(jsonmember)
-        memberlist.sort(key=get_count, reverse=True)
-        count = 1
-        rank = None
-        msgcount = None
-        for memberloop in memberlist:
-            if memberloop["name"] == member.id:
-                rank = count
-                msgcount = memberloop["count"]
-                break
-            count = count + 1
-        if msgcount is None or rank is None:
-            await send_generic_error_embed(
-                ctx,
-                error_data="The user you requested doesn't have any levels (no messages sent).",
-            )
-            return
-        async with client.database.pool.acquire() as con:
-            levelconfiglist = await con.fetchrow(
-                "SELECT * FROM levelconfig WHERE channelid = $1", ctx.channel.id
-            )
-        if levelconfiglist is None:
-            statement = (
-                """INSERT INTO levelconfig (channelid,messagecount) VALUES($1,$2);"""
-            )
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.channel.id, 25)
-            async with client.database.pool.acquire() as con:
-                levelconfiglist = await con.fetchrow(
-                    "SELECT * FROM levelconfig WHERE channelid = $1", ctx.channel.id
-                )
-        levelmsgcount = levelconfiglist["messagecount"]
-        avatar_bytes = await member.display_avatar.read()
-        destination = f"./resources/temp/level_{ctx.author.id}_{ctx.guild.id}.jpg"
-        await asyncio.to_thread(
-            render_level_image,
-            avatar_bytes,
-            member.name,
-            rank,
-            msgcount,
-            levelmsgcount,
-            destination,
-        )
-        file = discord.File(destination)
-        embed = discord.Embed()
-        embed.set_image(url=f"attachment://level_{ctx.author.id}_{ctx.guild.id}.jpg")
-        await ctx.send(file=file, embed=embed, ephemeral=True)
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    @commands.hybrid_command(
-        aliases=["leveltoggle", "togglelevel"],
-        brief="This command can be used to enable/disable your leveling system.",
-        description="This command can be used to enable/disable your leveling system(requires manage guild).",
-    )
-    async def levelsettings(self, ctx, channel: discord.TextChannel = None):
-        if channel is None:
-            channels = [ctx.channel]
-        else:
-            channels = [channel]
-        embed = discord.Embed(title="Leveling settings")
-        for channel in channels:
-            async with client.database.pool.acquire() as con:
-                warninglist = await con.fetchrow(
-                    "SELECT * FROM levelsettings WHERE channelid = $1", channel.id
-                )
-            if warninglist is None:
-                statement = (
-                    """INSERT INTO levelsettings (channelid,setting) VALUES($1,$2);"""
-                )
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, channel.id, True)
-                embed.add_field(
-                    value=f"The levels setting for {channel.mention} was successfully set to {check_emoji(True)}.",
-                    name="** **",
-                )
-            else:
-                current_set = warninglist["setting"]
-                new_set = not current_set
-                embed.add_field(
-                    value=f"The levels setting for {channel.mention} was successfully set to {check_emoji(new_set)}.",
-                    name="** **",
-                )
-                async with client.database.pool.acquire() as con:
-                    await con.execute(
-                        "UPDATE levelsettings SET setting = $1 WHERE channelid = $2",
-                        new_set,
-                        channel.id,
-                    )
-        await ctx.send(embed=embed, ephemeral=True)
 
 
 class Misc(commands.Cog):
@@ -4666,251 +2739,6 @@ async def translatetext(
     await interaction.response.send_message(embed=embed_one, ephemeral=True)
 
 
-class Call(commands.Cog):
-    """Call commands."""
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        aliases=[
-            "callsettings",
-            "chatsettings",
-            "callsetting",
-            "chatsetting",
-            "togglecall",
-        ],
-        brief=" This command can be used to enable/disable your incoming calls from call command.",
-        description=" This command can be used to enable/disable your incoming calls from call command.",
-    )
-    async def calltoggle(self, ctx):
-        async with client.database.pool.acquire() as con:
-            warninglist = await con.fetchrow(
-                "SELECT * FROM callsettings WHERE userid = $1", ctx.author.id
-            )
-        if warninglist is None:
-            statement = (
-                """INSERT INTO callsettings (userid,settingbool) VALUES($1,$2);"""
-            )
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.author.id, False)
-            await ctx.send(
-                f"{ctx.author.mention} Your call settings was successfully set to {check_emoji(False)}.",
-                ephemeral=True,
-            )
-        else:
-            current_set = warninglist["settingbool"]
-            new_set = not current_set
-            await ctx.send(
-                f"{ctx.author.mention} Your call settings was successfully set to {check_emoji(new_set)}.",
-                ephemeral=True,
-            )
-            # UPDATE shoelace_data SET sl_avail = 6 WHERE sl_name = 'sl7'
-            async with client.database.pool.acquire() as con:
-                await con.execute(
-                    "UPDATE callsettings SET settingBool = $1 WHERE userid = $2",
-                    new_set,
-                    ctx.author.id,
-                )
-
-    @commands.cooldown(1, 60, BucketType.member)
-    @commands.hybrid_command(
-        brief=" This command can be used to talk to people.",
-        description=" This command can be used to talk to people.",
-        usage="@member reason",
-    )
-    @commands.guild_only()
-    async def call(self, ctx, member: discord.User, reason: str = None):
-        is_verified = checkstaff(ctx.author)
-        ex_emoji = ""
-        if is_verified:
-            ex_emoji = "✅"
-        if reason is None:
-            reason = "no reason"
-        embed = discord.Embed(
-            title="Outgoing call",
-            description="Call ringing ⏳",
-        )
-        embed.add_field(name="Dialer", value=ctx.author.mention)
-        embed.add_field(name="Receiver", value=member.mention)
-        try:
-            prefix = ctx.prefix
-        except Exception:
-            prefix = "/"
-        messageonesent = None
-        try:
-            messageonesent = await ctx.author.send(embed=embed)
-        except Exception:
-            if ctx.channel.permissions_for(ctx.guild.me).attach_files:
-                f = discord.File(
-                    "./resources/common/dmEnable.jpg", filename="dmEnable.jpg"
-                )
-                e = discord.Embed(title="Dms disabled")
-                e.add_field(
-                    name="Command author", value=f"{ctx.author.mention}", inline=False
-                )
-                e.set_image(url="attachment://dmEnable.jpg")
-                mention_mes = await ctx.send(ctx.author.mention, ephemeral=True)
-                await asyncio.sleep(1)
-                await mention_mes.delete()
-                await ctx.send(
-                    f"{ctx.author.mention} Your dms are disabled , you need to enable dms for this command.",
-                    ephemeral=True,
-                )
-                dm_warnings = await ctx.send(file=f, embed=e, ephemeral=True)
-                await asyncio.sleep(5)
-                await dm_warnings.delete()
-            else:
-                await ctx.send(
-                    f"{ctx.author.mention} Your dms are disabled , you need to enable dms for this command.",
-                    ephemeral=True,
-                )
-            return
-        await ctx.send(
-            f"{ctx.author.mention} go to your dm ({messageonesent.jump_url}) for the call.",
-            ephemeral=True,
-        )
-        embed_one = discord.Embed(
-            title="Incoming call",
-            description=f"Call from {ex_emoji}{ctx.author} in {ctx.guild} , click accept/deny .",
-        )
-        embed_one.add_field(name="Call reason", value=reason)
-        async with client.database.pool.acquire() as con:
-            calllist = await con.fetchrow(
-                "SELECT * FROM callsettings WHERE userid = $1", member.id
-            )
-        member_settings = False
-        if calllist is None:
-            statement = (
-                """INSERT INTO callsettings (userid,settingbool) VALUES($1,$2);"""
-            )
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, member.id, False)
-            member_settings = False
-        else:
-            member_settings = calllist["settingbool"]
-        if member_settings:
-            try:
-                messagesent = await member.send(embed=embed_one)
-            except Exception:
-                await send_generic_error_embed(
-                    ctx,
-                    error_data=f"Your call couldn't connect because {member.name} had their dms disabled .",
-                )
-                return
-
-            await messagesent.add_reaction("✅")
-            await messagesent.add_reaction("❌")
-            reactionadded = ""
-
-            def check(payload):
-                nonlocal reactionadded
-                if payload.user_id == client.user.id:
-                    return False
-                reactionadded = str(payload.emoji)
-                return (
-                    payload.user_id == member.id
-                    and payload.message_id == messagesent.id
-                    and (str(payload.emoji) == "✅" or str(payload.emoji) == "❌")
-                )
-
-            try:
-                await client.wait_for("raw_reaction_add", check=check, timeout=30)
-            except TimeoutError:
-                newembed = messageonesent.embeds[0]
-                newembed.description = "Call declined ❌"
-                await messageonesent.edit(embed=newembed)
-                await ctx.author.send(
-                    f"Your call to {member.mention} was declined because of no response."
-                )
-                await member.send(
-                    f"Your call from {ctx.author.mention} was declined because of no response."
-                )
-                return
-            else:
-                if reactionadded == "✅":
-                    newembed = messageonesent.embeds[0]
-                    newembed.description = "Call accepted ✅"
-                    await messageonesent.edit(embed=newembed)
-                    await ctx.author.send(
-                        f"Your outgoing call to {member.mention} is accepted , start talking!"
-                    )
-                    await member.send(
-                        f"Your incoming call from {ctx.author.mention} is accepted , start talking!"
-                    )
-                elif reactionadded == "❌":
-                    newembed = messageonesent.embeds[0]
-                    newembed.description = "Call declined ❌"
-                    await messageonesent.edit(embed=newembed)
-                    await ctx.author.send(
-                        f"Your outgoing call to {member.mention} is declined."
-                    )
-                    await member.send(
-                        f"Your incoming call from {ctx.author.mention} is declined."
-                    )
-                    return
-
-                async def relay_call_message(_message, sender, recipient):
-                    content = _message.content
-                    if await check_profane(content):
-                        content = gencharstr(len(content), "-")
-                    try:
-                        await recipient.send(
-                            f"**{sender.display_name}** -> `{content}`"
-                        )
-                        for attachment in _message.attachments:
-                            data = await attachment.read()
-                            file = discord.File(
-                                BytesIO(data), filename=attachment.filename
-                            )
-                            await recipient.send(file=file)
-                    except Exception as ex:
-                        with contextlib.suppress(discord.HTTPException):
-                            await sender.send(
-                                f"Your message could not be relayed to "
-                                f"**{recipient.display_name}**: {ex}"
-                            )
-
-                def check(_message: discord.Message) -> bool:
-                    if _message.author not in (member, ctx.author):
-                        return False
-                    if _message.content in (f"{prefix}end", f"{prefix}hangup"):
-                        return True
-                    recipient = ctx.author if _message.author == member else member
-                    client.create_background_task(
-                        relay_call_message(_message, _message.author, recipient),
-                        name="call-message-relay",
-                    )
-                    return False
-
-                try:
-                    await client.wait_for("message", timeout=150, check=check)
-                except TimeoutError:
-                    await ctx.author.send(
-                        f" The call between {ctx.author.mention} and {member.mention} ended (150 seconds passed)."
-                    )
-                    await member.send(
-                        f" The call between {ctx.author.mention} and {member.mention} ended (150 seconds passed)."
-                    )
-                else:
-                    await ctx.author.send(
-                        f" The call between {ctx.author.mention} and {member.mention} ended due to call hangup."
-                    )
-                    await member.send(
-                        f" The call between {ctx.author.mention} and {member.mention} ended due to call hangup."
-                    )
-        else:
-            await asyncio.sleep(30)
-            try:
-                newembed = messageonesent.embeds[0]
-                newembed.description = "Call declined ❌"
-                await messageonesent.edit(embed=newembed)
-            except Exception:
-                pass
-            # await member.send(f"Your call from {ctx.author.mention} was automatically declined as it was disabled in settings , do a!calltoggle to enable it.")
-            await ctx.author.send(
-                f"Your call to {member.mention} was declined because of no response."
-            )
-
-
 class Fun(commands.Cog):
     """General fun commands"""
 
@@ -5128,120 +2956,19 @@ class Fun(commands.Cog):
     @commands.cooldown(1, 60, BucketType.member)
     @commands.hybrid_command(
         aliases=["user", "userinfo", "memberinfo", "member"],
-        brief="This command can be used to get user information.",
-        description="This command can be used to get user information.",
-        usage="@member",
+        brief="Show a bounded Discord member profile.",
+        description=(
+            "Show account age, server roles, sensitive permissions, timeout state, "
+            "badges, avatar, and banner without scanning the server ban list."
+        ),
+        usage="[member]",
     )
     @commands.guild_only()
     async def profile(self, ctx, *, member: discord.Member | discord.User = None):
-        if member is None:
-            member = ctx.author
-        asset = member.display_avatar
-        banner = member.banner
-        embedcolor = member.accent_color
-        if embedcolor is None:
-            embedcolor = Color.blue()
-        embed_one = discord.Embed(title="", description=str(asset), color=embedcolor)
-        bypassed_emoji = "❌"
-        try:
-            guildpos = "Member"
-            if member.guild.owner_id == member.id:
-                guildpos = "Owner"
-            if ctx.channel.permissions_for(member).manage_guild or checkstaff(member):
-                bypassed_emoji = "✅"
-            embed_one.add_field(name="Auto-mod bypass", value=bypassed_emoji)
-            embed_one.add_field(name=f"{member.guild}", value=f"{guildpos}")
-        except Exception:
-            pass
-        embed_one.add_field(name="Member id", value=str(member.id))
-        embed_one.add_field(name="Bot", value=str(check_emoji(member.bot)))
-        try:
-            timel = member.created_at
-            tuplea = timel.timetuple()
-            timestamp = int(
-                datetime(
-                    tuplea.tm_year,
-                    tuplea.tm_mon,
-                    tuplea.tm_mday,
-                    tuplea.tm_hour,
-                    tuplea.tm_min,
-                    tuplea.tm_sec,
-                ).timestamp()
-            )
-            warning = ""
-            if newaccount(member):
-                warning = "(:octagonal_sign: New account)"
-            embed_one.add_field(name="Registered", value=f"<t:{timestamp}:R> {warning}")
-        except Exception:
-            pass
-        try:
-            timel = member.joined_at
-            tuplea = timel.timetuple()
-            timestamp = int(
-                datetime(
-                    tuplea.tm_year,
-                    tuplea.tm_mon,
-                    tuplea.tm_mday,
-                    tuplea.tm_hour,
-                    tuplea.tm_min,
-                    tuplea.tm_sec,
-                ).timestamp()
-            )
-            embed_one.add_field(name="Joined", value=f"<t:{timestamp}:R>")
-        except Exception:
-            pass
-        try:
-            embed_one.add_field(name="Roles", value=list_to_string(member.roles))
-            embed_one.add_field(name="Nicknames", value=str(member.nick))
-        except Exception:
-            pass
-
-        details = member.public_flags
-        detailstring = ""
-        if details.hypesquad_bravery:
-            detailstring += "Hypesquad Bravery \n"
-        if details.hypesquad_brilliance:
-            detailstring += "Hypesquad Brilliance \n"
-        if details.hypesquad_balance:
-            detailstring += "Hypesquad Balance \n"
-        if details.verified_bot_developer:
-            detailstring += "Discord Verified bot developer \n"
-        if details.staff:
-            detailstring += "Official Discord Staff \n"
-        if checkstaff(member):
-            detailstring += f"✅ Official {client.user.name} developer ! \n"
-        if await uservoted(member):
-            detailstring += "✅ Voted on top.gg \n"
-        exists = False
-        banperms = True
-        try:
-            bannedmembers = [entry async for entry in ctx.guild.bans(limit=None)]
-        except Exception:
-            banperms = False
-        if banperms:
-            for loopmember in bannedmembers:
-                if loopmember.user.id == member.id:
-                    exists = True
-                    break
-        if exists:
-            detailstring += "Member banned :hammer:"
-        try:
-            dangperms = await dang_perm(ctx, member)
-            embed_one.add_field(name="Dangerous permissions: ", value=dangperms)
-        except Exception:
-            pass
-        if detailstring != "":
-            embed_one.add_field(
-                name="Additional Details :", value=detailstring, inline=False
-            )
-        if member.display_avatar is not None:
-            embed_one.set_author(name=member.name, icon_url=member.display_avatar)
-        if banner is not None:
-            embed_one.set_thumbnail(url=banner.url)
-        try:
-            await ctx.send(embed=embed_one, ephemeral=True)
-        except Exception:
-            pass
+        member = member or ctx.author
+        await ctx.send(
+            embed=await build_profile_embed(client, member, ctx.guild), ephemeral=True
+        )
 
 
 class Social(commands.Cog):
@@ -5329,412 +3056,6 @@ def message_probability(
         return int(percentage * 100)
     else:
         return 0
-
-
-class Giveaways(commands.Cog):
-    """Giveaways commands"""
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["makepoll"],
-        brief="This command can be used to setup a poll.",
-        description="This command can be used to setup a poll.",
-        usage="5s nitro",
-    )
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    @commands.guild_only()
-    async def poll(self, ctx, time: str, *, reasonpoll: str):
-        timenum = convert(time)
-        if timenum == -1:
-            await send_generic_error_embed(
-                ctx,
-                error_data="You didn't answer with a proper unit. Use (s|m|h|d) next time!",
-            )
-            return
-        elif timenum == -2:
-            await send_generic_error_embed(
-                ctx,
-                error_data="The time must be an integer. Please enter an integer next time.",
-            )
-            return
-        elif timenum == -3:
-            await send_generic_error_embed(
-                ctx,
-                error_data="The time must be an positive number. Please enter an positive number next time.",
-            )
-            return
-        if timenum > 86400:
-            await send_generic_error_embed(
-                ctx,
-                error_data="It is not recommended to set the time to more than 1 day due to bot restarts.",
-            )
-        embed = discord.Embed(
-            title=reasonpoll,
-            description=f"This poll is conducted by {ctx.author.mention} will last {time}.",
-        )
-        embed.add_field(name="Total users", value="0")
-        embed.add_field(
-            name="Percentage of votes ✅/❌",
-            value="0/0 %",
-        )
-        msgsent = await ctx.send(embed=embed)
-        await msgsent.add_reaction("✅")
-        await msgsent.add_reaction("❌")
-        results = "INSERT INTO polls (messageid) VALUES($1);"
-        async with client.database.pool.acquire() as con:
-            await con.execute(results, msgsent.id)
-        await asyncio.sleep(timenum)
-        _message = await ctx.channel.fetch_message(msgsent.id)
-        editedembed = _message.embeds[0]
-        embed.description = (
-            f"This poll was conducted by {ctx.author.mention} and lasted {time}."
-        )
-        await _message.edit(embed=editedembed)
-        await msgsent.reply(f"The poll on {reasonpoll} for {time} was completed.")
-        async with client.database.pool.acquire() as con:
-            await con.execute("DELETE FROM polls WHERE messageid = $1", msgsent.id)
-
-    @commands.hybrid_command(
-        brief="This command can be used to do a instant giveaway for the provided members.",
-        description="This command can be used to do a instant giveaway for the provided members(requires manage guild).",
-        usage="@member,@othermember",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def instantgiveaway(self, ctx, list_members: str):
-        membernames = list_members.replace(" ", ",")
-        members = []
-        for membername in membernames.split(","):
-            try:
-                member = await commands.MemberConverter().convert(ctx, membername)
-                members.append(member)
-            except Exception:
-                pass
-
-        if len(members) == 0:
-            raise commands.BadArgument("Nothing")
-        length = len(members)
-        randomnumber = random.randrange(0, (length - 1))
-        await ctx.send(
-            f"{members[randomnumber].mention} has won the giveaway hosted by {ctx.author.mention}."
-        )
-
-    @commands.hybrid_command(
-        brief="This command can be used to do a giveaway with a prize for a time interval.",
-        description="This command can be used to do a giveaway with a prize for a time interval(requires manage guild).",
-        usage="",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def giveawaystart(self, ctx):
-        check_ensure_permissions(
-            ctx,
-            ctx.guild.me,
-            ["manage_messages", "read_message_history", "add_reactions"],
-        )
-        await ctx.defer()
-        count = 1
-        await ctx.send(
-            "Let's start with this giveaway! Answer these questions within 15 seconds!",
-            ephemeral=True,
-        )
-
-        questions = [
-            "Which channel should it be hosted in?",
-            "What should be the duration of the giveaway? (s|m|h|d)",
-            "What is the prize of the giveaway?",
-        ]
-
-        answers = []
-
-        def check(m):
-            nonlocal count
-            count = count + 1
-            return m.author == ctx.author and m.channel == ctx.channel
-
-        await ctx.send(
-            "How many members will be winners of this giveaway ?", ephemeral=True
-        )
-        count = count + 1
-        try:
-            msg = await client.wait_for("message", timeout=15.0, check=check)
-        except TimeoutError:
-            try:
-                await ctx.channel.purge(limit=count)
-            except Exception:
-                await ctx.send(
-                    "I do not have `manage messages` permissions to delete messages.",
-                    ephemeral=True,
-                )
-        try:
-            membercount = int(msg.content)
-        except Exception:
-            try:
-                await ctx.channel.purge(limit=count)
-            except Exception:
-                await ctx.send(
-                    "I do not have `manage messages` permissions to delete messages.",
-                    ephemeral=True,
-                )
-            await send_generic_error_embed(
-                ctx, error_data="You didn't answer with a valid number."
-            )
-            return
-        if membercount <= 0:
-            try:
-                await ctx.channel.purge(limit=count)
-            except Exception:
-                await ctx.send(
-                    "I do not have `manage messages` permissions to delete messages.",
-                    ephemeral=True,
-                )
-            await send_generic_error_embed(
-                ctx,
-                error_data="You didn't answer with a proper number , Give a number above zero.",
-            )
-            return
-
-        for i in questions:
-            await ctx.send(i, ephemeral=True)
-            count = count + 1
-            try:
-                msg = await client.wait_for("message", timeout=15.0, check=check)
-            except TimeoutError:
-                try:
-                    await ctx.channel.purge(limit=count)
-                except Exception:
-                    await ctx.send(
-                        "I do not have `manage messages` permissions to delete messages.",
-                        ephemeral=True,
-                    )
-
-                await send_generic_error_embed(
-                    ctx,
-                    error_data="You didn't answer in time, please be quicker next time!",
-                )
-                return
-            answers.append(msg.content)
-
-        try:
-            c_id = int(answers[0][2:-1])
-        except Exception:
-            try:
-                await ctx.channel.purge(limit=count)
-            except Exception:
-                await ctx.send(
-                    "I do not have `manage messages` permissions to delete messages.",
-                    ephemeral=True,
-                )
-            await send_generic_error_embed(
-                ctx,
-                error_data=f"You didn't mention a channel properly. Do it like this {ctx.channel.mention} next time.",
-            )
-            return
-
-        channel = client.get_channel(c_id)
-        if not channel.permissions_for(ctx.guild.me).view_channel:
-            await send_generic_error_embed(
-                ctx,
-                error_data=f"I cannot view the channel(view_channel) {channel.mention} for sending a message for a giveaway.",
-            )
-            return
-        if not channel.permissions_for(ctx.guild.me).send_messages:
-            await send_generic_error_embed(
-                ctx,
-                error_data=f"I cannot send messages(send_messages) in channel {channel.mention} for sending a message for a giveaway.",
-            )
-            return
-        if not channel.permissions_for(ctx.guild.me).embed_links:
-            await send_generic_error_embed(
-                ctx,
-                error_data=f"I cannot send embeds(embed_links) in channel {channel.mention} for sending a message for a giveaway.",
-            )
-            return
-        timenum = convert(answers[1])
-        if timenum == -1:
-            try:
-                await ctx.channel.purge(limit=count)
-            except Exception:
-                await ctx.send(
-                    "I do not have `manage messages` permissions to delete messages.",
-                    ephemeral=True,
-                )
-
-            await send_generic_error_embed(
-                ctx,
-                error_data="You didn't answer with a proper unit. Use (s|m|h|d) next time!",
-            )
-
-            return
-        elif timenum == -2:
-            try:
-                await ctx.channel.purge(limit=count)
-            except Exception:
-                await ctx.send(
-                    "I do not have `manage messages` permissions to delete messages.",
-                    ephemeral=True,
-                )
-
-            await send_generic_error_embed(
-                ctx,
-                error_data="The time must be an integer. Please enter an integer next time.",
-            )
-            return
-        elif timenum == -3:
-            try:
-                await ctx.channel.purge(limit=count)
-            except Exception:
-                await ctx.send(
-                    "I do not have `manage messages` permissions to delete messages.",
-                    ephemeral=True,
-                )
-            await send_generic_error_embed(
-                ctx,
-                error_data="The time must be an positive number. Please enter an positive number next time.",
-            )
-            return
-        if timenum > 86400:
-            await send_generic_error_embed(
-                ctx,
-                error_data="It is not recommended to set the time to more than 1 day due to bot restarts.",
-            )
-            return
-
-        prize = answers[2]
-        try:
-            await ctx.channel.purge(limit=count)
-        except Exception:
-            await ctx.send(
-                "I do not have `manage messages` permissions to delete messages.",
-                ephemeral=True,
-            )
-
-        embed_one = discord.Embed(
-            title="Giveaways🎉", description=prize, color=Color.green()
-        )
-
-        embed_one.add_field(name="** **", value=f"Ends At: {answers[1]}", inline=False)
-
-        embed_one.add_field(
-            name="** **", value=f"Hosted By {ctx.author.mention}", inline=False
-        )
-
-        embed_one.add_field(name="** **", value="Giveaway id:", inline=False)
-        my_msg = await channel.send(embed=embed_one)
-        list_embeds = my_msg.embeds
-        for embed_two in list_embeds:
-            embed_two.set_field_at(
-                index=2, name="** **", value=f"Giveaway id: {my_msg.id}", inline=False
-            )
-            await my_msg.edit(embed=embed_two)
-        await my_msg.add_reaction("🎉")
-
-        await asyncio.sleep(timenum)
-
-        new_msg = await channel.fetch_message(my_msg.id)
-        await asyncio.sleep(1)
-        if len(new_msg.reactions) > 0:
-            users = [user async for user in new_msg.reactions[0].users()]
-            try:
-                users.pop(users.index(client.user))
-            except Exception:
-                pass
-            if len(users) < membercount:
-                await send_generic_error_embed(
-                    ctx,
-                    error_data=f"Enough number of users didn't participate in giveaway of {prize}. ",
-                )
-                return
-            selectedwinnerids = []
-            for i in range(membercount):
-                winner = random.choice(users)
-                if winner.id not in selectedwinnerids:
-                    selectedwinnerids.append(winner.id)
-                    msgurl = new_msg.jump_url
-                    await channel.send(
-                        f"Congratulations! {winner.mention} won the giveaway of **{prize}** ({msgurl})"
-                    )
-
-    @commands.hybrid_command(
-        brief="This command can be used to select a giveaway winner.",
-        description="This command can be used to select a giveaway winner(requires manage guild).",
-        usage="#channel winner giveawayid prize",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def selectroll(
-        self,
-        ctx,
-        channel: discord.TextChannel,
-        winner: discord.Member,
-        id_: int,
-        prize: str,
-    ):
-        await ctx.defer()
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        if not channel.permissions_for(ctx.guild.me).send_messages:
-            raise commands.BotMissingPermissions(["send_messages"])
-        if not channel.permissions_for(ctx.guild.me).view_channel:
-            raise commands.BotMissingPermissions(["view_channel"])
-        if not channel.permissions_for(ctx.guild.me).embed_links:
-            raise commands.BotMissingPermissions(["embed_links"])
-        try:
-            new_msg = await channel.fetch_message(id_)
-        except Exception:
-            await send_generic_error_embed(
-                ctx,
-                error_data="The ID that was entered was incorrect, make sure you have entered the correct giveaway message ID.",
-            )
-            return
-        msgurl = new_msg.jump_url
-        await channel.send(
-            f"Congratulations {winner.mention} won the giveaway of **{prize}** ({msgurl})"
-        )
-
-    @commands.hybrid_command(
-        brief="This command can be used to re-select a new giveaway winner.",
-        description="This command can be used to select a new giveaway winner(requires manage guild).",
-        usage="#channel giveawayid prize",
-    )
-    @commands.guild_only()
-    @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
-    async def reroll(self, ctx, channel: discord.TextChannel, id_: int, *, prize: str):
-        await ctx.defer()
-        if channel.guild != ctx.guild:
-            await send_generic_error_embed(
-                ctx, error_data=" The channel provided was not in this guild."
-            )
-            return
-        if not channel.permissions_for(ctx.guild.me).send_messages:
-            raise commands.BotMissingPermissions(["send_messages"])
-        if not channel.permissions_for(ctx.guild.me).view_channel:
-            raise commands.BotMissingPermissions(["view_channel"])
-        if not channel.permissions_for(ctx.guild.me).embed_links:
-            raise commands.BotMissingPermissions(["embed_links"])
-        try:
-            new_msg = await channel.fetch_message(id_)
-        except Exception:
-            await send_generic_error_embed(
-                ctx,
-                error_data="The ID that was entered was incorrect, make sure you have entered the correct giveaway message ID.",
-            )
-            return
-
-        users = [user async for user in new_msg.reactions[0].users()]
-        try:
-            users.pop(users.index(client.user))
-        except Exception:
-            pass
-        winner = random.choice(users)
-        new_msg = await channel.fetch_message(id_)
-        msgurl = new_msg.jump_url
-        await channel.send(
-            f"Congratulations {winner.mention} won the (reroll) giveaway of **{prize}** ({msgurl})"
-        )
 
 
 class Support(commands.Cog):
@@ -6201,7 +3522,7 @@ class Support(commands.Cog):
     )
     async def pastebin(self, ctx, *, text: str):
         try:
-            file = mystbin.File(filename=genrandomstr(10), content=text)
+            file = mystbin.File(filename=secrets.token_hex(5), content=text)
             pastecode = await mystbin_client.create_paste(files=[file])
         except Exception:
             await send_generic_error_embed(
@@ -6255,10 +3576,6 @@ class Support(commands.Cog):
             text=f"Created by {ctx.author.name} using embedcreate command."
         )
         await ctx.send(embed=embedone)
-
-
-# Compatibility export for integrations that imported ``main.Music``.
-Music = ModernMusic
 
 
 class YoutubeTogether(commands.Cog):
@@ -6338,100 +3655,8 @@ async def getimageurl(url):
     return meta_og_image.get("content") if meta_og_image else None
 
 
-def constructmsg(guild, member):
-    class Defcontext:
-        def __init__(self, guild, member):
-            self.guild = guild
-            self.author = member
-
-    constructedctx = Defcontext(guild, member)
-    return constructedctx
-
-
 class ChannelNotProvidedError(Exception):
     pass
-
-
-def constructctx(guild, member, channel=None):
-    async def defsend(
-        content="** **",
-        tts=None,
-        embed=None,
-        embeds=None,
-        file=None,
-        files=None,
-        stickers=None,
-        delete_after=None,
-        nonce=None,
-        allowed_mentions=None,
-        reference=None,
-        mention_author=None,
-        view=None,
-    ):
-        if channel is None:
-            raise ChannelNotProvidedError("No channels found to send a message to!")
-        await channel.send(
-            content=content,
-            tts=tts,
-            embed=embed,
-            embeds=embeds,
-            file=file,
-            files=files,
-            stickers=stickers,
-            delete_after=delete_after,
-            nonce=nonce,
-            allowed_mentions=allowed_mentions,
-            reference=reference,
-            mention_author=mention_author,
-            view=view,
-        )
-
-    async def defrespond(
-        content="** **",
-        tts=None,
-        embed=None,
-        embeds=None,
-        file=None,
-        files=None,
-        stickers=None,
-        delete_after=None,
-        nonce=None,
-        allowed_mentions=None,
-        reference=None,
-        mention_author=None,
-        view=None,
-        ephemeral=None,
-    ):
-        if channel is None:
-            raise ChannelNotProvidedError("No channels found to send a message to!")
-        await channel.send(
-            content=content,
-            tts=tts,
-            embed=embed,
-            embeds=embeds,
-            file=file,
-            files=files,
-            stickers=stickers,
-            delete_after=delete_after,
-            nonce=nonce,
-            allowed_mentions=allowed_mentions,
-            reference=reference,
-            mention_author=mention_author,
-            view=view,
-        )
-
-    class Defcontext:
-        def __init__(self, guild, member):
-            self.guild = guild
-            self.author = member
-            self.channel = channel
-            self.send = defsend
-            self.respond = defrespond
-            self.me = guild.me
-            self.voice_client = guild.voice_client
-
-    constructedctx = Defcontext(guild, member)
-    return constructedctx
 
 
 def get_guilds():
@@ -6441,112 +3666,15 @@ def get_guilds():
     return list_of_guilds
 
 
-@client.tree.context_menu()  # creates a global _message command. use guild_ids=[] to create guild-specific commands
-async def profile(ctx, _message: discord.Message):
-    member = _message.author
-    asset = member.display_avatar
-    banner = member.banner
-    embedcolor = member.accent_color
-    if embedcolor is None:
-        embedcolor = Color.blue()
-    embed_one = discord.Embed(title="", description=str(asset), color=embedcolor)
-    bypassed_emoji = "❌"
-    try:
-        guildpos = "Member"
-        if member.guild.owner_id == member.id:
-            guildpos = "Owner"
-        if ctx.channel.permissions_for(member).manage_guild or checkstaff(member):
-            bypassed_emoji = "✅"
-        embed_one.add_field(name="Auto-mod bypass", value=bypassed_emoji)
-        embed_one.add_field(name=f"{member.guild}", value=f"{guildpos}")
-    except Exception:
-        pass
-    embed_one.add_field(name="Member id", value=str(member.id))
-    embed_one.add_field(name="Bot", value=str(check_emoji(member.bot)))
-    try:
-        timel = member.created_at
-        tuplea = timel.timetuple()
-        timestamp = int(
-            datetime(
-                tuplea.tm_year,
-                tuplea.tm_mon,
-                tuplea.tm_mday,
-                tuplea.tm_hour,
-                tuplea.tm_min,
-                tuplea.tm_sec,
-            ).timestamp()
-        )
-        warning = ""
-        if newaccount(member):
-            warning = "(:octagonal_sign: New account)"
-        embed_one.add_field(name="Registered", value=f"<t:{timestamp}:R> {warning}")
-    except Exception:
-        pass
-    try:
-        timel = member.joined_at
-        tuplea = timel.timetuple()
-        timestamp = int(
-            datetime(
-                tuplea.tm_year,
-                tuplea.tm_mon,
-                tuplea.tm_mday,
-                tuplea.tm_hour,
-                tuplea.tm_min,
-                tuplea.tm_sec,
-            ).timestamp()
-        )
-        embed_one.add_field(name="Joined", value=f"<t:{timestamp}:R>")
-    except Exception:
-        pass
-    try:
-        embed_one.add_field(name="Roles", value=list_to_string(member.roles))
-        embed_one.add_field(name="Nicknames", value=str(member.nick))
-    except Exception:
-        pass
-
-    details = member.public_flags
-    detailstring = ""
-    if details.hypesquad_bravery:
-        detailstring += "Hypesquad Bravery \n"
-    if details.hypesquad_brilliance:
-        detailstring += "Hypesquad Brilliance \n"
-    if details.hypesquad_balance:
-        detailstring += "Hypesquad Balance \n"
-    if details.verified_bot_developer:
-        detailstring += "Discord Verified bot developer \n"
-    if details.staff:
-        detailstring += "Official Discord Staff \n"
-    if checkstaff(member):
-        detailstring += f"✅ Official {client.user.name} developer ! \n"
-    if await uservoted(member):
-        detailstring += "✅ Voted on top.gg \n"
-    exists = False
-    banperms = True
-    try:
-        bannedmembers = [entry async for entry in ctx.guild.bans(limit=None)]
-    except Exception:
-        banperms = False
-    if banperms:
-        for loopmember in bannedmembers:
-            if loopmember.user.id == member.id:
-                exists = True
-                break
-    if exists:
-        detailstring += "Member banned :hammer:"
-    try:
-        dangperms = await dang_perm(ctx, member)
-        embed_one.add_field(name="Dangerous permissions: ", value=dangperms)
-    except Exception:
-        pass
-    if detailstring != "":
-        embed_one.add_field(
-            name="Additional Details :", value=detailstring, inline=False
-        )
-    if member.display_avatar is not None:
-        embed_one.set_author(name=member.name, icon_url=member.display_avatar)
-    if banner is not None:
-        embed_one.set_thumbnail(url=banner.url)
-    await ctx.send(embed=embed_one, ephemeral=True)
+@client.tree.context_menu(name="Profile")
+async def profile_context_menu(
+    interaction: discord.Interaction, message: discord.Message
+):
+    """Show the selected message author's Discord profile privately."""
+    await interaction.response.send_message(
+        embed=await build_profile_embed(client, message.author, interaction.guild),
+        ephemeral=True,
+    )
 
 
 @client.tree.context_menu()  # creates a global _message command. use guild_ids=[] to create guild-specific commands
@@ -6632,7 +3760,25 @@ class Minecraftpvp(discord.ui.View):
         self.memberone_resiscooldown = False
         self.membertwo_resiscooldown = False
         self.vc = vc
-        super().__init__(timeout=None)
+        self.message = None
+        super().__init__(timeout=300)
+
+    def _finish(self, *, delay: float = 2.5) -> None:
+        """Stop accepting actions and release optional voice in the background."""
+        self.stop()
+        if isinstance(self.vc, MinecraftVoiceEffects):
+            client.create_background_task(
+                self.vc.close(delay=delay), name="minecraft-pvp-voice-cleanup"
+            )
+
+    async def on_timeout(self) -> None:
+        """Expire abandoned fights and release their temporary voice session."""
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await self.message.edit(content="This PvP fight expired.", view=self)
+        self._finish(delay=0)
 
     @discord.ui.button(
         label="🎌 Surrender",
@@ -6683,15 +3829,8 @@ class Minecraftpvp(discord.ui.View):
                         value="🧧Tie",
                     )
                     await _message.edit(content="** **", embed=embed, view=None)
-            try:
-                if self.vc.is_playing():
-                    self.vc.stop()
-                self.vc.play(
-                    discord.FFmpegPCMAudio("./resources/pvp/Event_raidhorn4.ogg")
-                )
-            except Exception:
-                pass
-            self.stop()
+            play_minecraft_sound(self.vc, "Event_raidhorn4.ogg")
+            self._finish()
 
     @discord.ui.button(
         label="🛡️ Defend",
@@ -6737,14 +3876,7 @@ class Minecraftpvp(discord.ui.View):
             _message = interaction.message
             if _message is not None:
                 embed = _message.embeds[0]
-                try:
-                    if self.vc.is_playing():
-                        self.vc.stop()
-                    self.vc.play(
-                        discord.FFmpegPCMAudio("./resources/pvp/Equip_netherite4.ogg")
-                    )
-                except Exception:
-                    pass
+                play_minecraft_sound(self.vc, "Equip_netherite4.ogg")
                 embed.description = f"`{interaction.user.name} has equipped the shields and its on cooldown for the next move!`"
                 await _message.edit(
                     content=f"<@{self.moveturn}> 's turn to fight!", embed=embed
@@ -6817,25 +3949,7 @@ class Minecraftpvp(discord.ui.View):
                     f"You dealt {damagevalue} to {self.membertwoname}.",
                     ephemeral=True,
                 )
-                try:
-                    if self.vc.is_playing():
-                        self.vc.stop()
-                    if attackchoice == "weak":
-                        self.vc.play(
-                            discord.FFmpegPCMAudio("./resources/pvp/Weak_attack1.ogg")
-                        )
-                    if attackchoice == "strong":
-                        self.vc.play(
-                            discord.FFmpegPCMAudio("./resources/pvp/Strong_attack1.ogg")
-                        )
-                    if attackchoice == "critical":
-                        self.vc.play(
-                            discord.FFmpegPCMAudio(
-                                "./resources/pvp/Critical_attack1.ogg"
-                            )
-                        )
-                except Exception:
-                    pass
+                play_minecraft_sound(self.vc, f"{attackchoice.title()}_attack1.ogg")
                 _message = interaction.message
                 if self.membertwo_healthpoint <= 0:
                     if _message is not None:
@@ -6846,16 +3960,7 @@ class Minecraftpvp(discord.ui.View):
                             name=f"{self.memberonename}",
                             value="🎊Won +50 Currency",
                         )
-                        try:
-                            if self.vc.is_playing():
-                                self.vc.stop()
-                            self.vc.play(
-                                discord.FFmpegPCMAudio(
-                                    "./resources/pvp/Player_hurt1.ogg"
-                                )
-                            )
-                        except Exception:
-                            pass
+                        play_minecraft_sound(self.vc, "Player_hurt1.ogg")
                         await addmoney(interaction.channel, self.memberoneid, 50)
                         embed.set_field_at(
                             index=1,
@@ -6867,21 +3972,12 @@ class Minecraftpvp(discord.ui.View):
                             await con.execute(statement, str(self.memberoneid))
                         await addmoney(interaction.channel, self.membertwoid, 5)
                         await _message.edit(embed=embed, view=None)
-                        self.stop()
+                        self._finish()
                         return
                 if _message is not None:
                     lastmessage = " ."
                     if shielddisabled:
-                        try:
-                            if self.vc.is_playing():
-                                self.vc.stop()
-                            self.vc.play(
-                                discord.FFmpegPCMAudio(
-                                    "./resources/pvp/Shield_block5.ogg"
-                                )
-                            )
-                        except Exception:
-                            pass
+                        play_minecraft_sound(self.vc, "Shield_block5.ogg")
                         lastmessage = " and disabled the shields!"
                     embed = _message.embeds[0]
                     embed.description = f"`{self.memberonename} landed {self.membertwoname} with a {attackchoice} hit and dealt {damagevalue}{lastmessage}`"
@@ -6925,25 +4021,7 @@ class Minecraftpvp(discord.ui.View):
                     f"You dealt {damagevalue} to {self.memberonename}.",
                     ephemeral=True,
                 )
-                try:
-                    if self.vc.is_playing():
-                        self.vc.stop()
-                    if attackchoice == "weak":
-                        self.vc.play(
-                            discord.FFmpegPCMAudio("./resources/pvp/Weak_attack1.ogg")
-                        )
-                    if attackchoice == "strong":
-                        self.vc.play(
-                            discord.FFmpegPCMAudio("./resources/pvp/Strong_attack1.ogg")
-                        )
-                    if attackchoice == "critical":
-                        self.vc.play(
-                            discord.FFmpegPCMAudio(
-                                "./resources/pvp/Critical_attack1.ogg"
-                            )
-                        )
-                except Exception:
-                    pass
+                play_minecraft_sound(self.vc, f"{attackchoice.title()}_attack1.ogg")
                 _message = interaction.message
                 if self.memberone_healthpoint <= 0:
                     if _message is not None:
@@ -6960,36 +4038,18 @@ class Minecraftpvp(discord.ui.View):
                             name=f"{self.membertwoname}",
                             value="🎊Won +50 Currency",
                         )
-                        try:
-                            if self.vc.is_playing():
-                                self.vc.stop()
-                            self.vc.play(
-                                discord.FFmpegPCMAudio(
-                                    "./resources/pvp/Player_hurt1.ogg"
-                                )
-                            )
-                        except Exception:
-                            pass
+                        play_minecraft_sound(self.vc, "Player_hurt1.ogg")
                         statement = """INSERT INTO leaderboard (mention) VALUES($1);"""
                         async with client.database.pool.acquire() as con:
                             await con.execute(statement, str(self.membertwoid))
                         await addmoney(interaction.channel, self.memberoneid, 5)
                         await _message.edit(embed=embed, view=None)
-                        self.stop()
+                        self._finish()
                         return
                 if _message is not None:
                     lastmessage = " ."
                     if shielddisabled:
-                        try:
-                            if self.vc.is_playing():
-                                self.vc.stop()
-                            self.vc.play(
-                                discord.FFmpegPCMAudio(
-                                    "./resources/pvp/Shield_block5.ogg"
-                                )
-                            )
-                        except Exception:
-                            pass
+                        play_minecraft_sound(self.vc, "Shield_block5.ogg")
                         lastmessage = " and disabled the shields!"
                     embed = _message.embeds[0]
                     embed.description = f"`{self.membertwoname} landed {self.memberonename} with a {attackchoice} hit and dealt {damagevalue}{lastmessage}`"
@@ -7068,14 +4128,24 @@ def is_custom_command(command_name):
 class CustomCommands(commands.Cog):
     """Create and run server-specific text response commands."""
 
+    custom = app_commands.Group(
+        name="custom", description="Manage this server's custom response commands."
+    )
+
     def __init__(self, bot):
         self.bot = bot
         self._loader_task = None
 
     async def cog_load(self):
-        self._loader_task = asyncio.create_task(
-            self._load_custom_commands(), name="aestron-custom-command-loader"
-        )
+        task_creator = getattr(self.bot, "create_background_task", None)
+        if task_creator:
+            self._loader_task = task_creator(
+                self._load_custom_commands(), name="aestron-custom-command-loader"
+            )
+        else:
+            self._loader_task = asyncio.create_task(
+                self._load_custom_commands(), name="aestron-custom-command-loader"
+            )
 
     async def cog_unload(self):
         if self._loader_task is not None:
@@ -7090,7 +4160,10 @@ class CustomCommands(commands.Cog):
             brief="Send this server's configured custom response.",
             description="Send the response configured for this server's custom command.",
             usage="",
-            extras={"aestron_custom_command": True},
+            extras={
+                "aestron_custom_command": True,
+                "placeholders": "{user}, {member}, {channel}, {guild}",
+            },
         )
         @is_custom_command(command_name)
         async def custom_command(_cog, ctx):
@@ -7155,7 +4228,7 @@ class CustomCommands(commands.Cog):
                     command_name,
                 )
 
-    @commands.cooldown(1, 120, BucketType.member)
+    @commands.cooldown(1, 10, BucketType.member)
     @commands.command(
         brief="List this server's custom commands.",
         description="List every custom response command configured in this server.",
@@ -7203,9 +4276,9 @@ class CustomCommands(commands.Cog):
                 ),
             )
             return
-        if len(response) > 4000:
+        if not response.strip() or len(response) > 4000:
             await send_generic_error_embed(
-                ctx, error_data="Custom responses must be at most 4000 characters."
+                ctx, error_data="Custom responses must contain 1-4000 characters."
             )
             return
         existing = self.bot.get_command(command_name)
@@ -7216,6 +4289,10 @@ class CustomCommands(commands.Cog):
             return
 
         async with client.database.pool.acquire() as con:
+            guild_command_count = await con.fetchval(
+                "SELECT COUNT(*) FROM customcommands WHERE guildid = $1",
+                ctx.guild.id,
+            )
             exists = await con.fetchval(
                 """
                 SELECT EXISTS(
@@ -7226,6 +4303,12 @@ class CustomCommands(commands.Cog):
                 ctx.guild.id,
                 command_name,
             )
+            if not exists and guild_command_count >= 50:
+                await send_generic_error_embed(
+                    ctx,
+                    error_data="This server has reached the limit of 50 custom commands.",
+                )
+                return
             if exists:
                 await con.execute(
                     """
@@ -7247,7 +4330,11 @@ class CustomCommands(commands.Cog):
                     response,
                 )
         self._register_custom_command(command_name)
-        await ctx.send(f"Saved the custom command `{command_name}`.")
+        await ctx.send(
+            f"Saved `{command_name}`. Available placeholders: `{{user}}`, "
+            "`{member}`, `{channel}`, and `{guild}`.",
+            ephemeral=True,
+        )
 
     @commands.cooldown(1, 240, BucketType.member)
     @commands.command(
@@ -7285,127 +4372,123 @@ class CustomCommands(commands.Cog):
                 self.__cog_commands__ = tuple(
                     item for item in self.__cog_commands__ if item is not command
                 )
-        await ctx.send(f"Removed the custom command `{command_name}`.")
+        await ctx.send(f"Removed the custom command `{command_name}`.", ephemeral=True)
 
-
-@client.event
-async def on_raw_reaction_add(payload):
-    if payload.user_id == client.user.id:
-        return
-    if client.runtime_state.maintenance_mode:
-        logging.log(
-            logging.DEBUG,
-            f"Guild {payload.guild_id} channel {payload.channel_id} message {payload.message_id} reaction {payload.emoji} event_type {payload.event_type}.",
+    @custom.command(name="list", description="List this server's custom commands.")
+    async def slash_custom_list(self, interaction: discord.Interaction):
+        """List custom commands privately through slash commands."""
+        async with client.database.pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT commandname FROM customcommands "
+                "WHERE guildid = $1 ORDER BY commandname LIMIT 50",
+                interaction.guild_id,
+            )
+        embed = discord.Embed(
+            title=f"{interaction.guild.name}'s custom commands",
+            description=(
+                " ".join(f"`{row['commandname']}`" for row in rows)
+                or "No custom commands are configured."
+            )[:4096],
+            color=Color.blurple(),
         )
-    try:
-        if payload.event_type == "REACTION_REMOVE":
-            async with client.database.pool.acquire() as con:
-                polllist = await con.fetch("SELECT messageid FROM polls")
-            selectid = payload.message_id
-            exists = False
-            for poll in polllist:
-                if poll[0] == selectid:
-                    exists = True
-            if exists:
-                guild = client.get_guild(payload.guild_id)
-                channel = guild.get_channel(payload.channel_id)
-                _message = await channel.fetch_message(payload.message_id)
-                embed = _message.embeds[0]
-                # embed.add_field(name="Total count ",value="0")
-                # embed.add_field(name="Percentage of votes ✅/❌",value="0/0 %")
-                if len(_message.reactions) >= 2:
-                    deniedreactions = [
-                        user async for user in _message.reactions[1].users()
-                    ]
-                    try:
-                        deniedreactions.pop(deniedreactions.index(client.user))
-                    except Exception:
-                        pass
-                    verifiedreactions = [
-                        user async for user in _message.reactions[0].users()
-                    ]
-                    try:
-                        verifiedreactions.pop(verifiedreactions.index(client.user))
-                    except Exception:
-                        pass
-                    deniedcount = len(deniedreactions)
-                    verifiedcount = len(verifiedreactions)
-                    totalcount = deniedcount + verifiedcount
-                    deniedpercent = (deniedcount / totalcount) * 100
-                    verifiedpercent = (verifiedcount / totalcount) * 100
-                    embed.set_field_at(index=0, name="Total users", value=totalcount)
-                    embed.set_field_at(
-                        index=1,
-                        name="Percentage of votes ✅/❌",
-                        value=f"{round(verifiedpercent)}/{round(deniedpercent)} %",
-                    )
-                    statusmsg = f"Tie {verifiedcount}/{totalcount}"
-                    if round(deniedpercent) > round(verifiedpercent):
-                        statusmsg = f"Denied({deniedcount}/{totalcount}) users"
-                    else:
-                        statusmsg = f"Accepted({verifiedcount}/{totalcount}) users"
-                    embed.set_footer(text=statusmsg)
-                    await _message.edit(embed=embed)
+        embed.set_footer(
+            text="Use /custom set to create one; custom commands use the server prefix"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @custom.command(name="set", description="Create or update a custom response.")
+    @app_commands.default_permissions(manage_guild=True)
+    async def slash_custom_set(
+        self, interaction: discord.Interaction, name: str, response: str
+    ):
+        """Save a validated custom response through slash commands."""
+        name = name.casefold().strip()
+        if not re.fullmatch(r"[a-z0-9_-]{1,32}", name):
+            await interaction.response.send_message(
+                "Names must be 1-32 lowercase letters, numbers, `_`, or `-`.",
+                ephemeral=True,
+            )
+            return
+        if not response.strip() or len(response) > 4000:
+            await interaction.response.send_message(
+                "Responses must contain 1-4000 characters.", ephemeral=True
+            )
+            return
+        existing_command = self.bot.get_command(name)
+        if existing_command is not None and not existing_command.extras.get(
+            "aestron_custom_command"
+        ):
+            await interaction.response.send_message(
+                "That name is already used by a built-in command.", ephemeral=True
+            )
             return
         async with client.database.pool.acquire() as con:
-            polllist = await con.fetch("SELECT messageid FROM polls")
-        selectid = payload.message_id
-        exists = False
-        for poll in polllist:
-            if poll[0] == selectid:
-                exists = True
-        if exists:
-            guild = client.get_guild(payload.guild_id)
-            channel = guild.get_channel(payload.channel_id)
-            _message = await channel.fetch_message(payload.message_id)
-            embed = _message.embeds[0]
-            # embed.add_field(name="Total count ",value="0")
-            # embed.add_field(name="Percentage of votes ✅/❌",value="0/0 %")
-            if len(_message.reactions) >= 2:
-                deniedreactions = [user async for user in _message.reactions[1].users()]
-                try:
-                    deniedreactions.pop(deniedreactions.index(client.user))
-                except Exception:
-                    pass
-                verifiedreactions = [
-                    user async for user in _message.reactions[0].users()
-                ]
-                try:
-                    verifiedreactions.pop(verifiedreactions.index(client.user))
-                except Exception:
-                    pass
-                deniedcount = len(deniedreactions)
-                verifiedcount = len(verifiedreactions)
-                totalcount = deniedcount + verifiedcount
-                deniedpercent = (deniedcount / totalcount) * 100
-                verifiedpercent = (verifiedcount / totalcount) * 100
-                embed.set_field_at(index=0, name="Total users", value=totalcount)
-                embed.set_field_at(
-                    index=1,
-                    name="Percentage of votes ✅/❌",
-                    value=f"{round(verifiedpercent)}/{round(deniedpercent)} %",
-                )
-                statusmsg = f"Tie {verifiedcount}/{totalcount}"
-                if round(deniedpercent) > round(verifiedpercent):
-                    statusmsg = f"Denied({deniedcount}/{totalcount}) users"
-                else:
-                    statusmsg = f"Accepted({verifiedcount}/{totalcount}) users"
-                embed.set_footer(text=statusmsg)
-                await _message.edit(embed=embed)
-        async with client.database.pool.acquire() as con:
-            ticketlist = await con.fetchrow(
-                "SELECT * FROM ticketchannels WHERE messageid = $1", payload.message_id
+            exists = await con.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM customcommands "
+                "WHERE guildid = $1 AND commandname = $2)",
+                interaction.guild_id,
+                name,
             )
-        if ticketlist is not None:
-            supportroleid = ticketlist["roleid"]
-            guild = client.get_guild(payload.guild_id)
-            channel = guild.get_channel(payload.channel_id)
-            _message = channel.get_partial_message(payload.message_id)
-            user = payload.member
-            await _message.remove_reaction(payload.emoji, user)
-            await createticket(user, guild, channel.category, channel, supportroleid)
-    except Exception as error:
-        logging.log(logging.ERROR, f" on_raw_reaction_add: {format_exception(error)}")
+            count = await con.fetchval(
+                "SELECT COUNT(*) FROM customcommands WHERE guildid = $1",
+                interaction.guild_id,
+            )
+            if not exists and count >= 50:
+                await interaction.response.send_message(
+                    "This server has reached the limit of 50 custom commands.",
+                    ephemeral=True,
+                )
+                return
+            if exists:
+                await con.execute(
+                    "UPDATE customcommands SET commandoutput = $3 "
+                    "WHERE guildid = $1 AND commandname = $2",
+                    interaction.guild_id,
+                    name,
+                    response,
+                )
+            else:
+                await con.execute(
+                    "INSERT INTO customcommands (guildid, commandname, commandoutput) "
+                    "VALUES ($1, $2, $3)",
+                    interaction.guild_id,
+                    name,
+                    response,
+                )
+        self._register_custom_command(name)
+        await interaction.response.send_message(
+            f"Saved `{name}`. Placeholders: `{{user}}`, `{{member}}`, "
+            "`{{channel}}`, `{{guild}}`.",
+            ephemeral=True,
+        )
+
+    @custom.command(name="remove", description="Remove a custom response.")
+    @app_commands.default_permissions(manage_guild=True)
+    async def slash_custom_remove(self, interaction: discord.Interaction, name: str):
+        """Remove a guild-specific custom response through slash commands."""
+        name = name.casefold().strip()
+        async with client.database.pool.acquire() as con:
+            status = await con.execute(
+                "DELETE FROM customcommands WHERE guildid = $1 AND commandname = $2",
+                interaction.guild_id,
+                name,
+            )
+            remaining = await con.fetchval(
+                "SELECT COUNT(*) FROM customcommands WHERE commandname = $1", name
+            )
+        if status == "DELETE 0":
+            await interaction.response.send_message(
+                f"There is no custom command named `{name}`.", ephemeral=True
+            )
+            return
+        if remaining == 0:
+            command = self.bot.get_command(name)
+            if command is not None and command.extras.get("aestron_custom_command"):
+                self.bot.remove_command(name)
+                self.__cog_commands__ = tuple(
+                    item for item in self.__cog_commands__ if item is not command
+                )
+        await interaction.response.send_message(f"Removed `{name}`.", ephemeral=True)
 
 
 @client.event
@@ -7521,188 +4604,6 @@ async def on_raw_message_delete(payload):
 
 
 @client.event
-async def on_message_edit(before, _message):
-    if not client.database.connected:
-        logging.log(
-            logging.ERROR,
-            f"Could not process _message {_message.id} because of db problems!",
-        )
-        return
-    try:
-        if client.runtime_state.maintenance_mode:
-            if not checkstaff(_message.author):
-                return
-            logging.log(
-                logging.DEBUG,
-                f" {_message.author} edited {before.content} -> {_message.content} in {_message.channel} .",
-            )
-        if _message.author.bot:
-            return
-
-        origmessage = _message.content
-        if _message.guild:
-            async with client.database.pool.acquire() as con:
-                linklist = await con.fetchrow(
-                    "SELECT * FROM linkchannels WHERE channelid = $1",
-                    _message.channel.id,
-                )
-            if (
-                linklist is not None
-                and not _message.channel.permissions_for(_message.author).manage_guild
-                and not checkstaff(_message.author)
-                and not ismuted(_message, _message.author)
-            ):
-                listofsentence = [origmessage]
-                listofwords = convertwords(listofsentence)
-                for word in listofwords:
-                    serverinvitecheck = re.compile(
-                        r"(?:https?://)?discord(?:app)?\.(?:com/invite|gg)/[a-zA-Z0-9]+/?"
-                    )
-                    if serverinvitecheck.match(word):
-                        try:
-                            await _message.delete()
-                        except Exception:
-                            automodembed_one = discord.Embed(
-                                title="Automod Error",
-                                description="I don't have `manage messages` permission.",
-                            )
-                            messagesent = await _message.channel.send(
-                                embed=automodembed_one
-                            )
-                            await asyncio.sleep(2)
-                            await messagesent.delete()
-                        automodembed = discord.Embed(
-                            title="Automod (Message edit)", description="Server invite"
-                        )
-                        automodembed.add_field(
-                            value=f"Hey {_message.author.mention} server invites are not allowed here.",
-                            name="** **",
-                        )
-                        messagesent = await _message.channel.send(embed=automodembed)
-                        await asyncio.sleep(2)
-                        await messagesent.delete()
-                        return
-                    if not word.startswith("http:") and not word.startswith("https:"):
-                        wordone = "http://" + word
-                        wordtwo = "https://" + word
-                        if validurl(wordone) or validurl(wordtwo):
-                            try:
-                                await _message.delete()
-                            except Exception:
-                                automodembed_one = discord.Embed(
-                                    title="Automod Error",
-                                    description="I don't have `manage messages` permission.",
-                                )
-                                messagesent = await _message.channel.send(
-                                    embed=automodembed_one
-                                )
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
-                            automodembed = discord.Embed(
-                                title="Automod (Message edit)",
-                                description="Website link",
-                            )
-                            automodembed.add_field(
-                                value=f"Hey {_message.author.mention} links are not allowed here.",
-                                name="** **",
-                            )
-                            messagesent = await _message.channel.send(
-                                embed=automodembed
-                            )
-                            await asyncio.sleep(2)
-                            await messagesent.delete()
-                            return
-                    else:
-                        if validurl(word):
-                            try:
-                                await _message.delete()
-                            except Exception:
-                                automodembed_one = discord.Embed(
-                                    title="Automod Error",
-                                    description="I don't have `manage messages` permission.",
-                                )
-                                messagesent = await _message.channel.send(
-                                    embed=automodembed_one
-                                )
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
-                            automodembed = discord.Embed(
-                                title="Automod (Message edit)",
-                                description="Website link",
-                            )
-                            automodembed.add_field(
-                                value=f"Hey {_message.author.mention} links are not allowed here.",
-                                name="** **",
-                            )
-                            messagesent = await _message.channel.send(
-                                embed=automodembed
-                            )
-                            await asyncio.sleep(2)
-                            await messagesent.delete()
-                            return
-        if _message.guild:
-            async with client.database.pool.acquire() as con:
-                profanelist = await con.fetchrow(
-                    "SELECT * FROM profanechannels WHERE channelid = $1",
-                    _message.channel.id,
-                )
-            if (
-                profanelist is not None
-                and not _message.channel.permissions_for(_message.author).manage_guild
-                and not checkstaff(_message.author)
-                and not ismuted(_message, _message.author)
-            ):
-                if await check_profane(origmessage):
-                    try:
-                        await _message.delete()
-                    except Exception:
-                        automodembed_one = discord.Embed(
-                            title="Automod Error",
-                            description="I don't have `manage messages` permission.",
-                        )
-                        messagesent = await _message.channel.send(
-                            embed=automodembed_one
-                        )
-                        await asyncio.sleep(2)
-                        await messagesent.delete()
-                    automodembed = discord.Embed(
-                        title="Automod", description="Profane message edit"
-                    )
-                    automodembed.add_field(
-                        value=f"Hey {_message.author.mention} don't send offensive messages.",
-                        name="** **",
-                    )
-                    messagesent = await _message.channel.send(embed=automodembed)
-                    await asyncio.sleep(2)
-                    await messagesent.delete()
-                elif check_caps(origmessage):
-                    try:
-                        await _message.delete()
-                    except Exception:
-                        automodembed_one = discord.Embed(
-                            title="Automod Error",
-                            description="I don't have `manage messages` permission.",
-                        )
-                        messagesent = await _message.channel.send(
-                            embed=automodembed_one
-                        )
-                        await asyncio.sleep(2)
-                        await messagesent.delete()
-                    automodembed = discord.Embed(
-                        title="Automod", description="Caps message edit"
-                    )
-                    automodembed.add_field(
-                        value=f"Hey {_message.author.mention} don't send full caps messages.",
-                        name="** **",
-                    )
-                    messagesent = await _message.channel.send(embed=automodembed)
-                    await asyncio.sleep(2)
-                    await messagesent.delete()
-    except Exception as error:
-        logging.log(logging.ERROR, f" on_message_edit: {format_exception(error)}")
-
-
-@client.event
 async def on_command(ctx):
     if not LOGGER.isEnabledFor(logging.DEBUG):
         return
@@ -7717,42 +4618,12 @@ async def on_command(ctx):
     )
 
 
-async def restricttimer(timecount, guildid, memberid):
-    await asyncio.sleep(timecount)
-    async with client.database.pool.acquire() as con:
-        await con.execute(
-            "DELETE FROM restrictedUsers WHERE memberid = $1 AND guildid = $2",
-            memberid,
-            guildid,
-        )
-
-
-async def restrict(guild, channel, member):
-    if checkstaff(member):
-        return
-    epochtime = int(time.time()) + 300
-    statement = (
-        """INSERT INTO restrictedUsers (guildid,memberid,epochtime) VALUES($1,$2,$3);"""
-    )
-    async with client.database.pool.acquire() as con:
-        await con.execute(statement, guild.id, member.id, epochtime)
-    embed = discord.Embed(
-        title="Commands Restriction",
-        description=f"This restriction will last till <t:{epochtime}:R> for {member.mention}",
-    )
-    try:
-        await channel.send(embed=embed)
-    except Exception:
-        pass
-    client.create_background_task(
-        restricttimer(300, guild.id, member.id), name="command-restriction-expiry"
-    )
-
-
 @client.event
 async def on_message(_message):
     try:
         if not client.database.connected:
+            return
+        if _message.author.bot:
             return
         if client.runtime_state.maintenance_mode:
             if client.user in _message.mentions:
@@ -7767,15 +4638,6 @@ async def on_message(_message):
                 f" {_message.author} sent {_message.content} in {_message.channel} .",
             )
         ctx = await client.get_context(_message)
-        if _message.author == client.user:
-            return
-        async with client.database.pool.acquire() as con:
-            restrictlist = await con.fetchrow(
-                "SELECT * FROM restrictedUsers WHERE memberid = $1", ctx.author.id
-            )
-        if restrictlist is not None and ctx.valid:
-            return
-
         if ctx.valid:
             logging.log(
                 logging.DEBUG,
@@ -7784,10 +4646,12 @@ async def on_message(_message):
             bucket = client.rate_limits.command_spam.get_bucket(_message)
             retry_after = bucket.update_rate_limit()
             if retry_after:
-                await restrict(ctx.guild, ctx.channel, ctx.author)
-        if _message.author.bot:
-            return
-        origmessage = _message.content
+                await ctx.send(
+                    f"You're sending commands too quickly. Try again in "
+                    f"{max(1, int(retry_after))} second(s).",
+                    delete_after=8,
+                )
+                return
         if _message.guild:
             if ctx.valid:
                 currcommand = ctx.command.name
@@ -7826,27 +4690,21 @@ async def on_message(_message):
                     return
                 await client.process_commands(_message)
                 return
-            async with client.database.pool.acquire() as con:
-                warninglist = await con.fetchrow(
-                    "SELECT * FROM levelsettings WHERE channelid = $1",
-                    _message.channel.id,
-                )
-            if warninglist is None:
-                statement = (
-                    """INSERT INTO levelsettings (channelid,setting) VALUES($1,$2);"""
-                )
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, _message.channel.id, False)
-
+            if client.get_cog("Leveling") is not None:
+                warninglist = {"setting": False}
+            else:
                 async with client.database.pool.acquire() as con:
                     warninglist = await con.fetchrow(
                         "SELECT * FROM levelsettings WHERE channelid = $1",
                         _message.channel.id,
                     )
-                # await ctx.send(
-                #    f"Alert: leveling was automatically disabled in this channel, do {_message.guild.me.mention}leveltoggle to turn on leveling!",
-                #    delete_after=5,
-                # )
+                if warninglist is None:
+                    statement = (
+                        "INSERT INTO levelsettings (channelid,setting) VALUES($1,$2);"
+                    )
+                    async with client.database.pool.acquire() as con:
+                        await con.execute(statement, _message.channel.id, False)
+                    warninglist = {"setting": False}
             if warninglist["setting"]:
                 async with client.database.pool.acquire() as con:
                     levelconfiglist = await con.fetchrow(
@@ -7892,145 +4750,6 @@ async def on_message(_message):
                         await con.execute(
                             statement, _message.guild.id, _message.author.id, 1
                         )
-        if _message.guild:
-            async with client.database.pool.acquire() as con:
-                linklist = await con.fetchrow(
-                    "SELECT * FROM linkchannels WHERE channelid = $1",
-                    _message.channel.id,
-                )
-            if (
-                linklist is not None
-                and not ctx.channel.permissions_for(_message.author).manage_guild
-                and not checkstaff(ctx.author)
-                and not ismuted(ctx, ctx.author)
-            ):
-                listofsentence = [origmessage]
-                listofwords = convertwords(listofsentence)
-                for word in listofwords:
-                    serverinvitecheck = re.compile(
-                        r"(?:https?://)?discord(?:app)?\.(?:com/invite|gg)/[a-zA-Z0-9]+/?"
-                    )
-                    try:
-                        tenorgifcheck = re.compile(
-                            "((http://)|(https://))((tenor.com/)|(c.tenor.com/))"
-                        )
-                        if tenorgifcheck.match(word):
-                            continue
-                    except Exception:
-                        pass
-                    if serverinvitecheck.match(word):
-                        try:
-                            await _message.delete()
-                        except Exception:
-                            automodembed_one = discord.Embed(
-                                title="Automod Error",
-                                description="I don't have `manage messages` permission.",
-                            )
-                            messagesent = await ctx.send(embed=automodembed_one)
-                            await asyncio.sleep(2)
-                            await messagesent.delete()
-                        # TODO replace mute -> timeout
-                        cmd = client.get_command("mute")
-                        try:
-                            noninvite = await client.fetch_invite(word)
-                            guildmsg = "DM channel"
-                            if noninvite.guild is not None:
-                                guildmsg = noninvite.guild.name
-                            await cmd(
-                                await client.get_context(_message),
-                                _message.author,
-                                duration="5m",
-                                reason=f"{guildmsg}'s server invite posted",
-                            )
-                        except Exception as ex:
-                            logging.log(
-                                logging.ERROR, f"Exception in mute automod {ex}"
-                            )
-                            automodembed = discord.Embed(
-                                title="Automod Error", description="Server invite"
-                            )
-                            automodembed.add_field(
-                                value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
-                                name="** **",
-                            )
-                            messagesent = await ctx.send(embed=automodembed)
-                            await asyncio.sleep(2)
-                            await messagesent.delete()
-                        return
-                    if not word.startswith("http:") and not word.startswith("https:"):
-                        wordone = "http://" + word
-                        wordtwo = "https://" + word
-                        if validurl(wordone) or validurl(wordtwo):
-                            try:
-                                await _message.delete()
-                            except Exception:
-                                automodembed_one = discord.Embed(
-                                    title="Automod Error",
-                                    description="I don't have `manage messages` permission.",
-                                )
-                                messagesent = await ctx.send(embed=automodembed_one)
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
-                            # TODO replace mute -> timeout
-                            cmd = client.get_command("mute")
-                            try:
-                                await cmd(
-                                    await client.get_context(_message),
-                                    _message.author,
-                                    duration="5m",
-                                    reason=f"links posted in {_message.channel.mention}",
-                                )
-                            except Exception as ex:
-                                logging.log(
-                                    logging.ERROR, f"Exception in mute automod {ex}"
-                                )
-                                automodembed = discord.Embed(
-                                    title="Automod Error", description="Website link"
-                                )
-                                automodembed.add_field(
-                                    value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
-                                    name="** **",
-                                )
-                                messagesent = await ctx.send(embed=automodembed)
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
-                            return
-                    else:
-                        if validurl(word):
-                            try:
-                                await _message.delete()
-                            except Exception:
-                                automodembed_one = discord.Embed(
-                                    title="Automod Error",
-                                    description="I don't have `manage messages` permission.",
-                                )
-                                messagesent = await ctx.send(embed=automodembed_one)
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
-                            # TODO replace mute -> timeout
-                            cmd = client.get_command("mute")
-                            try:
-                                await cmd(
-                                    await client.get_context(_message),
-                                    _message.author,
-                                    duration="5m",
-                                    reason=f"links posted in {_message.channel.mention}",
-                                )
-                            except Exception as ex:
-                                logging.log(
-                                    logging.ERROR, f"Exception in mute automod {ex}"
-                                )
-                                automodembed = discord.Embed(
-                                    title="Automod Error", description="Website link"
-                                )
-                                automodembed.add_field(
-                                    value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
-                                    name="** **",
-                                )
-                                messagesent = await ctx.send(embed=automodembed)
-                                await asyncio.sleep(2)
-                                await messagesent.delete()
-                            return
         if client.user in _message.mentions and not ctx.valid:
             if _message.guild:
                 async with client.database.pool.acquire() as con:
@@ -8061,1578 +4780,9 @@ async def on_message(_message):
                     )
             else:
                 await _message.reply("My default dm prefix is `a!`.")
-        bucket = client.rate_limits.message_spam.get_bucket(_message)
-        retry_after = bucket.update_rate_limit()
-        if retry_after and _message.guild:
-            async with client.database.pool.acquire() as con:
-                spamlist = await con.fetchrow(
-                    "SELECT * FROM spamchannels WHERE channelid = $1",
-                    _message.channel.id,
-                )
-            if (
-                spamlist is not None
-                and not ctx.channel.permissions_for(_message.author).manage_guild
-                and not checkstaff(ctx.author)
-                and not ismuted(ctx, ctx.author)
-            ):
-                try:
-                    await _message.delete()
-                except Exception:
-                    automodembed_one = discord.Embed(
-                        title="Automod Error",
-                        description="I don't have `manage messages` permission.",
-                    )
-                    messagesent = await ctx.send(embed=automodembed_one)
-                    await asyncio.sleep(2)
-                    await messagesent.delete()
-                # TODO replace mute -> timeout
-                cmd = client.get_command("mute")
-                try:
-                    await cmd(
-                        await client.get_context(_message),
-                        _message.author,
-                        duration="5m",
-                        reason=f"spamming in {_message.channel.mention}",
-                    )
-                except Exception as ex:
-                    logging.log(logging.ERROR, f"Exception in mute automod {ex}")
-                    automodembed = discord.Embed(
-                        title="Automod", description="Message spam"
-                    )
-                    automodembed.add_field(
-                        value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
-                        name="** **",
-                    )
-                    messagesent = await ctx.send(embed=automodembed)
-                    await asyncio.sleep(2)
-                    await messagesent.delete()
-        if _message.guild:
-            async with client.database.pool.acquire() as con:
-                profanelist = await con.fetchrow(
-                    "SELECT * FROM profanechannels WHERE channelid = $1",
-                    _message.channel.id,
-                )
-            if (
-                profanelist is not None
-                and not ctx.channel.permissions_for(_message.author).manage_guild
-                and not checkstaff(ctx.author)
-                and not ismuted(ctx, ctx.author)
-            ):
-                if await check_profane(origmessage):
-                    warnbucket = client.rate_limits.warning_repeat.get_bucket(_message)
-                    warnretry_after = warnbucket.update_rate_limit()
-                    if not warnretry_after:
-                        try:
-                            await _message.delete()
-                        except Exception:
-                            pass
-                        await ctx.send(
-                            f"{_message.author.mention} You are being warned as a rare offender, further continuation will result in a mute."
-                        )
-                        return
-                    try:
-                        await _message.delete()
-                    except Exception:
-                        automodembed_one = discord.Embed(
-                            title="Automod Error",
-                            description="I don't have `manage messages` permission.",
-                        )
-                        messagesent = await ctx.send(embed=automodembed_one)
-                        await asyncio.sleep(2)
-                        await messagesent.delete()
-                    # TODO replace mute -> timeout
-                    cmd = client.get_command("mute")
-                    try:
-                        await cmd(
-                            await client.get_context(_message),
-                            _message.author,
-                            duration="5m",
-                            reason=f"profane messages sent in {_message.channel.mention}",
-                        )
-                    except Exception as ex:
-                        logging.log(logging.ERROR, f"Exception in mute automod {ex}")
-                        automodembed = discord.Embed(
-                            title="Automod", description="Profane message"
-                        )
-                        automodembed.add_field(
-                            value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
-                            name="** **",
-                        )
-                        messagesent = await ctx.send(embed=automodembed)
-                        await asyncio.sleep(2)
-                        await messagesent.delete()
-                    return
-                elif check_caps(origmessage) and len(origmessage) >= 4:
-                    warnbucket = client.rate_limits.warning_repeat.get_bucket(_message)
-                    warnretry_after = warnbucket.update_rate_limit()
-                    if not warnretry_after:
-                        try:
-                            await _message.delete()
-                        except Exception:
-                            pass
-                        await ctx.send(
-                            f"{_message.author.mention} You are being warned as a rare offender , further continuation will result in a mute."
-                        )
-                        return
-                    try:
-                        await _message.delete()
-                    except Exception:
-                        automodembed_one = discord.Embed(
-                            title="Automod Error",
-                            description="I don't have `manage messages` permission.",
-                        )
-                        messagesent = await ctx.send(embed=automodembed_one)
-                        await asyncio.sleep(2)
-                        await messagesent.delete()
-                    # TODO replace mute -> timeout
-                    cmd = client.get_command("mute")
-                    try:
-                        await cmd(
-                            await client.get_context(_message),
-                            _message.author,
-                            duration="5m",
-                            reason=f"full caps messages sent in {_message.channel.mention}",
-                        )
-                    except Exception as ex:
-                        logging.log(logging.ERROR, f"Exception in mute automod {ex}")
-                        automodembed = discord.Embed(
-                            title="Automod Error", description="Caps message"
-                        )
-                        automodembed.add_field(
-                            value=f"I couldn't mute {_message.author.mention} , I don't have `manage roles` permission.",
-                            name="** **",
-                        )
-                        messagesent = await ctx.send(embed=automodembed)
-                        await asyncio.sleep(2)
-                        await messagesent.delete()
-                    return
         await client.process_commands(_message)
     except Exception as error:
         logging.log(logging.ERROR, f" on_message: {format_exception(error)}")
-
-
-@client.event
-async def on_guild_channel_create(channel):
-    logguild = channel.guild
-    logchannel = None
-    antiraidchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    async with client.database.pool.acquire() as con:
-        antiraidchannellist = await con.fetchrow(
-            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-        if logchannel:
-            checklog = logchannel.permissions_for(logguild.me).view_audit_log
-            if not checklog:
-                raise commands.BotMissingPermissions(["view_audit_log"])
-            async for entry in logguild.audit_logs(
-                limit=1, action=discord.AuditLogAction.channel_create
-            ):
-                mod = logguild.get_member(entry.user.id)
-            try:
-                embed = discord.Embed(
-                    title="Channel creation",
-                    description=channel.mention,
-                    color=Color.green(),
-                )
-                embed.add_field(name="Category", value=channel.category)
-                embed.add_field(name="Moderator", value=f"{mod.mention}")
-                await logchannel.send(embed=embed)
-            except Exception as ex:
-                logging.log(
-                    logging.ERROR, f" on_guild_channel_create: {format_exception(ex)}"
-                )
-    if antiraidchannellist:
-        channelid = antiraidchannellist["channelid"]
-        antiraidchannel = logguild.get_channel(channelid)
-        if mod is None:
-            checklog = antiraidchannel.permissions_for(logguild.me).view_audit_log
-            if not checklog:
-                raise commands.BotMissingPermissions(["view_audit_log"])
-            async for entry in logguild.audit_logs(
-                limit=1, action=discord.AuditLogAction.channel_create
-            ):
-                mod = logguild.get_member(entry.user.id)
-        if not mod.bot:
-            _message = constructmsg(logguild, mod)
-            ctx = constructctx(logguild, mod, antiraidchannel)
-            ctx.bot = client
-            bucket = client.rate_limits.channel_create.get_bucket(_message)
-            retry_after = bucket.update_rate_limit()
-            if retry_after:
-                # TODO replace mute -> timeout
-                statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, logguild.id)
-                await removeguildcaution(logguild.id)
-                return
-
-
-@client.event
-async def on_guild_channel_delete(channel):
-    logguild = channel.guild
-    logchannel = None
-    antiraidchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    async with client.database.pool.acquire() as con:
-        antiraidchannellist = await con.fetchrow(
-            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-        if logchannel:
-            checklog = logchannel.permissions_for(logguild.me).view_audit_log
-            if not checklog:
-                raise commands.BotMissingPermissions(["view_audit_log"])
-            async for entry in logguild.audit_logs(
-                limit=1, action=discord.AuditLogAction.channel_delete
-            ):
-                mod = logguild.get_member(entry.user.id)
-            try:
-                embed = discord.Embed(
-                    title="Channel deletion",
-                    description=channel.mention,
-                    color=Color.green(),
-                )
-                embed.add_field(name="Category", value=channel.category)
-                embed.add_field(name="Moderator", value=f"{mod.mention}")
-                await logchannel.send(embed=embed)
-            except Exception as ex:
-                logging.log(
-                    logging.ERROR, f" on_guild_channel_delete: {format_exception(ex)}"
-                )
-    if antiraidchannellist:
-        channelid = antiraidchannellist["channelid"]
-        antiraidchannel = logguild.get_channel(channelid)
-        if mod is None:
-            checklog = antiraidchannel.permissions_for(logguild.me).view_audit_log
-            if not checklog:
-                raise commands.BotMissingPermissions(["view_audit_log"])
-            async for entry in logguild.audit_logs(
-                limit=1, action=discord.AuditLogAction.channel_delete
-            ):
-                mod = logguild.get_member(entry.user.id)
-        if not mod.bot:
-            _message = constructmsg(logguild, mod)
-            ctx = constructctx(logguild, mod, antiraidchannel)
-            ctx.bot = client
-            bucket = client.rate_limits.channel_delete.get_bucket(_message)
-            retry_after = bucket.update_rate_limit()
-            if retry_after:
-                # TODO replace mute -> timeout
-                statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, logguild.id)
-                await removeguildcaution(logguild.id)
-                return
-
-
-@client.event
-async def on_guild_channel_update(before, after):
-    logguild = before.guild
-    logchannel = None
-    antiraidchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    async with client.database.pool.acquire() as con:
-        antiraidchannellist = await con.fetchrow(
-            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    if antiraidchannellist:
-        channelid = antiraidchannellist["channelid"]
-        antiraidchannel = logguild.get_channel(channelid)
-    if not antiraidchannel:
-        return
-
-    checklog = antiraidchannel.permissions_for(logguild.me).view_audit_log
-    if not checklog:
-        raise commands.BotMissingPermissions(["view_audit_log"])
-    dirs = [a for a in dir(before) if not a.startswith("__")]
-    changedetected = False
-    for a in dirs:
-        try:
-            attrbefore = getattr(before, a)
-            attrafter = getattr(after, a)
-            if not hasattr(attrbefore, a):
-                continue
-        except Exception:
-            continue
-        if attrbefore != attrafter:
-            changedetected = True
-    if not changedetected:
-        return
-    currententry = None
-    ut = []
-    async for entry in logguild.audit_logs(
-        limit=1, action=discord.AuditLogAction.channel_update
-    ):
-        ut.append(entry)
-    async for entry in logguild.audit_logs(
-        limit=1, action=discord.AuditLogAction.overwrite_create
-    ):
-        ut.append(entry)
-    async for entry in logguild.audit_logs(
-        limit=1, action=discord.AuditLogAction.overwrite_update
-    ):
-        ut.append(entry)
-    async for entry in logguild.audit_logs(
-        limit=1, action=discord.AuditLogAction.overwrite_delete
-    ):
-        ut.append(entry)
-    ut.sort(key=lambda x: x.created_at, reverse=True)
-    currententry = ut[0]
-    modid = currententry.user.id
-    mod = None
-    if modid != client.user.id:
-        mod = logguild.get_member(modid)
-        _message = constructmsg(logguild, mod)
-        ctx = constructctx(logguild, mod, antiraidchannel)
-        ctx.bot = client
-        bucket = client.rate_limits.channel_update.get_bucket(_message)
-        retry_after = bucket.update_rate_limit()
-        if retry_after:
-            # TODO replace mute -> timeout
-            cmd = client.get_command("blacklist")
-            try:
-                await cmd(
-                    ctx,
-                    str(mod),
-                    reason=("""AUTO-MOD for exceeding channel update limit."""),
-                )
-            except Exception as ex:
-                logging.log(logging.ERROR, f"on_guild_channel_update error {ex}")
-            statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, logguild.id)
-            await removeguildcaution(logguild.id)
-            return
-    try:
-        changes = ""
-        if before.category != after.category:
-            changes = (
-                changes
-                + f"The category changed from {before.category} to {after.category}.\n"
-            )
-        if before.name != after.name:
-            changes = (
-                changes + f"The name changed from {before.name} to {after.name}.\n"
-            )
-        if before.overwrites != after.overwrites:
-            before_perms = before.overwrites
-            after_perms = after.overwrites
-            for role in logguild.roles:
-                try:
-                    role_bef = before_perms[role]
-                    role_aft = after_perms[role]
-                except Exception:
-                    continue
-                perm_one = []
-                perm_one.append(role_bef.add_reactions)
-                # if (myPerms.administrator ):
-                # _message=("Does user have administrator privilleges **:**")
-                perm_one.append(role_bef.administrator)
-                # if (myPerms.attach_files ):
-                # _message=("Can user send file attachments in messages **:**")
-                perm_one.append(role_bef.attach_files)
-                # if (myPerms.ban_members ):
-                # _message=("Can user ban other members from the guild **:**")
-                perm_one.append(role_bef.ban_members)
-                # if (myPerms.change_nickname ):
-                # _message=("Can user change their nicknames in the guild **:**")
-                perm_one.append(role_bef.change_nickname)
-                # if (myPerms.connect ):
-                # _message=("Can user connect to any voice channels **:**")
-                perm_one.append(role_bef.connect)
-                # if (myPerms.create_instant_invite ):
-                # _message=("Can user invite other members by generating an invite link **:**")
-                perm_one.append(role_bef.create_instant_invite)
-                # if (myPerms.deafen_members ):
-                # _message=("Can user server deafen other members in a voice channel **:**")
-                perm_one.append(role_bef.deafen_members)
-                # if (myPerms.embed_links ):
-                # _message=("Can user send embedded content in a channel **:**")
-                perm_one.append(role_bef.embed_links)
-                # if (myPerms.external_emojis ):
-                # _message=("Can user send emojis created in other guilds **:**")
-                perm_one.append(role_bef.external_emojis)
-                # if (myPerms.kick_members ):
-                # _message=("Can user kick other members from the guild **:**")
-                perm_one.append(role_bef.kick_members)
-                # if (myPerms.manage_channels ):
-                # _message=("Can user edit , create or delete any channels **:**")
-                perm_one.append(role_bef.manage_channels)
-                # if (myPerms.manage_emojis ):
-                # _message=("Can user edit , create or delete any emojis **:**")
-                perm_one.append(role_bef.manage_emojis)
-                # if (myPerms.manage_guild ):
-                # _message=("Can user edit guild settings and invite bots **:**")
-                perm_one.append(role_bef.manage_guild)
-                # if (myPerms.manage_messages ):
-                # _message=("Can user delete messages sent by other members in a channel **:**")
-                perm_one.append(role_bef.manage_messages)
-                # if (myPerms.manage_nicknames):
-                # _message=("Can user change other member's nicknames **:**")
-                perm_one.append(role_bef.manage_nicknames)
-                # if (myPerms.manage_permissions ):
-                # _message=("Can user edit , create or delete role's permissions below their highest role **:**")
-                perm_one.append(role_bef.manage_permissions)
-                # if (myPerms.manage_roles ):
-                # _message=("Can user edit , create or delete roles below their highest role **:**")
-                perm_one.append(role_bef.manage_roles)
-                # if (myPerms.manage_webhooks ):
-                # _message=("Can user  edit , create or delete webhooks of a channel **:**")
-                perm_one.append(role_bef.manage_webhooks)
-                # if (myPerms.mention_everyone ):
-                # _message=("Can user mention everyone in a channel **:**")
-                perm_one.append(role_bef.mention_everyone)
-                # if (myPerms.move_members ):
-                # _message=("Can user move other members to other voice channels **:**")
-                perm_one.append(role_bef.move_members)
-                # if (myPerms.mute_members ):
-                # _message=("Can user can server mute other members in a voice channel **:**")
-                perm_one.append(role_bef.mute_members)
-                # if (myPerms.priority_speaker ):
-                # _message=("Will user be given priority when speaking in a voice channel **:**")
-                perm_one.append(role_bef.priority_speaker)
-                # if (myPerms.read_message_history ):
-                # _message=("Can user read messages channel's previous messages **:**")
-                perm_one.append(role_bef.read_message_history)
-                # if (myPerms.read_messages ):
-                # _message=("Can user read messages from all or any channel **:**")
-                perm_one.append(role_bef.read_messages)
-                # if (myPerms.request_to_speak ):
-                # _message=("Can user request to speak in a stage channel **:**")
-                perm_one.append(role_bef.request_to_speak)
-                # if (myPerms.send_messages ):
-                # _message=("Can user can send messages from all or specific text channels **:**")
-                perm_one.append(role_bef.add_reactions)
-                # if (myPerms.send_tts_messages ):
-                # _message=("Can user can send messages TTS(which get converted to speech) from all or specific text channels **:**")
-                perm_one.append(role_bef.add_reactions)
-                # if (myPerms.speak ):
-                # _message=("Can user can unmute and speak in a voice channel **:**")
-                perm_one.append(role_bef.speak)
-                # if (myPerms.stream ):
-                # _message=("Can user can share their computer screen in a voice channel **:**")
-                perm_one.append(role_bef.stream)
-                # if (myPerms.use_external_emojis ):
-                # _message=("Can user send emojis created in other guilds **:**")
-                perm_one.append(role_bef.use_external_emojis)
-                # if (myPerms.use_slash_command ):
-                # _message=("Can user use slash commands in a channel **:**")
-                perm_one.append(role_bef.use_slash_command)
-                # if (myPerms.use_voice_activation ):
-                # _message=("Can user use voice activation in a voice channel **:**")
-                perm_one.append(role_bef.use_voice_activation)
-                # if (myPerms.view_audit_log ):
-                # _message=("Can user view guild's audit log **:**")
-                perm_one.append(role_bef.view_audit_log)
-                # if (myPerms.view_channel ):
-                # _message=("Can user view all or specific channels **:**")
-                perm_one.append(role_bef.view_channel)
-                # if (myPerms.view_guild_insights ):
-                # _message=("Can user view the guild insights **:**")
-                perm_one.append(role_bef.view_guild_insights)
-                perm_two = []
-                message_list = []
-                message_list.append(" Add reactions to messages **:**".capitalize())
-                perm_two.append(role_aft.add_reactions)
-                # if (myPerms.administrator ):
-                message_list.append(" Administrator privilleges **:**".capitalize())
-                perm_two.append(role_aft.administrator)
-                # if (myPerms.attach_files ):
-                message_list.append(
-                    " Send file attachments in messages **:**".capitalize()
-                )
-                perm_two.append(role_aft.attach_files)
-                # if (myPerms.ban_members ):
-                message_list.append(
-                    " Ban other members from the guild **:**".capitalize()
-                )
-                perm_two.append(role_aft.ban_members)
-                # if (myPerms.change_nickname ):
-                message_list.append(
-                    " Change their nicknames in the guild **:**".capitalize()
-                )
-                perm_two.append(role_aft.change_nickname)
-                # if (myPerms.connect ):
-                message_list.append(" Connect to any voice channels **:**".capitalize())
-                perm_two.append(role_aft.connect)
-                # if (myPerms.create_instant_invite ):
-                message_list.append(
-                    " Invite other members by generating an invite link **:**".capitalize()
-                )
-                perm_two.append(role_aft.create_instant_invite)
-                # if (myPerms.deafen_members ):
-                message_list.append(
-                    " Server deafen other members in a voice channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.deafen_members)
-                # if (myPerms.embed_links ):
-                message_list.append(
-                    " Send embedded content in a channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.embed_links)
-                # if (myPerms.external_emojis ):
-                message_list.append(
-                    " Send emojis created in other guilds **:**".capitalize()
-                )
-                perm_two.append(role_aft.external_emojis)
-                # if (myPerms.kick_members ):
-                message_list.append(
-                    " Kick other members from the guild **:**".capitalize()
-                )
-                perm_two.append(role_aft.kick_members)
-                # if (myPerms.manage_channels ):
-                message_list.append(
-                    " Edit , create or delete any channels **:**".capitalize()
-                )
-                perm_two.append(role_aft.manage_channels)
-                # if (myPerms.manage_emojis ):
-                message_list.append(
-                    " Edit , create or delete any emojis **:**".capitalize()
-                )
-                perm_two.append(role_aft.manage_emojis)
-                # if (myPerms.manage_guild ):
-                message_list.append(
-                    " Edit guild settings and invite bots **:**".capitalize()
-                )
-                perm_two.append(role_aft.manage_guild)
-                # if (myPerms.manage_messages ):
-                message_list.append(
-                    " Delete messages sent by other members in a channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.manage_messages)
-                # if (myPerms.manage_nicknames):
-                message_list.append(
-                    " Change other member's nicknames **:**".capitalize()
-                )
-                perm_two.append(role_aft.manage_nicknames)
-                # if (myPerms.manage_permissions ):
-                message_list.append(
-                    " Edit , create or delete role's permissions below their highest role **:**".capitalize()
-                )
-                perm_two.append(role_aft.manage_permissions)
-                # if (myPerms.manage_roles ):
-                message_list.append(
-                    " Edit , create or delete roles below their highest role **:**".capitalize()
-                )
-                perm_two.append(role_aft.manage_roles)
-                # if (myPerms.manage_webhooks ):
-                message_list.append(
-                    "  Edit , create or delete webhooks of a channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.manage_webhooks)
-                # if (myPerms.mention_everyone ):
-                message_list.append(" Mention everyone in a channel **:**".capitalize())
-                perm_two.append(role_aft.mention_everyone)
-                # if (myPerms.move_members ):
-                message_list.append(
-                    " Move other members to other voice channels **:**".capitalize()
-                )
-                perm_two.append(role_aft.move_members)
-                # if (myPerms.mute_members ):
-                message_list.append(
-                    " Mute other members in a voice channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.mute_members)
-                # if (myPerms.priority_speaker ):
-                message_list.append(
-                    " Given priority in a voice channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.priority_speaker)
-                # if (myPerms.read_message_history ):
-                message_list.append(
-                    " Read messages channel's previous messages **:**".capitalize()
-                )
-                perm_two.append(role_aft.read_message_history)
-                # if (myPerms.read_messages ):
-                message_list.append(
-                    " Read messages from all or any channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.read_messages)
-                # if (myPerms.request_to_speak ):
-                message_list.append(
-                    " Request to speak in a stage channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.request_to_speak)
-                # if (myPerms.send_messages ):
-                message_list.append(
-                    " Can send messages from all or specific text channels **:**".capitalize()
-                )
-                perm_two.append(role_aft.add_reactions)
-                # if (myPerms.send_tts_messages ):
-                message_list.append(
-                    " Can send messages TTS(which get converted to speech) from all or specific text channels **:**".capitalize()
-                )
-                perm_two.append(role_aft.add_reactions)
-                # if (myPerms.speak ):
-                message_list.append(
-                    " Can unmute and speak in a voice channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.speak)
-                # if (myPerms.stream ):
-                message_list.append(
-                    " Can share their computer screen in a voice channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.stream)
-                # if (myPerms.use_external_emojis ):
-                message_list.append(
-                    " Send emojis created in other guilds **:**".capitalize()
-                )
-                perm_two.append(role_aft.use_external_emojis)
-                # if (myPerms.use_slash_command ):
-                message_list.append(
-                    " Use slash commands in a channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.use_slash_command)
-                # if (myPerms.use_voice_activation ):
-                message_list.append(
-                    " Use voice activation in a voice channel **:**".capitalize()
-                )
-                perm_two.append(role_aft.use_voice_activation)
-                # if (myPerms.view_audit_log ):
-                message_list.append(" View guild's audit log **:**".capitalize())
-                perm_two.append(role_aft.view_audit_log)
-                # if (myPerms.view_channel ):
-                message_list.append(" View all or specific channels **:**".capitalize())
-                perm_two.append(role_aft.view_channel)
-                # if (myPerms.view_guild_insights ):
-                message_list.append(" View the guild insights **:**".capitalize())
-                perm_two.append(role_aft.view_guild_insights)
-                role_changes = ""
-                for i in range(len(perm_one)):
-                    if perm_one[i] != perm_two[i]:
-                        role_changes = (
-                            role_changes
-                            + message_list[i]
-                            + " "
-                            + check_emoji(perm_two[i])
-                            + "\n"
-                        )
-
-                if not role_changes == "":
-                    changes = (
-                        changes
-                        + f" The role {role.mention} permissions has changed **:**\n"
-                    )
-                    changes = changes + role_changes
-        if before.permissions_synced != after.permissions_synced:
-            if after.permissions_synced:
-                changes = (
-                    changes
-                    + "The permissions of the channel are now synced with the channel category.\n"
-                )
-            else:
-                changes = (
-                    changes
-                    + "The permissions of the channel are now not synced with the channel category.\n"
-                )
-        if not changes == "":
-            embed = discord.Embed(
-                title="Channel update", description=before.mention, color=Color.blue()
-            )
-            embed.add_field(name="** **", value=changes)
-            embed.add_field(name="Moderator", value=f"{mod.mention}")
-            await logchannel.send(embed=embed)
-
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_guild_channel_update: {format_exception(ex)}")
-
-
-@client.event
-async def on_guild_update(before, after):
-    logguild = before
-    logchannel = None
-    antiraidchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    async with client.database.pool.acquire() as con:
-        antiraidchannellist = await con.fetchrow(
-            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    if antiraidchannellist:
-        channelid = antiraidchannellist["channelid"]
-        antiraidchannel = logguild.get_channel(channelid)
-    if not antiraidchannel:
-        return
-
-    checklog = antiraidchannel.permissions_for(logguild.me).view_audit_log
-    if not checklog:
-        raise commands.BotMissingPermissions(["view_audit_log"])
-    currententry = None
-    async for entry in logguild.audit_logs(
-        limit=1, action=discord.AuditLogAction.guild_update
-    ):
-        currententry = entry
-    modid = currententry.user.id
-    mod = None
-    if modid != client.user.id:
-        mod = logguild.get_member(modid)
-        _message = constructmsg(logguild, mod)
-        ctx = constructctx(logguild, mod, antiraidchannel)
-        ctx.bot = client
-        bucket = client.rate_limits.guild_update.get_bucket(_message)
-        retry_after = bucket.update_rate_limit()
-        if retry_after:
-            # TODO replace mute -> timeout
-            cmd = client.get_command("blacklist")
-            try:
-                await cmd(
-                    ctx,
-                    str(mod),
-                    reason=("""AUTO-MOD for exceeding guild update limit."""),
-                )
-            except Exception as ex:
-                logging.log(logging.ERROR, f"on_guild_update Blacklist error {ex}")
-            statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, logguild.id)
-            await removeguildcaution(logguild.id)
-            return
-    try:
-        changes = ""
-        if before.name != after.name:
-            changes = (
-                changes + f" The name changed from {before.name} to {after.name}.\n"
-            )
-        if before.icon != after.icon:
-            changes = changes + f" The icon changed to {after.icon.url}.\n"
-        if before.banner != after.banner:
-            changes = changes + f" The banner changed to {after.banner_url}.\n"
-        if before.region != after.region:
-            changes = (
-                changes
-                + f" The region changed from {before.region} to {after.region}.\n"
-            )
-        if before.afk_channel != after.afk_channel:
-            changes = (
-                changes
-                + f" The afk channel changed from {before.afk_channel.mention} to {after.afk_channel.mention}.\n"
-            )
-        if before.afk_timeout != after.afk_timeout:
-            changes = (
-                changes
-                + f" The afk timeout changed from {before.afk_timeout} to {after.afk_timeout}.\n"
-            )
-        if before.mfa_level != after.mfa_level:
-            before_level = ""
-            if before.mfa_level == 0:
-                before_level = "not required"
-            else:
-                before_level = "required"
-            after_level = ""
-            if after.mfa_level == 0:
-                after_level = "not required"
-            else:
-                after_level = "required"
-            changes = (
-                changes
-                + f" The 2fa requirements changed from {before_level} to {after_level}.\n"
-            )
-        if before.verification_level != after.verification_level:
-            changes = (
-                changes
-                + f" The verification level changed from {before.verification_level} to {after.verification_level}.\n"
-            )
-        if not changes == "":
-            embed = discord.Embed(
-                title=("Guild update"), description=before.name, color=Color.blue()
-            )
-            embed.add_field(name="** **", value=changes)
-            embed.add_field(name="Moderator", value=f"{mod.mention}")
-            await logchannel.send(embed=embed)
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_guild_update: {format_exception(ex)}")
-
-
-@client.event
-async def on_guild_role_create(role):
-    logguild = role.guild
-    logchannel = None
-    antiraidchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    async with client.database.pool.acquire() as con:
-        antiraidchannellist = await con.fetchrow(
-            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    if antiraidchannellist:
-        channelid = antiraidchannellist["channelid"]
-        antiraidchannel = logguild.get_channel(channelid)
-    if not antiraidchannel:
-        return
-
-    checklog = antiraidchannel.permissions_for(logguild.me).view_audit_log
-    if not checklog:
-        raise commands.BotMissingPermissions(["view_audit_log"])
-    currententry = None
-    async for entry in logguild.audit_logs(
-        limit=1, action=discord.AuditLogAction.role_create
-    ):
-        currententry = entry
-    modid = currententry.user.id
-    mod = None
-    if modid != client.user.id:
-        mod = logguild.get_member(modid)
-        _message = constructmsg(logguild, mod)
-        ctx = constructctx(logguild, mod, antiraidchannel)
-        ctx.bot = client
-        bucket = client.rate_limits.role_create.get_bucket(_message)
-        retry_after = bucket.update_rate_limit()
-        if retry_after:
-            # TODO replace mute -> timeout
-            cmd = client.get_command("blacklist")
-            try:
-                await cmd(
-                    ctx,
-                    str(mod),
-                    reason=("""AUTO-MOD for exceeding role create limit."""),
-                )
-            except Exception as ex:
-                logging.log(logging.ERROR, f"on_guild_role_create Blacklist error {ex}")
-            statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, logguild.id)
-            await removeguildcaution(logguild.id)
-            return
-    try:
-        hoistmsg = "not displayed seperately"
-        if role.hoist:
-            hoistmsg = "displayed seperately"
-        mentionablemsg = "not mentionable"
-        if role.mentionable:
-            mentionablemsg = "mentionable"
-        changes = f"The {role.mention} was created with color {role.color.r},{role.color.g},{role.color.b} and is {hoistmsg} and {mentionablemsg}."
-        embed = discord.Embed(
-            title=("Role creation"), description=role.mention, color=Color.green()
-        )
-        embed.add_field(name="** **", value=changes)
-        embed.add_field(name="Moderator", value=f"{mod.mention}")
-        await logchannel.send(embed=embed)
-
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_guild_role_create: {format_exception(ex)}")
-
-
-@client.event
-async def on_guild_role_delete(role):
-    logguild = role.guild
-    logchannel = None
-    antiraidchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    async with client.database.pool.acquire() as con:
-        antiraidchannellist = await con.fetchrow(
-            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    if antiraidchannellist:
-        channelid = antiraidchannellist["channelid"]
-        antiraidchannel = logguild.get_channel(channelid)
-    if not antiraidchannel:
-        return
-
-    checklog = antiraidchannel.permissions_for(logguild.me).view_audit_log
-    if not checklog:
-        raise commands.BotMissingPermissions(["view_audit_log"])
-    currententry = None
-    async for entry in logguild.audit_logs(
-        limit=1, action=discord.AuditLogAction.role_delete
-    ):
-        currententry = entry
-    modid = currententry.user.id
-    mod = None
-    if modid != client.user.id:
-        mod = logguild.get_member(modid)
-        _message = constructmsg(logguild, mod)
-        ctx = constructctx(logguild, mod, antiraidchannel)
-        ctx.bot = client
-        bucket = client.rate_limits.role_delete.get_bucket(_message)
-        retry_after = bucket.update_rate_limit()
-        if retry_after:
-            # TODO replace mute -> timeout
-            cmd = client.get_command("blacklist")
-            try:
-                await cmd(
-                    ctx,
-                    str(mod),
-                    reason=("""AUTO-MOD for exceeding role delete limit."""),
-                )
-            except Exception as ex:
-                logging.log(
-                    logging.ERROR, f" on_guild_role_delete: {format_exception(ex)}"
-                )
-            statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, logguild.id)
-            await removeguildcaution(logguild.id)
-            return
-    try:
-        embed = discord.Embed(
-            title=("Role deletion"), description=f"{role}", color=Color.red()
-        )
-        embed.add_field(name="Moderator", value=f"{mod.mention}")
-        await logchannel.send(embed=embed)
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_guild_role_delete: {format_exception(ex)}")
-
-
-@client.event
-async def on_guild_role_update(before, after):
-    logguild = before.guild
-    logchannel = None
-    antiraidchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    async with client.database.pool.acquire() as con:
-        antiraidchannellist = await con.fetchrow(
-            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    if antiraidchannellist:
-        channelid = antiraidchannellist["channelid"]
-        antiraidchannel = logguild.get_channel(channelid)
-    if not antiraidchannel:
-        return
-
-    checklog = antiraidchannel.permissions_for(logguild.me).view_audit_log
-    if not checklog:
-        raise commands.BotMissingPermissions(["view_audit_log"])
-    currententry = None
-    async for entry in logguild.audit_logs(
-        limit=1, action=discord.AuditLogAction.role_update
-    ):
-        currententry = entry
-    modid = currententry.user.id
-    mod = None
-    if modid != client.user.id:
-        mod = logguild.get_member(modid)
-        _message = constructmsg(logguild, mod)
-        ctx = constructctx(logguild, mod, antiraidchannel)
-        ctx.bot = client
-        bucket = client.rate_limits.role_update.get_bucket(_message)
-        retry_after = bucket.update_rate_limit()
-        if retry_after:
-            # TODO replace mute -> timeout
-            cmd = client.get_command("blacklist")
-            try:
-                await cmd(
-                    ctx,
-                    str(mod),
-                    reason=("""AUTO-MOD for exceeding role update limit."""),
-                )
-            except Exception as ex:
-                logging.log(logging.ERROR, f"on_guild_role_update Blacklist error {ex}")
-            statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, logguild.id)
-            await removeguildcaution(logguild.id)
-            return
-    try:
-        changes = ""
-        if before.color != after.color:
-            changes = (
-                changes
-                + f" The role color changed from (R,G,B) {before.color.r},{before.color.g},{before.color.b} to {after.color.r},{after.color.g},{after.color.b}.\n"
-            )
-        if before.hoist != after.hoist:
-            hoistmsg = ""
-            hoistmsg = "not displayed seperately"
-            if after.hoist:
-                hoistmsg = "displayed seperately"
-            changes = changes + f" The role will be now {hoistmsg} from other roles.\n"
-        if before.mentionable != after.mentionable:
-            mentionablemsg = "not mentionable"
-            if after.mentionable:
-                mentionablemsg = "mentionable"
-            changes = changes + f" The role will be now {mentionablemsg} by users.\n"
-        if before.permissions != after.permissions:
-            my_perms = before.permissions
-            my_list = []
-            # _message=("Can user add reactions to messages **:**")
-            my_list.append(my_perms.add_reactions)
-            # if (myPerms.administrator ):
-            # _message=("Does user have administrator privilleges **:**")
-            my_list.append(my_perms.administrator)
-            # if (myPerms.attach_files ):
-            # _message=("Can user send file attachments in messages **:**")
-            my_list.append(my_perms.attach_files)
-            # if (myPerms.ban_members ):
-            # _message=("Can user ban other members from the guild **:**")
-            my_list.append(my_perms.ban_members)
-            # if (myPerms.change_nickname ):
-            # _message=("Can user change their nicknames in the guild **:**")
-            my_list.append(my_perms.change_nickname)
-            # if (myPerms.connect ):
-            # _message=("Can user connect to any voice channels **:**")
-            my_list.append(my_perms.connect)
-            # if (myPerms.create_instant_invite ):
-            # _message=("Can user invite other members by generating an invite link **:**")
-            my_list.append(my_perms.create_instant_invite)
-            # if (myPerms.deafen_members ):
-            # _message=("Can user server deafen other members in a voice channel **:**")
-            my_list.append(my_perms.deafen_members)
-            # if (myPerms.embed_links ):
-            # _message=("Can user send embedded content in a channel **:**")
-            my_list.append(my_perms.embed_links)
-            # if (myPerms.external_emojis ):
-            # _message=("Can user send emojis created in other guilds **:**")
-            my_list.append(my_perms.external_emojis)
-            # if (myPerms.kick_members ):
-            # _message=("Can user kick other members from the guild **:**")
-            my_list.append(my_perms.kick_members)
-            # if (myPerms.manage_channels ):
-            # _message=("Can user edit , create or delete any channels **:**")
-            my_list.append(my_perms.manage_channels)
-            # if (myPerms.manage_emojis ):
-            # _message=("Can user edit , create or delete any emojis **:**")
-            my_list.append(my_perms.manage_emojis)
-            # if (myPerms.manage_guild ):
-            # _message=("Can user edit guild settings and invite bots **:**")
-            my_list.append(my_perms.manage_guild)
-            # if (myPerms.manage_messages ):
-            # _message=("Can user delete messages sent by other members in a channel **:**")
-            my_list.append(my_perms.manage_messages)
-            # if (myPerms.manage_nicknames):
-            # _message=("Can user change other member's nicknames **:**")
-            my_list.append(my_perms.manage_nicknames)
-            # if (myPerms.manage_permissions ):
-            # _message=("Can user edit , create or delete role's permissions below their highest role **:**")
-            my_list.append(my_perms.manage_permissions)
-            # if (myPerms.manage_roles ):
-            # _message=("Can user edit , create or delete roles below their highest role **:**")
-            my_list.append(my_perms.manage_roles)
-            # if (myPerms.manage_webhooks ):
-            # _message=("Can user  edit , create or delete webhooks of a channel **:**")
-            my_list.append(my_perms.manage_webhooks)
-            # if (myPerms.mention_everyone ):
-            # _message=("Can user mention everyone in a channel **:**")
-            my_list.append(my_perms.mention_everyone)
-            # if (myPerms.move_members ):
-            # _message=("Can user move other members to other voice channels **:**")
-            my_list.append(my_perms.move_members)
-            # if (myPerms.mute_members ):
-            # _message=("Can user can server mute other members in a voice channel **:**")
-            my_list.append(my_perms.mute_members)
-            # if (myPerms.priority_speaker ):
-            # _message=("Will user be given priority when speaking in a voice channel **:**")
-            my_list.append(my_perms.priority_speaker)
-            # if (myPerms.read_message_history ):
-            # _message=("Can user read messages channel's previous messages **:**")
-            my_list.append(my_perms.read_message_history)
-            # if (myPerms.read_messages ):
-            # _message=("Can user read messages from all or any channel **:**")
-            my_list.append(my_perms.read_messages)
-            # if (myPerms.request_to_speak ):
-            # _message=("Can user request to speak in a stage channel **:**")
-            my_list.append(my_perms.request_to_speak)
-            # if (myPerms.send_messages ):
-            # _message=("Can user can send messages from all or specific text channels **:**")
-            my_list.append(my_perms.add_reactions)
-            # if (myPerms.send_tts_messages ):
-            # _message=("Can user can send messages TTS(which get converted to speech) from all or specific text channels **:**")
-            my_list.append(my_perms.add_reactions)
-            # if (myPerms.speak ):
-            # _message=("Can user can unmute and speak in a voice channel **:**")
-            my_list.append(my_perms.speak)
-            # if (myPerms.stream ):
-            # _message=("Can user can share their computer screen in a voice channel **:**")
-            my_list.append(my_perms.stream)
-            # if (myPerms.use_external_emojis ):
-            # _message=("Can user send emojis created in other guilds **:**")
-            my_list.append(my_perms.use_external_emojis)
-            # if (myPerms.use_slash_command ):
-            # _message=("Can user use slash commands in a channel **:**")
-            my_list.append(my_perms.use_slash_command)
-            # if (myPerms.use_voice_activation ):
-            # _message=("Can user use voice activation in a voice channel **:**")
-            my_list.append(my_perms.use_voice_activation)
-            # if (myPerms.view_audit_log ):
-            # _message=("Can user view guild's audit log **:**")
-            my_list.append(my_perms.view_audit_log)
-            # if (myPerms.view_channel ):
-            # _message=("Can user view all or specific channels **:**")
-            my_list.append(my_perms.view_channel)
-            # if (myPerms.view_guild_insights ):
-            # _message=("Can user view the guild insights **:**")
-            my_list.append(my_perms.view_guild_insights)
-            my_perms = after.permissions
-            my_list1 = []
-            message_list = []
-            message_list.append(" Add reactions to messages **:**".capitalize())
-            my_list1.append(my_perms.add_reactions)
-            # if (myPerms.administrator ):
-            message_list.append(" Administrator privilleges **:**".capitalize())
-            my_list1.append(my_perms.administrator)
-            # if (myPerms.attach_files ):
-            message_list.append(" Send file attachments in messages **:**".capitalize())
-            my_list1.append(my_perms.attach_files)
-            # if (myPerms.ban_members ):
-            message_list.append(" Ban other members from the guild **:**".capitalize())
-            my_list1.append(my_perms.ban_members)
-            # if (myPerms.change_nickname ):
-            message_list.append(
-                " Change their nicknames in the guild **:**".capitalize()
-            )
-            my_list1.append(my_perms.change_nickname)
-            # if (myPerms.connect ):
-            message_list.append(" Connect to any voice channels **:**".capitalize())
-            my_list1.append(my_perms.connect)
-            # if (myPerms.create_instant_invite ):
-            message_list.append(
-                " Invite other members by generating an invite link **:**".capitalize()
-            )
-            my_list1.append(my_perms.create_instant_invite)
-            # if (myPerms.deafen_members ):
-            message_list.append(
-                " Server deafen other members in a voice channel **:**".capitalize()
-            )
-            my_list1.append(my_perms.deafen_members)
-            # if (myPerms.embed_links ):
-            message_list.append(
-                " Send embedded content in a channel **:**".capitalize()
-            )
-            my_list1.append(my_perms.embed_links)
-            # if (myPerms.external_emojis ):
-            message_list.append(
-                " Send emojis created in other guilds **:**".capitalize()
-            )
-            my_list1.append(my_perms.external_emojis)
-            # if (myPerms.kick_members ):
-            message_list.append(" Kick other members from the guild **:**".capitalize())
-            my_list1.append(my_perms.kick_members)
-            # if (myPerms.manage_channels ):
-            message_list.append(
-                " Edit , create or delete any channels **:**".capitalize()
-            )
-            my_list1.append(my_perms.manage_channels)
-            # if (myPerms.manage_emojis ):
-            message_list.append(
-                " Edit , create or delete any emojis **:**".capitalize()
-            )
-            my_list1.append(my_perms.manage_emojis)
-            # if (myPerms.manage_guild ):
-            message_list.append(
-                " Edit guild settings and invite bots **:**".capitalize()
-            )
-            my_list1.append(my_perms.manage_guild)
-            # if (myPerms.manage_messages ):
-            message_list.append(
-                " Delete messages sent by other members in a channel **:**".capitalize()
-            )
-            my_list1.append(my_perms.manage_messages)
-            # if (myPerms.manage_nicknames):
-            message_list.append(" Change other member's nicknames **:**".capitalize())
-            my_list1.append(my_perms.manage_nicknames)
-            # if (myPerms.manage_permissions ):
-            message_list.append(
-                " Edit , create or delete role's permissions below their highest role **:**".capitalize()
-            )
-            my_list1.append(my_perms.manage_permissions)
-            # if (myPerms.manage_roles ):
-            message_list.append(
-                " Edit , create or delete roles below their highest role **:**".capitalize()
-            )
-            my_list1.append(my_perms.manage_roles)
-            # if (myPerms.manage_webhooks ):
-            message_list.append(
-                "  Edit , create or delete webhooks of a channel **:**".capitalize()
-            )
-            my_list1.append(my_perms.manage_webhooks)
-            # if (myPerms.mention_everyone ):
-            message_list.append(" Mention everyone in a channel **:**".capitalize())
-            my_list1.append(my_perms.mention_everyone)
-            # if (myPerms.move_members ):
-            message_list.append(
-                " Move other members to other voice channels **:**".capitalize()
-            )
-            my_list1.append(my_perms.move_members)
-            # if (myPerms.mute_members ):
-            message_list.append(
-                " Mute other members in a voice channel **:**".capitalize()
-            )
-            my_list1.append(my_perms.mute_members)
-            # if (myPerms.priority_speaker ):
-            message_list.append(" Given priority in a voice channel **:**".capitalize())
-            my_list1.append(my_perms.priority_speaker)
-            # if (myPerms.read_message_history ):
-            message_list.append(
-                " Read messages channel's previous messages **:**".capitalize()
-            )
-            my_list1.append(my_perms.read_message_history)
-            # if (myPerms.read_messages ):
-            message_list.append(
-                " Read messages from all or any channel **:**".capitalize()
-            )
-            my_list1.append(my_perms.read_messages)
-            # if (myPerms.request_to_speak ):
-            message_list.append(
-                " Request to speak in a stage channel **:**".capitalize()
-            )
-            my_list1.append(my_perms.request_to_speak)
-            # if (myPerms.send_messages ):
-            message_list.append(
-                " Can send messages from all or specific text channels **:**".capitalize()
-            )
-            my_list1.append(my_perms.add_reactions)
-            # if (myPerms.send_tts_messages ):
-            message_list.append(
-                " Can send messages TTS(which get converted to speech) from all or specific text channels **:**".capitalize()
-            )
-            my_list1.append(my_perms.add_reactions)
-            # if (myPerms.speak ):
-            message_list.append(
-                " Can unmute and speak in a voice channel **:**".capitalize()
-            )
-            my_list1.append(my_perms.speak)
-            # if (myPerms.stream ):
-            message_list.append(
-                " Can share their computer screen in a voice channel **:**".capitalize()
-            )
-            my_list1.append(my_perms.stream)
-            # if (myPerms.use_slash_command ):
-            message_list.append(" Use slash commands in a channel **:**".capitalize())
-            my_list1.append(my_perms.use_slash_command)
-            # if (myPerms.use_voice_activation ):
-            message_list.append(
-                " Use voice activation in a voice channel **:**".capitalize()
-            )
-            my_list1.append(my_perms.use_voice_activation)
-            # if (myPerms.view_audit_log ):
-            message_list.append(" View guild's audit log **:**".capitalize())
-            my_list1.append(my_perms.view_audit_log)
-            # if (myPerms.view_channel ):
-            message_list.append(" View all or specific channels **:**".capitalize())
-            my_list1.append(my_perms.view_channel)
-            # if (myPerms.view_guild_insights ):
-            message_list.append(" View the guild insights **:**".capitalize())
-            my_list1.append(my_perms.view_guild_insights)
-            role_changes = ""
-            for i in range(len(my_list1)):
-                if my_list[i] != my_list1[i]:
-                    role_changes = (
-                        role_changes
-                        + message_list[i]
-                        + " "
-                        + check_emoji(my_list1[i])
-                        + "\n"
-                    )
-            if not role_changes == "":
-                changes = changes + " The role permissions has changed **:**\n"
-                changes = changes + role_changes
-        if before.name != after.name:
-            changes = (
-                changes
-                + f" The role name has changed from {before.name} to {after.name}.\n"
-            )
-        if not changes == "":
-            embed = discord.Embed(
-                title=("Role update"), description=after.mention, color=Color.blue()
-            )
-            embed.add_field(name="** **", value=changes)
-            embed.add_field(name="Moderator", value=f"{mod.mention}")
-            await logchannel.send(embed=embed)
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_guild_role_update: {format_exception(ex)}")
-
-
-@client.event
-async def on_member_ban(guild, member):
-    logguild = guild
-    logchannel = None
-    antiraidchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    async with client.database.pool.acquire() as con:
-        antiraidchannellist = await con.fetchrow(
-            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    if antiraidchannellist:
-        channelid = antiraidchannellist["channelid"]
-        antiraidchannel = logguild.get_channel(channelid)
-    if not antiraidchannel:
-        return
-
-    checklog = antiraidchannel.permissions_for(logguild.me).view_audit_log
-    if not checklog:
-        raise commands.BotMissingPermissions(["view_audit_log"])
-    currententry = None
-    async for entry in logguild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
-        currententry = entry
-    modid = currententry.user.id
-    mod = None
-    if modid != client.user.id:
-        mod = logguild.get_member(modid)
-        _message = constructmsg(logguild, mod)
-        ctx = constructctx(logguild, mod, antiraidchannel)
-        ctx.bot = client
-        bucket = client.rate_limits.member_ban.get_bucket(_message)
-        retry_after = bucket.update_rate_limit()
-        if retry_after:
-            # TODO replace mute -> timeout
-            cmd = client.get_command("blacklist")
-            try:
-                await cmd(
-                    ctx,
-                    str(mod),
-                    reason=("""AUTO-MOD for exceeding member ban limit."""),
-                )
-            except Exception as ex:
-                logging.log(logging.ERROR, f" on_member_ban Blacklist error {ex}")
-            statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, logguild.id)
-            await removeguildcaution(logguild.id)
-            return
-    try:
-        embed = discord.Embed(
-            title=("Member banned"), description=member.mention, color=Color.red()
-        )
-        embed.add_field(
-            name="** **",
-            value=f" The member {member.mention} was banned from {logguild} by {mod.mention}.",
-        )
-        await logchannel.send(embed=embed)
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_member_ban: {format_exception(ex)}")
-
-
-@client.event
-async def on_member_unban(guild, member):
-    logguild = guild
-    logchannel = None
-    antiraidchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    async with client.database.pool.acquire() as con:
-        antiraidchannellist = await con.fetchrow(
-            "SELECT * FROM antiraid WHERE guildid = $1", logguild.id
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    if antiraidchannellist:
-        channelid = antiraidchannellist["channelid"]
-        antiraidchannel = logguild.get_channel(channelid)
-    if not antiraidchannel:
-        return
-
-    checklog = antiraidchannel.permissions_for(logguild.me).view_audit_log
-    currententry = None
-    if not checklog:
-        raise commands.BotMissingPermissions(["view_audit_log"])
-    async for entry in logguild.audit_logs(
-        limit=1, action=discord.AuditLogAction.unban
-    ):
-        currententry = entry
-    modid = currententry.user.id
-    mod = None
-    if modid != client.user.id:
-        mod = logguild.get_member(modid)
-        _message = constructmsg(logguild, mod)
-        ctx = constructctx(logguild, mod, antiraidchannel)
-        ctx.bot = client
-        bucket = client.rate_limits.member_unban.get_bucket(_message)
-        retry_after = bucket.update_rate_limit()
-        if retry_after:
-            # TODO replace mute -> timeout
-            cmd = client.get_command("blacklist")
-            try:
-                await cmd(
-                    ctx,
-                    str(mod),
-                    reason=("""AUTO-MOD for exceeding member unban limit."""),
-                )
-            except Exception as ex:
-                logging.log(logging.ERROR, f" on_member_unban Blacklist error {ex}")
-            statement = """INSERT INTO cautionraid (guildid) VALUES($1);"""
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, logguild.id)
-            await removeguildcaution(logguild.id)
-            return
-    try:
-        embed = discord.Embed(
-            title=("Member unbanned"), description=member.mention, color=Color.green()
-        )
-        embed.add_field(
-            name="** **",
-            value=f" The member {member.mention} was unbanned from {logguild} by {mod.mention}.",
-        )
-        await logchannel.send(embed=embed)
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_member_unban: {format_exception(ex)}")
-
-
-@client.event
-async def on_invite_create(invite):
-    logguild = invite.guild
-    logchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    if logchannellist is not None:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    else:
-        return
-    try:
-        max_usemsg = invite.max_uses
-        if max_usemsg == 0:
-            max_usemsg = "unlimited"
-        max_agemsg = invite.max_age
-        if max_agemsg == 0:
-            max_agemsg = "unlimited"
-        changes = f" The invite was created by {invite.inviter.mention} in {invite.channel.mention} and can be used a maximum of {max_usemsg} times for {max_agemsg} seconds ."
-        embed = discord.Embed(
-            title=("Invite creation"), description=invite.url, color=Color.green()
-        )
-        embed.add_field(name="** **", value=changes)
-        await logchannel.send(embed=embed)
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_invite_create: {format_exception(ex)}")
-
-
-@client.event
-async def on_invite_delete(invite):
-    logguild = invite.guild
-    logchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    if logchannellist is not None:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    else:
-        return
-    try:
-        embed = discord.Embed(
-            title=("Invite deletion"), description=invite.url, color=Color.red()
-        )
-        await logchannel.send(embed=embed)
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_invite_update: {format_exception(ex)}")
-
-
-@client.event
-async def on_voice_state_update(member, before, after):
-    logguild = member.guild
-    logchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    if logchannellist is not None:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    try:
-        changes = ""
-        if before.channel is None:
-            changes = (
-                changes
-                + f" The member {member.mention} connected to the voice channel {after.channel.mention}.\n"
-            )
-        if after.channel is None:
-            changes = (
-                changes
-                + f" The member {member.mention} disconnected from the voice channel {before.channel.mention}.\n"
-            )
-        if before.self_mute != after.self_mute:
-            mic_msg = ""
-            if before.self_mute:
-                mic_msg = f" The member {member.mention} unmuted themselves in the voice channel {before.channel.mention}.\n"
-            else:
-                mic_msg = f" The member {member.mention} muted themselves in the voice channel {before.channel.mention}.\n"
-            changes = changes + mic_msg
-        if before.self_deaf != after.self_deaf:
-            mic_msg = ""
-            if before.self_deaf:
-                mic_msg = f" The member {member.mention} undeafened themselves in the voice channel {before.channel.mention}.\n"
-            else:
-                mic_msg = f" The member {member.mention} deafened themselves in the voice channel {before.channel.mention}.\n"
-            changes = changes + mic_msg
-        if before.mute != after.mute:
-            mic_msg = ""
-            if before.mute:
-                mic_msg = f" The member {member.mention} was unmuted by an admin in the voice channel {before.channel.mention}.\n"
-            else:
-                mic_msg = f" The member {member.mention} was muted by an admin in the voice channel {before.channel.mention}.\n"
-            changes = changes + mic_msg
-        if before.deaf != after.deaf:
-            mic_msg = ""
-            if before.deaf:
-                mic_msg = f" The member {member.mention} was undeafened by an admin in the voice channel {before.channel.mention}.\n"
-            else:
-                mic_msg = f" The member {member.mention} was deafened by an admin in the voice channel {before.channel.mention}.\n"
-            changes = changes + mic_msg
-        if before.self_stream != after.self_stream:
-            mic_msg = ""
-            if before.self_stream:
-                mic_msg = f" The member {member.mention} stopped streaming content in the voice channel {before.channel.mention}.\n"
-            else:
-                mic_msg = f" The member {member.mention} is streaming content in the voice channel {before.channel.mention}.\n"
-            changes = changes + mic_msg
-        if before.self_video != after.self_video:
-            mic_msg = ""
-            if before.self_video:
-                mic_msg = f" The member {member.mention} stopped their video in the voice channel {before.channel.mention}.\n"
-            else:
-                mic_msg = f" The member {member.mention} shared their video in the voice channel {before.channel.mention}.\n"
-            changes = changes + mic_msg
-
-        if not changes == "":
-            if logchannel is not None:
-                embed = discord.Embed(
-                    title=("Voice channel update"),
-                    description=member.mention,
-                    color=Color.blue(),
-                )
-                embed.add_field(name="** **", value=changes)
-                await logchannel.send(embed=embed)
-    except Exception as ex:
-        logging.log(logging.ERROR, f" on_voice_state_update: {format_exception(ex)}")
 
 
 def main():

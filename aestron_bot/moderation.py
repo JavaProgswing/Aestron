@@ -98,6 +98,36 @@ class Moderation(commands.Cog):
                 _message_id(ctx),
             )
 
+    async def _log_action(
+        self,
+        ctx: commands.Context,
+        action: str,
+        target: discord.abc.Snowflake | str,
+        reason: str,
+    ) -> None:
+        """Publish a normalized moderation event without blocking the command."""
+        audit_logging = self.bot.get_cog("AuditLogging")
+        if audit_logging is None or ctx.guild is None:
+            return
+        target_id = getattr(target, "id", None)
+        target_text = (
+            f"{target} (`{target_id}`)" if target_id is not None else str(target)
+        )
+        try:
+            await audit_logging.dispatch(
+                ctx.guild,
+                kind=f"moderation_{action}",
+                title=f"Moderation: {action.replace('_', ' ').title()}",
+                target=target_text,
+                target_id=target_id,
+                actor_override=ctx.author,
+                reason_override=reason,
+                color=discord.Color.orange(),
+            )
+        except Exception:
+            LOGGER.exception("Could not publish moderation log guild=%s", ctx.guild.id)
+
+    @commands.cooldown(2, 10, commands.BucketType.channel)
     @commands.hybrid_command(
         aliases=["lockdown", "restrict", "startlockdown"],
         brief="Prevent a role from sending messages in a channel.",
@@ -128,11 +158,13 @@ class Moderation(commands.Cog):
             send_messages=False,
             reason=_audit_reason(ctx, reason),
         )
+        await self._log_action(ctx, "lock", target, reason)
         await ctx.send(
             f"🔒 {target.mention} is locked for {target_role.mention}. Reason: {reason}",
             ephemeral=True,
         )
 
+    @commands.cooldown(2, 10, commands.BucketType.channel)
     @commands.hybrid_command(
         aliases=["stoplockdown", "unrestrict"],
         brief="Restore inherited send permission in a locked channel.",
@@ -163,11 +195,13 @@ class Moderation(commands.Cog):
             send_messages=None,
             reason=_audit_reason(ctx, reason),
         )
+        await self._log_action(ctx, "unlock", target, reason)
         await ctx.send(
             f"🔓 {target.mention} is unlocked for {target_role.mention}. Reason: {reason}",
             ephemeral=True,
         )
 
+    @commands.cooldown(2, 10, commands.BucketType.channel)
     @commands.hybrid_command(
         aliases=["slowmode"],
         brief="Set this channel's slowmode delay.",
@@ -188,11 +222,14 @@ class Moderation(commands.Cog):
         await ctx.channel.edit(
             slowmode_delay=seconds, reason=_audit_reason(ctx, reason)
         )
+        await self._log_action(ctx, "slowmode", ctx.channel, reason)
         await ctx.send(
             f"Slowmode is now {seconds} second(s) in {ctx.channel.mention}.",
             ephemeral=True,
         )
 
+    @commands.cooldown(1, 5, commands.BucketType.channel)
+    @commands.max_concurrency(1, commands.BucketType.channel, wait=False)
     @commands.hybrid_command(
         brief="Delete a bounded number of recent messages.",
         description=(
@@ -218,6 +255,12 @@ class Moderation(commands.Cog):
             check=check,
             reason=_audit_reason(ctx, reason),
         )
+        await self._log_action(
+            ctx,
+            "purge",
+            member or ctx.channel,
+            f"{reason} ({len(deleted)} messages)",
+        )
         scope = "" if member is None else f" from {member.mention}"
         await ctx.send(
             f"Deleted {len(deleted)} message(s){scope}. Reason: {reason}",
@@ -225,6 +268,8 @@ class Moderation(commands.Cog):
             ephemeral=True,
         )
 
+    @commands.cooldown(1, 5, commands.BucketType.channel)
+    @commands.max_concurrency(1, commands.BucketType.channel, wait=False)
     @commands.hybrid_command(
         brief="Delete recent messages sent by this bot.",
         description="Delete 1-1000 recent messages authored by Aestron.",
@@ -246,12 +291,16 @@ class Moderation(commands.Cog):
             check=lambda message: message.author.id == self.bot.user.id,
             reason=_audit_reason(ctx, reason),
         )
+        await self._log_action(
+            ctx, "self_purge", ctx.channel, f"{reason} ({len(deleted)} messages)"
+        )
         await ctx.send(
             f"Deleted {len(deleted)} bot message(s).",
             delete_after=8,
             ephemeral=True,
         )
 
+    @commands.cooldown(3, 15, commands.BucketType.member)
     @commands.hybrid_command(
         brief="Record a warning for a member.",
         description="Record a warning and notify the member when direct messages allow it.",
@@ -270,6 +319,7 @@ class Moderation(commands.Cog):
         _validate_target(ctx, member)
         case_reason = _audit_reason(ctx, reason)
         await self._record_case(ctx, member, case_reason)
+        await self._log_action(ctx, "warn", member, reason)
         notified = await _try_dm(
             member, f"You were warned in **{ctx.guild.name}**. Reason: {reason}"
         )
@@ -278,6 +328,7 @@ class Moderation(commands.Cog):
             f"⚠️ Warned {member.mention}. Reason: {reason}{suffix}", ephemeral=True
         )
 
+    @commands.cooldown(1, 5, commands.BucketType.member)
     @commands.hybrid_command(
         aliases=["punishments"],
         brief="Show a member's warning history.",
@@ -310,6 +361,7 @@ class Moderation(commands.Cog):
             ephemeral=True,
         )
 
+    @commands.cooldown(1, 10, commands.BucketType.member)
     @commands.hybrid_command(
         aliases=["clearwarns", "delwarnings"],
         brief="Clear a member's warning history.",
@@ -330,11 +382,15 @@ class Moderation(commands.Cog):
         async with self.bot.database.pool.acquire() as connection:
             result = await connection.execute(query, member.id, ctx.guild.id)
         deleted = int(result.rsplit(" ", maxsplit=1)[-1])
+        await self._log_action(
+            ctx, "clear_warnings", member, f"{reason} ({deleted} records)"
+        )
         await ctx.send(
             f"Cleared {deleted} warning(s) for {member.mention}. Reason: {reason}",
             ephemeral=True,
         )
 
+    @commands.cooldown(2, 10, commands.BucketType.member)
     @commands.hybrid_command(
         brief="Ban a member from this server.",
         description="Ban one member and optionally delete up to seven days of messages.",
@@ -363,9 +419,11 @@ class Moderation(commands.Cog):
             reason=audit_reason,
         )
         await self._record_case(ctx, member, f"Ban: {audit_reason}")
+        await self._log_action(ctx, "ban", member, reason)
         suffix = "" if notified else " (DM delivery failed)"
         await ctx.send(f"🔨 Banned {member}{suffix}. Reason: {reason}", ephemeral=True)
 
+    @commands.cooldown(2, 10, commands.BucketType.member)
     @commands.hybrid_command(
         brief="Unban a user by selecting or supplying their account.",
         description="Verify that a user is banned, then remove their guild ban.",
@@ -389,11 +447,13 @@ class Moderation(commands.Cog):
         audit_reason = _audit_reason(ctx, reason)
         await ctx.guild.unban(user, reason=audit_reason)
         await self._record_case(ctx, user, f"Unban: {audit_reason}")
+        await self._log_action(ctx, "unban", user, reason)
         await _try_dm(
             user, f"You were unbanned from **{ctx.guild.name}**. Reason: {reason}"
         )
         await ctx.send(f"Unbanned {user}. Reason: {reason}", ephemeral=True)
 
+    @commands.cooldown(1, 10, commands.BucketType.member)
     @commands.hybrid_command(
         aliases=["bans", "guildbans", "banned", "serverbans"],
         brief="List recent server bans.",
@@ -422,6 +482,7 @@ class Moderation(commands.Cog):
             )
             await ctx.send(embed=embed, ephemeral=True)
 
+    @commands.cooldown(2, 10, commands.BucketType.member)
     @commands.hybrid_command(
         brief="Kick a member from this server.",
         description="Kick one hierarchy-validated member and record the action.",
@@ -445,9 +506,11 @@ class Moderation(commands.Cog):
         )
         await member.kick(reason=audit_reason)
         await self._record_case(ctx, member, f"Kick: {audit_reason}")
+        await self._log_action(ctx, "kick", member, reason)
         suffix = "" if notified else " (DM delivery failed)"
         await ctx.send(f"Kicked {member}{suffix}. Reason: {reason}", ephemeral=True)
 
+    @commands.cooldown(2, 10, commands.BucketType.member)
     @commands.hybrid_command(
         aliases=["mute"],
         brief="Temporarily timeout a member.",
@@ -472,6 +535,7 @@ class Moderation(commands.Cog):
         until = discord.utils.utcnow() + delta
         await member.timeout(until, reason=audit_reason)
         await self._record_case(ctx, member, f"Timeout until {until}: {audit_reason}")
+        await self._log_action(ctx, "timeout", member, f"{duration}: {reason}")
         await _try_dm(
             member,
             f"You were timed out in **{ctx.guild.name}** for {duration}. Reason: {reason}",
@@ -482,6 +546,7 @@ class Moderation(commands.Cog):
             ephemeral=True,
         )
 
+    @commands.cooldown(2, 10, commands.BucketType.member)
     @commands.hybrid_command(
         aliases=["unmute", "removetimeout"],
         brief="Remove a member's active timeout.",
@@ -503,11 +568,13 @@ class Moderation(commands.Cog):
         audit_reason = _audit_reason(ctx, reason)
         await member.timeout(None, reason=audit_reason)
         await self._record_case(ctx, member, f"Timeout removed: {audit_reason}")
+        await self._log_action(ctx, "untimeout", member, reason)
         await ctx.send(
             f"Removed the timeout from {member.mention}. Reason: {reason}",
             ephemeral=True,
         )
 
+    @commands.cooldown(1, 15, commands.BucketType.member)
     @commands.hybrid_command(
         brief="Ban and immediately unban a member to clear recent messages.",
         description="Soft-ban a member and remove up to one day of their recent messages.",
@@ -536,6 +603,7 @@ class Moderation(commands.Cog):
             LOGGER.exception("Soft-ban unban step failed for user %s", member.id)
             raise
         await self._record_case(ctx, member, f"Soft-ban: {audit_reason}")
+        await self._log_action(ctx, "softban", member, reason)
         await ctx.send(f"Soft-banned {member}. Reason: {reason}", ephemeral=True)
 
     @commands.hybrid_command(
