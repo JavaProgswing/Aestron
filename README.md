@@ -6,8 +6,9 @@ The actively maintained runtime features are split into focused modules:
 
 - `aestron_bot/lavalink.py` owns node connection, health, and reconnection.
 - `aestron_bot/music.py` owns searches, queues, playback, controls, and errors.
-- `aestron_bot/fun.py` provides dependency-free interactive games and social
-  commands with invoker-only controls and bounded input.
+- `aestron_bot/fun.py` and `aestron_bot/fun_ui.py` provide image-first
+  interactive games and social commands with replay, scoring, elimination,
+  live voting, invoker-only controls, and bounded input.
 - `aestron_bot/moderation.py` owns validated moderation commands, native
   timeouts, hierarchy checks, and warning records.
 - `aestron_bot/antiraid.py`, `automod.py`, and `audit_logging.py` provide
@@ -28,9 +29,9 @@ The actively maintained runtime features are split into focused modules:
   local variables or secrets.
 - `aestron_bot/statistics.py` batches persistent activity counters without adding
   a database query to every command.
-- `aestron_bot/valorant.py` provides secure account linking, official on-demand
-  match retrieval, and transparent post-match review without pickle caches or
-  unofficial rank APIs.
+- `aestron_bot/valorant.py` and `aestron_bot/valorant_ui.py` provide secure
+  account linking, official on-demand match retrieval, and rendered post-match
+  dashboards without pickle caches or unofficial rank APIs.
 - `aestron_bot/feedback.py` sends `/suggest` and `/reportbug` submissions to one
   website queue, with a configured Discord channel as a fallback.
 - `website/` is the standalone FastAPI product site and versioned API. The main
@@ -110,11 +111,16 @@ when the node has no working audio source.
 - `/suggest <title> <details>` and `/reportbug <feature> <details>` — submit
   validated feedback to the shared website/admin queue.
 - `/valorant link` and `/valorant unlink` — secure opt-in Riot account linking.
-- `/valorant stats [member] [matches]` — interactive overview, history, agent/map
-  context, match selector, coaching prompts, and metric guide.
-- `/valorant history`, `/valorant match`, and `/valorant coach` — recent match cards,
-  round-level match inspection, and evidence-based post-match review. Match
-  history is also available from the selector in `/valorant stats`.
+- `/valorant stats [member] [matches]` — image-first overview, history,
+  agent/map trends, match selector, review prompts, and metric guide.
+- `/valorant history`, `/valorant match`, and `/valorant coach` — rendered
+  dashboards with per-round timelines, personal economy efficiency, opponent
+  duel matrices, official minimap kill/death plots, round selection, player-card
+  banners, agent art, weapon icons, and evidence-based review. Public artwork and
+  map-coordinate transforms are loaded asynchronously from valorant-api.com and
+  cached in memory; Riot match data remains the only statistics source. Aestron
+  does not invent personal MMR/ELO because Riot's supported player-match APIs do
+  not expose it and Riot policy prohibits replacement ranking calculators.
 - `/fun rps` runs a first-to-three match and `/fun trivia` runs a scored
   five-question session. Coin flips, dice, decisions, and eight-ball answers can
   replay in place; would-you-rather uses a public one-vote-per-member poll.
@@ -145,11 +151,12 @@ when the node has no working audio source.
   that resume after a restart. Native Discord polls remain available through the
   prefix poll command.
 - `/minecraft balance|daily|weekly|pay|inventory|shop|pvp|leaderboard|server` —
-  the grouped Minecraft economy and competitive game. Reward cooldowns persist
+  the grouped Minecraft economy and competitive game. Inventory and PvP use
+  rendered boards with cached in-game item sprites. Reward cooldowns persist
   across restarts, transfers and forge purchases are transaction-safe, trade-ins
-  return 60%, and PvP includes strikes, shields, one golden-apple heal, surrender
-  rewards, rankings, and optional local voice effects. Abandoned fights release
-  their temporary voice connection after five minutes.
+  return 60%, and PvP acknowledges every click before rendering, audio, or reward
+  writes. Abandoned fights release their temporary voice connection after five
+  minutes.
 - `/call <member> [reason]`, `/calls privacy|status|hangup`, and `a!hangup` —
   opt-in private calls. Invitations use DM buttons, only DM messages are relayed,
   attachments are bounded, and either participant can stop the relay immediately.
@@ -314,10 +321,12 @@ retrieves recent matches on demand from official Riot endpoints with bounded
 parallelism, short-lived caching, current VAL-CONTENT names, and rate-limit
 handling. Analytics include match score, K/D/A, ACS, ADR, dealt-minus-received
 damage per round, headshot-hit percentage, opening duels, survival, multikill
-rounds, objectives, and utility casts. They use completed-match fields only and
-do not estimate hidden MMR, KAST, economy value, or live tactical advice. The old
-fixed-shard pollers, pickled match objects, static metadata extractors, and
-third-party MMR endpoint are not used.
+rounds, objectives, utility casts, round economy, opponent duels, and spatial
+kill/death events. They use completed-match fields only and do not estimate
+hidden MMR, KAST, or live tactical advice. Visual metadata and artwork come from
+the community-run valorant-api.com service; all VALORANT game assets remain Riot
+Games property. The old fixed-shard pollers, pickled match objects, static
+metadata extractors, and third-party MMR endpoint are not used.
 
 After doing this, run the bot with:
 

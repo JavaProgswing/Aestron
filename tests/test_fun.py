@@ -1,8 +1,9 @@
-import asyncio
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
-
-from aestron_bot.fun import FunGames, RockPaperScissorsView, TriviaView
+from aestron_bot.fun import (
+    FunGames,
+    RockPaperScissorsView,
+    TriviaView,
+    _rating,
+)
 
 
 def test_fun_commands_have_complete_metadata():
@@ -17,19 +18,15 @@ def test_fun_commands_have_complete_metadata():
 
 
 def test_rate_is_repeatable_for_a_user_and_subject():
-    async def run_test():
-        cog = FunGames(SimpleNamespace())
-        ctx = SimpleNamespace(author=SimpleNamespace(id=123), send=AsyncMock())
+    first_subject, first_score = _rating(123, "clean code")
+    second_subject, second_score = _rating(123, "clean   code")
 
-        await FunGames.rate.callback(cog, ctx, subject="clean code")
-        first = ctx.send.await_args.kwargs["embed"]
-        await FunGames.rate.callback(cog, ctx, subject="clean   code")
-        second = ctx.send.await_args.kwargs["embed"]
-
-        assert first.description == second.description
-        assert "/100" in first.description
-
-    asyncio.run(run_test())
+    assert first_subject == second_subject
+    assert first_score == second_score
+    assert (
+        f"{first_score}/100"
+        in FunGames._rating_embed(first_subject, first_score).description
+    )
 
 
 def test_interactive_games_are_invoker_scoped():

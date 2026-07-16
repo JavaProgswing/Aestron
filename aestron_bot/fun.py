@@ -1,19 +1,75 @@
-"""Fast, dependency-free games and social commands."""
+"""Fast, image-first games and social commands with interactive controls."""
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import itertools
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
+from io import BytesIO
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from .fun_ui import render_fun_dashboard
+
 ACCENT = 0xFF4655
+
+
+def _image_embed() -> discord.Embed:
+    """Return the minimal Discord frame used by rendered fun dashboards."""
+    return discord.Embed(color=ACCENT).set_image(url="attachment://fun-dashboard.png")
+
+
+async def _dashboard_file(embed: discord.Embed) -> discord.File:
+    """Render a fun dashboard off the event loop."""
+    image = await asyncio.to_thread(render_fun_dashboard, embed)
+    return discord.File(BytesIO(image), filename="fun-dashboard.png")
+
+
+async def _edit_dashboard(
+    interaction: discord.Interaction,
+    embed: discord.Embed,
+    view: discord.ui.View,
+) -> None:
+    """Acknowledge a component before rendering and replacing its dashboard."""
+    await interaction.response.defer()
+    file = await _dashboard_file(embed)
+    if interaction.message is not None:
+        await interaction.message.edit(
+            embed=_image_embed(), view=view, attachments=[file]
+        )
+
+
+async def _send_dashboard(
+    ctx: commands.Context,
+    embed: discord.Embed,
+    *,
+    view: discord.ui.View | None = None,
+    ephemeral: bool = False,
+) -> discord.Message:
+    """Render and send one image-first command response."""
+    file = await _dashboard_file(embed)
+    return await ctx.send(
+        embed=_image_embed(), file=file, view=view, ephemeral=ephemeral
+    )
+
+
+async def _respond_dashboard(
+    interaction: discord.Interaction,
+    embed: discord.Embed,
+    *,
+    view: discord.ui.View | None = None,
+) -> discord.Message:
+    """Defer a slash command and send its rendered dashboard."""
+    await interaction.response.defer(thinking=True)
+    file = await _dashboard_file(embed)
+    await interaction.followup.send(embed=_image_embed(), file=file, view=view)
+    return await interaction.original_response()
 
 
 def _pick(values: tuple[str, ...] | list[str]) -> str:
@@ -138,6 +194,19 @@ class InvokerView(discord.ui.View):
             with contextlib.suppress(discord.HTTPException):
                 await self.message.edit(view=self)
 
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        """Return a private failure after a component has been acknowledged."""
+        message = "That game action failed safely. Try the command again."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
 
 class ReplayView(InvokerView):
     """Rerun a bounded local game without producing channel spam."""
@@ -163,7 +232,7 @@ class ReplayView(InvokerView):
         embed.set_footer(
             text=f"Replay {self.replays}/5 • Run the command for a fresh session"
         )
-        await interaction.response.edit_message(embed=embed, view=self)
+        await _edit_dashboard(interaction, embed, self)
 
 
 class DecisionView(InvokerView):
@@ -203,18 +272,14 @@ class DecisionView(InvokerView):
         embed.set_footer(text=f"Pick {self.picks} · secure virtual randomness")
         return embed
 
-    @discord.ui.button(
-        label="Choose again", style=discord.ButtonStyle.primary
-    )
+    @discord.ui.button(label="Choose again", style=discord.ButtonStyle.primary)
     async def again(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Pick again from the current pool."""
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await _edit_dashboard(interaction, self.embed(), self)
 
-    @discord.ui.button(
-        label="Eliminate one", style=discord.ButtonStyle.danger
-    )
+    @discord.ui.button(label="Eliminate one", style=discord.ButtonStyle.danger)
     async def eliminate(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -229,7 +294,7 @@ class DecisionView(InvokerView):
         self.eliminated.append(removed)
         embed = self.embed()
         embed.description = f"Eliminated ~~{discord.utils.escape_markdown(removed)}~~\n\n{embed.description}"
-        await interaction.response.edit_message(embed=embed, view=self)
+        await _edit_dashboard(interaction, embed, self)
 
 
 class RockPaperScissorsView(InvokerView):
@@ -290,7 +355,7 @@ class RockPaperScissorsView(InvokerView):
         if match_finished:
             for item in self.children:
                 item.disabled = True
-        await interaction.response.edit_message(embed=embed, view=self)
+        await _edit_dashboard(interaction, embed, self)
         if match_finished:
             self.stop()
 
@@ -403,7 +468,7 @@ class TriviaAnswerButton(discord.ui.Button):
                 inline=False,
             )
             view.stop()
-        await interaction.response.edit_message(embed=embed, view=view)
+        await _edit_dashboard(interaction, embed, view)
 
 
 class TriviaAgainButton(discord.ui.Button):
@@ -427,7 +492,7 @@ class TriviaAgainButton(discord.ui.Button):
         )
         new_view.message = interaction.message
         old_view.stop()
-        await interaction.response.edit_message(embed=new_view.embed(), view=new_view)
+        await _edit_dashboard(interaction, new_view.embed(), new_view)
 
 
 class TriviaView(InvokerView):
@@ -463,9 +528,7 @@ class TriviaView(InvokerView):
 class WouldYouRatherView(discord.ui.View):
     """Public either-or poll with one vote per member and an invoker-owned next button."""
 
-    def __init__(
-        self, author_id: int, prompt: tuple[str, str] | None = None
-    ) -> None:
+    def __init__(self, author_id: int, prompt: tuple[str, str] | None = None) -> None:
         """Start a public vote hosted by the command invoker."""
         super().__init__(timeout=180)
         self.author_id = author_id
@@ -508,7 +571,7 @@ class WouldYouRatherView(discord.ui.View):
             )
             return
         self.votes[interaction.user.id] = choice
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await _edit_dashboard(interaction, self.embed(), self)
 
     @discord.ui.button(label="Option A", style=discord.ButtonStyle.primary)
     async def option_a(
@@ -537,7 +600,7 @@ class WouldYouRatherView(discord.ui.View):
         choices = [prompt for prompt in WOULD_YOU_RATHER if prompt != self.prompt]
         self.prompt = _pick(choices)
         self.votes.clear()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await _edit_dashboard(interaction, self.embed(), self)
 
     async def on_timeout(self) -> None:
         """Disable voting controls when the poll expires."""
@@ -546,6 +609,19 @@ class WouldYouRatherView(discord.ui.View):
         if self.message:
             with contextlib.suppress(discord.HTTPException):
                 await self.message.edit(view=self)
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        """Return a private poll failure without leaving Discord waiting."""
+        message = "That vote could not be rendered. Try the command again."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
 
 
 class FunGames(commands.Cog):
@@ -571,7 +647,7 @@ class FunGames(commands.Cog):
     ) -> None:
         """Flip virtual coins."""
         view = ReplayView(ctx.author.id, lambda: _coinflip_embed(count), "Flip again")
-        view.message = await ctx.send(embed=_coinflip_embed(count), view=view)
+        view.message = await _send_dashboard(ctx, _coinflip_embed(count), view=view)
 
     @commands.hybrid_command(
         with_app_command=False,
@@ -588,7 +664,7 @@ class FunGames(commands.Cog):
     ) -> None:
         """Roll dice and show each result plus its total."""
         view = ReplayView(ctx.author.id, lambda: _dice_embed(dice, sides), "Roll again")
-        view.message = await ctx.send(embed=_dice_embed(dice, sides), view=view)
+        view.message = await _send_dashboard(ctx, _dice_embed(dice, sides), view=view)
 
     @commands.hybrid_command(
         with_app_command=False,
@@ -601,7 +677,7 @@ class FunGames(commands.Cog):
         """Choose one clean, non-empty option."""
         choices = _options(options)
         view = DecisionView(ctx.author.id, choices)
-        view.message = await ctx.send(embed=view.embed(), view=view)
+        view.message = await _send_dashboard(ctx, view.embed(), view=view)
 
     @commands.hybrid_command(
         with_app_command=False,
@@ -630,7 +706,7 @@ class FunGames(commands.Cog):
             )
 
         view = ReplayView(ctx.author.id, renderer, "Shake again")
-        view.message = await ctx.send(embed=renderer(), view=view)
+        view.message = await _send_dashboard(ctx, renderer(), view=view)
 
     @commands.hybrid_command(
         with_app_command=False,
@@ -641,7 +717,7 @@ class FunGames(commands.Cog):
     async def rate(self, ctx: commands.Context, *, subject: str) -> None:
         """Generate a stable user-specific score without global randomness."""
         subject, score = _rating(ctx.author.id, subject)
-        await ctx.send(embed=self._rating_embed(subject, score))
+        await _send_dashboard(ctx, self._rating_embed(subject, score))
 
     @commands.hybrid_command(
         with_app_command=False,
@@ -653,10 +729,11 @@ class FunGames(commands.Cog):
     async def rps(self, ctx: commands.Context) -> None:
         """Start an interactive rock-paper-scissors round."""
         view = RockPaperScissorsView(ctx.author.id)
-        view.message = await ctx.send(
-            embed=discord.Embed(
+        view.message = await _send_dashboard(
+            ctx,
+            discord.Embed(
                 title="Rock, paper, scissors",
-                description="Choose your move below.",
+                description="First to three wins. Choose your opening move below.",
                 color=ACCENT,
             ),
             view=view,
@@ -672,7 +749,7 @@ class FunGames(commands.Cog):
     async def trivia(self, ctx: commands.Context) -> None:
         """Start one interactive trivia question."""
         view = TriviaView(ctx.author.id, _pick(TRIVIA_QUESTIONS))
-        view.message = await ctx.send(embed=view.embed(), view=view)
+        view.message = await _send_dashboard(ctx, view.embed(), view=view)
 
     @commands.hybrid_command(
         with_app_command=False,
@@ -691,7 +768,7 @@ class FunGames(commands.Cog):
         """Show a stable, clearly playful compatibility score."""
         second = second or ctx.author
         score = self._ship_score(first.id, second.id)
-        await ctx.send(embed=self._ship_embed(first, second, score))
+        await _send_dashboard(ctx, self._ship_embed(first, second, score))
 
     @commands.hybrid_command(
         with_app_command=False,
@@ -704,7 +781,7 @@ class FunGames(commands.Cog):
     async def wouldyourather(self, ctx: commands.Context) -> None:
         """Send one bounded conversation prompt."""
         view = WouldYouRatherView(ctx.author.id)
-        view.message = await ctx.send(embed=view.embed(), view=view)
+        view.message = await _send_dashboard(ctx, view.embed(), view=view)
 
     @staticmethod
     def _ship_score(first_id: int, second_id: int) -> int:
@@ -770,8 +847,9 @@ class FunGames(commands.Cog):
         view = ReplayView(
             interaction.user.id, lambda: _coinflip_embed(count), "Flip again"
         )
-        await interaction.response.send_message(embed=_coinflip_embed(count), view=view)
-        view.message = await interaction.original_response()
+        view.message = await _respond_dashboard(
+            interaction, _coinflip_embed(count), view=view
+        )
 
     @fun.command(name="roll", description="Roll configurable virtual dice.")
     @app_commands.checks.cooldown(2, 4, key=lambda interaction: interaction.user.id)
@@ -785,10 +863,9 @@ class FunGames(commands.Cog):
         view = ReplayView(
             interaction.user.id, lambda: _dice_embed(dice, sides), "Roll again"
         )
-        await interaction.response.send_message(
-            embed=_dice_embed(dice, sides), view=view
+        view.message = await _respond_dashboard(
+            interaction, _dice_embed(dice, sides), view=view
         )
-        view.message = await interaction.original_response()
 
     @fun.command(name="choose", description="Choose from comma-separated options.")
     @app_commands.checks.cooldown(2, 4, key=lambda interaction: interaction.user.id)
@@ -798,8 +875,7 @@ class FunGames(commands.Cog):
         """Choose one supplied option through `/fun choose`."""
         choices = _options(options)
         view = DecisionView(interaction.user.id, choices)
-        await interaction.response.send_message(embed=view.embed(), view=view)
-        view.message = await interaction.original_response()
+        view.message = await _respond_dashboard(interaction, view.embed(), view=view)
 
     @fun.command(name="eightball", description="Ask the magic eight ball a question.")
     @app_commands.checks.cooldown(2, 5, key=lambda interaction: interaction.user.id)
@@ -822,39 +898,35 @@ class FunGames(commands.Cog):
             )
 
         view = ReplayView(interaction.user.id, renderer, "Shake again")
-        await interaction.response.send_message(embed=renderer(), view=view)
-        view.message = await interaction.original_response()
+        view.message = await _respond_dashboard(interaction, renderer(), view=view)
 
     @fun.command(name="rate", description="Give a subject a stable playful rating.")
     async def slash_rate(self, interaction: discord.Interaction, subject: str) -> None:
         """Rate one subject through `/fun rate`."""
         subject, score = _rating(interaction.user.id, subject)
-        await interaction.response.send_message(
-            embed=self._rating_embed(subject, score)
-        )
+        await _respond_dashboard(interaction, self._rating_embed(subject, score))
 
     @fun.command(name="rps", description="Play interactive rock-paper-scissors.")
     @app_commands.checks.cooldown(1, 5, key=lambda interaction: interaction.user.id)
     async def slash_rps(self, interaction: discord.Interaction) -> None:
         """Start rock-paper-scissors through `/fun rps`."""
         view = RockPaperScissorsView(interaction.user.id)
-        await interaction.response.send_message(
-            embed=discord.Embed(
+        view.message = await _respond_dashboard(
+            interaction,
+            discord.Embed(
                 title="Rock, paper, scissors",
-                description="Choose your move below.",
+                description="First to three wins. Choose your opening move below.",
                 color=ACCENT,
             ),
             view=view,
         )
-        view.message = await interaction.original_response()
 
     @fun.command(name="trivia", description="Play interactive multiple-choice trivia.")
     @app_commands.checks.cooldown(1, 8, key=lambda interaction: interaction.user.id)
     async def slash_trivia(self, interaction: discord.Interaction) -> None:
         """Start trivia through `/fun trivia`."""
         view = TriviaView(interaction.user.id, _pick(TRIVIA_QUESTIONS))
-        await interaction.response.send_message(embed=view.embed(), view=view)
-        view.message = await interaction.original_response()
+        view.message = await _respond_dashboard(interaction, view.embed(), view=view)
 
     @fun.command(name="ship", description="Check two members' playful compatibility.")
     @app_commands.checks.cooldown(2, 5, key=lambda interaction: interaction.user.id)
@@ -867,14 +939,11 @@ class FunGames(commands.Cog):
         """Show compatibility through `/fun ship`."""
         second = second or interaction.user
         score = self._ship_score(first.id, second.id)
-        await interaction.response.send_message(
-            embed=self._ship_embed(first, second, score)
-        )
+        await _respond_dashboard(interaction, self._ship_embed(first, second, score))
 
     @fun.command(name="would-you-rather", description="Get an either-or prompt.")
     @app_commands.checks.cooldown(2, 5, key=lambda interaction: interaction.user.id)
     async def slash_would_you_rather(self, interaction: discord.Interaction) -> None:
         """Send a conversation prompt through `/fun would-you-rather`."""
         view = WouldYouRatherView(interaction.user.id)
-        await interaction.response.send_message(embed=view.embed(), view=view)
-        view.message = await interaction.original_response()
+        view.message = await _respond_dashboard(interaction, view.embed(), view=view)

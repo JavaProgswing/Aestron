@@ -324,3 +324,86 @@ def render_pvp_board(
     output = BytesIO()
     canvas.save(output, format="PNG", optimize=True)
     return output.getvalue()
+
+
+def render_inventory_card(
+    *, name: str, avatar: bytes, armor: str, sword: str, balance: int
+) -> bytes:
+    """Render one player's active loadout with bundled in-game item sprites."""
+    canvas = Image.new("RGB", (900, 470), (13, 18, 14))
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (36, 31),
+        "AESTRON // MINECRAFT LOADOUT",
+        font=_font(14, bold=True),
+        fill=(126, 227, 119),
+    )
+    draw.line((36, 68, 864, 68), fill=(58, 70, 60), width=2)
+    profile = _avatar_image(avatar, name).resize((126, 126), Image.Resampling.NEAREST)
+    canvas.paste(profile, (42, 105))
+    draw.rectangle((39, 102, 171, 234), outline=(91, 202, 91), width=3)
+    draw.text(
+        (194, 117),
+        _bounded_text(draw, name, 610, _font(30, bold=True)),
+        font=_font(30, bold=True),
+        fill=(240, 244, 237),
+    )
+    draw.text(
+        (194, 160),
+        f"{balance:,} emeralds available",
+        font=_font(15),
+        fill=(155, 168, 157),
+    )
+    draw.rounded_rectangle(
+        (194, 195, 850, 229), radius=9, fill=(25, 31, 27), outline=(58, 70, 60)
+    )
+    rating = min(1.0, (ARMOR_RESISTANCE[armor] + SWORD_DAMAGE[sword] * 4) / 120)
+    draw.rounded_rectangle(
+        (194, 195, 194 + int(656 * rating), 229),
+        radius=9,
+        fill=(91, 202, 91),
+    )
+    draw.text(
+        (522, 212),
+        "DUEL LOADOUT BALANCE",
+        font=_font(11, bold=True),
+        fill=(245, 248, 242),
+        anchor="mm",
+    )
+    for x, label, material, filename, statistic in (
+        (
+            42,
+            "ARMOR",
+            armor,
+            _ARMOR_FILES[armor],
+            f"{ARMOR_RESISTANCE[armor]:g}% resistance",
+        ),
+        (
+            462,
+            "WEAPON",
+            sword,
+            _SWORD_FILES[sword],
+            f"{SWORD_DAMAGE[sword]:g} base attack",
+        ),
+    ):
+        draw.rounded_rectangle(
+            (x, 270, x + 396, 430),
+            radius=18,
+            fill=(25, 31, 27),
+            outline=(58, 70, 60),
+            width=2,
+        )
+        _paste_item(canvas, (x + 24, 303), filename, size=92)
+        draw.text(
+            (x + 140, 294), label, font=_font(11, bold=True), fill=(126, 227, 119)
+        )
+        draw.text(
+            (x + 140, 327),
+            material,
+            font=_font(25, bold=True),
+            fill=(240, 244, 237),
+        )
+        draw.text((x + 140, 367), statistic, font=_font(14), fill=(155, 168, 157))
+    output = BytesIO()
+    canvas.save(output, format="PNG", optimize=True)
+    return output.getvalue()

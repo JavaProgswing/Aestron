@@ -58,6 +58,7 @@ from aestron_bot.minecraft_ui import (
     ARMOR_RESISTANCE,
     SWORD_DAMAGE,
     FighterVisual,
+    render_inventory_card,
     render_pvp_board,
 )
 from aestron_bot.moderation import Moderation
@@ -1377,80 +1378,37 @@ class MinecraftFun(commands.Cog):
     )
     @commands.guild_only()
     async def inventory(self, ctx, member: discord.Member = None):
-        if member is None:
-            member = ctx.author
+        member = member or ctx.author
+        if ctx.interaction is not None and not ctx.interaction.response.is_done():
+            await ctx.defer(ephemeral=True)
+        inventory = await self._minecraft_inventory(member.id)
+        async with client.database.pool.acquire() as con:
+            balance = int(
+                await con.fetchval(
+                    "SELECT balance FROM mceconomy WHERE memberid = $1", member.id
+                )
+                or 0
+            )
+        avatar = await member.display_avatar.with_size(256).read()
+        image = await asyncio.to_thread(
+            render_inventory_card,
+            name=member.display_name,
+            avatar=avatar,
+            armor=inventory["orechoice"],
+            sword=inventory["swordchoice"],
+            balance=balance,
+        )
         embed = discord.Embed(
-            title=f"{member.display_name}'s loadout 🎒",
-            description="Equipment currently used in interactive PvP.",
+            title=f"{member.display_name}'s Minecraft loadout",
+            description="Active equipment used in interactive PvP.",
             color=0x55AA55,
         )
-        async with client.database.pool.acquire() as con:
-            memberoneeco = await con.fetchrow(
-                "SELECT * FROM mceconomy WHERE memberid = $1", member.id
-            )
-        if memberoneeco is None:
-            statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
-            newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, member.id, 1500, json.dumps(newjson))
-            async with client.database.pool.acquire() as con:
-                memberoneeco = await con.fetchrow(
-                    "SELECT * FROM mceconomy WHERE memberid = $1", member.id
-                )
-        orechoiceemoji = {
-            "Netherite": "🛡️",
-            "Diamond": "🛡️",
-            "Iron": "🛡️",
-            "Leather": "🛡️",
-            "Chainmail": "🛡️",
-            "Golden": "🛡️",
-        }
-        swordchoiceemoji = {
-            "Netherite": "⚔️",
-            "Diamond": "⚔️",
-            "Iron": "⚔️",
-            "Stone": "⚔️",
-            "Golden": "⚔️",
-            "Wooden": "⚔️",
-        }
-        inventory = json.loads(memberoneeco["inventory"])
-        armorname = inventory["orechoice"]
-        armoremoji = orechoiceemoji[armorname]
-        swordname = inventory["swordchoice"]
-        swordemoji = swordchoiceemoji[swordname]
-        armor_stats = {
-            "Netherite": 85,
-            "Diamond": 75,
-            "Iron": 55,
-            "Chainmail": 45,
-            "Golden": 40,
-            "Leather": 28,
-        }
-        sword_stats = {
-            "Netherite": 12,
-            "Diamond": 10,
-            "Iron": 9,
-            "Golden": 8.5,
-            "Stone": 8,
-            "Wooden": 5,
-        }
-        armor_power = armor_stats.get(armorname, 0)
-        sword_power = sword_stats.get(swordname, 0)
-        embed.add_field(
-            name="Armor",
-            value=f"{armoremoji} **{armorname} Armor**\n{armor_power}% resistance",
+        embed.set_image(url="attachment://minecraft-loadout.png")
+        await ctx.send(
+            embed=embed,
+            file=discord.File(BytesIO(image), filename="minecraft-loadout.png"),
+            ephemeral=True,
         )
-        embed.add_field(
-            name="Weapon",
-            value=f"{swordemoji} **{swordname} Sword**\n{sword_power:g} base damage",
-        )
-        embed.add_field(
-            name="Power estimate",
-            value=f"⚔️ {sword_power * (1 + armor_power / 100):.1f}",
-            inline=False,
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        await ctx.send(embed=embed, ephemeral=True)
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
@@ -3101,7 +3059,12 @@ class Minecraftpvp(discord.ui.View):
                 f"{attacker_name} landed a {attack_type} strike on {defender_name} "
                 f"for {damage:.1f} damage."
             )
-            play_minecraft_sound(self.vc, f"{attack_type.title()}_attack1.ogg")
+            sound_attack = {
+                "steady": "Weak",
+                "strong": "Strong",
+                "critical": "Critical",
+            }[attack_type]
+            play_minecraft_sound(self.vc, f"{sound_attack}_attack1.ogg")
         self.last_action = f"attack_{attacker_side}"
         if remaining <= 0:
             await self._complete_fight(

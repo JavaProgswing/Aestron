@@ -25,6 +25,31 @@ class ProductUpdate:
 PRODUCT_UPDATES = (
     ProductUpdate(
         published="2026-07-16",
+        category="Game dashboards",
+        title="VALORANT and Minecraft become image-first",
+        summary=(
+            "Dense text embeds were replaced with rendered dashboards designed for "
+            "fast scanning on desktop and mobile Discord."
+        ),
+        details=(
+            "VALORANT now renders overview, match history, round timeline, personal economy, duel matrix, trends, and review-plan pages from official completed-match data.",
+            "Match reviews use real map layouts, numbered kill/death positions, player-card or map banners, agent portraits, and finishing-weapon art loaded from a bounded public artwork cache.",
+            "The dashboard never estimates hidden MMR or ELO; every displayed metric is derived from a documented match field or clearly labelled aggregate.",
+            "Minecraft PvP and inventory use cached in-game item sprites, and every combat button acknowledges Discord before image rendering, audio, or reward writes.",
+            "Fun commands share a consistent rendered-card system while preserving replay, scoring, elimination, and live-vote controls.",
+        ),
+        commands=(
+            "/valorant stats",
+            "/valorant match",
+            "/valorant coach",
+            "/minecraft pvp",
+            "/minecraft inventory",
+            "/fun coinflip",
+            "/fun trivia",
+        ),
+    ),
+    ProductUpdate(
+        published="2026-07-16",
         category="Commands",
         title="Social, fun, and Minecraft sessions rebuilt",
         summary=(
@@ -33,7 +58,7 @@ PRODUCT_UPDATES = (
         ),
         details=(
             "Welcome and wanted cards render at 1200 x 480 with themes, reactions, and private profile controls.",
-            "Trivia, rock-paper-scissors, coin flips, dice, choices, and polls now support replay, scoring, or live voting.",
+            "Trivia, rock-paper-scissors, coin flips, dice, choices, and polls now support rendered cards, replay, scoring, or live voting.",
             "Minecraft rewards persist across restarts; the shop is transactional and PvP adds healing, surrender rewards, and optional voice effects.",
         ),
         commands=(

@@ -110,14 +110,28 @@ class DuelPerformance:
 
 
 @dataclass(frozen=True, slots=True)
+class KillLocation:
+    """One player-involved elimination location from Riot's kill event."""
+
+    round_number: int
+    x: float
+    y: float
+    outcome: str
+    weapon_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class MatchPerformance:
     """One player's transparent performance metrics for one completed match."""
 
     match_id: str
     game_start_millis: int
     queue: str
+    map_id: str
     map_name: str
+    agent_id: str
     agent_name: str
+    player_card_id: str
     won: bool
     rounds: int
     rounds_won: int
@@ -140,6 +154,7 @@ class MatchPerformance:
     ability_casts: int
     round_details: tuple[RoundPerformance, ...]
     duels: tuple[DuelPerformance, ...]
+    kill_locations: tuple[KillLocation, ...]
 
     @property
     def kd_ratio(self) -> float:
@@ -319,6 +334,7 @@ def analyze_match(
     values: Counter[str] = Counter()
     duel_values: dict[str, Counter[str]] = {}
     round_details: list[RoundPerformance] = []
+    kill_locations: list[KillLocation] = []
     for fallback_number, round_result in enumerate(round_results, start=1):
         player_stats = [
             item
@@ -376,6 +392,24 @@ def analyze_match(
                 duel_values.setdefault(killer, Counter())["deaths"] += 1
             if puuid in (kill.get("assistants") or []):
                 round_assists += 1
+            if killer == puuid or victim == puuid:
+                location = kill.get("victimLocation") or {}
+                try:
+                    location_x = float(location.get("x"))
+                    location_y = float(location.get("y"))
+                except (TypeError, ValueError):
+                    continue
+                finishing_damage = kill.get("finishingDamage") or {}
+                kill_locations.append(
+                    KillLocation(
+                        round_number=_integer(round_result.get("roundNum"))
+                        or fallback_number,
+                        x=location_x,
+                        y=location_y,
+                        outcome="kill" if killer == puuid else "death",
+                        weapon_id=str(finishing_damage.get("damageItem") or ""),
+                    )
+                )
 
         economy = player_round.get("economy") or {}
         opening_result = None
@@ -425,8 +459,11 @@ def analyze_match(
         match_id=str(match_info.get("matchId") or "Unknown match"),
         game_start_millis=_integer(match_info.get("gameStartMillis")),
         queue=str(match_info.get("queueId") or "Unknown queue").replace("_", " "),
+        map_id=str(match_info.get("mapId") or ""),
         map_name=catalog.map_name(match_info.get("mapId")),
+        agent_id=str(player.get("characterId") or ""),
         agent_name=catalog.agent_name(player.get("characterId")),
+        player_card_id=str(player.get("playerCard") or ""),
         won=bool(team.get("won")),
         rounds=rounds,
         rounds_won=_integer(team.get("roundsWon")),
@@ -462,6 +499,7 @@ def analyze_match(
                 ),
             )
         ),
+        kill_locations=tuple(kill_locations),
     )
 
 

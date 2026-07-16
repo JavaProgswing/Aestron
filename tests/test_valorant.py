@@ -1,8 +1,7 @@
-from aestron_bot.valorant import (
+from aestron_bot.valorant import ValorantStatsView
+from aestron_bot.valorant_analytics import (
     AssetCatalog,
-    ValorantStatsView,
     coaching_notes,
-    stats_overview_embed,
     summarize_matches,
 )
 
@@ -11,7 +10,7 @@ def _match(*, won: bool = True):
     return {
         "matchInfo": {
             "matchId": "match-123",
-            "mapId": "map-ascent",
+            "mapId": "/Game/Maps/Ascent/Ascent",
             "gameStartMillis": 1_700_000_000_000,
             "queueId": "competitive",
         },
@@ -19,7 +18,8 @@ def _match(*, won: bool = True):
             {
                 "puuid": "player-1",
                 "teamId": "Blue",
-                "characterId": "Jett",
+                "characterId": "add6443a-41bd-e414-f6ad-e58d267f4e95",
+                "playerCard": "11111111-2222-3333-4444-555555555555",
                 "stats": {
                     "roundsPlayed": 2,
                     "kills": 3,
@@ -68,6 +68,10 @@ def _match(*, won: bool = True):
                                 "killer": "player-1",
                                 "victim": "other",
                                 "timeSinceRoundStartMillis": 8000,
+                                "victimLocation": {"x": 3980.9, "y": -5938.8},
+                                "finishingDamage": {
+                                    "damageItem": "9c82e19d-4575-0200-1a81-3eacf00cf872"
+                                },
                             }
                         ],
                     }
@@ -86,6 +90,10 @@ def _match(*, won: bool = True):
                                 "killer": "other",
                                 "victim": "player-1",
                                 "timeSinceRoundStartMillis": 4000,
+                                "victimLocation": {"x": -2344.1, "y": -7548.5},
+                                "finishingDamage": {
+                                    "damageItem": "9c82e19d-4575-0200-1a81-3eacf00cf872"
+                                },
                             }
                         ],
                     },
@@ -116,7 +124,10 @@ def _match(*, won: bool = True):
 
 
 def test_match_summary_uses_round_and_damage_data():
-    catalog = AssetCatalog(agents={"jett": "Jett"}, maps={"map-ascent": "Ascent"})
+    catalog = AssetCatalog(
+        agents={"add6443a-41bd-e414-f6ad-e58d267f4e95": "Jett"},
+        maps={"/game/maps/ascent/ascent": "Ascent"},
+    )
     summary = summarize_matches([_match()], "player-1", catalog)
 
     assert summary.matches == 1
@@ -139,6 +150,9 @@ def test_match_summary_uses_round_and_damage_data():
     assert summary.performances[0].round_details[0].loadout_value == 3900
     assert summary.performances[0].duels[0].kills == 1
     assert summary.performances[0].duels[0].deaths == 1
+    assert len(summary.performances[0].kill_locations) == 2
+    assert summary.performances[0].kill_locations[0].outcome == "kill"
+    assert summary.performances[0].kill_locations[1].outcome == "death"
 
 
 def test_coaching_is_transparent_and_never_creates_a_rank():
@@ -169,26 +183,32 @@ def test_stats_panel_restores_interactive_drill_downs():
         summary=summary,
     )
 
-    overview = stats_overview_embed(account, summary)
-    assert overview.title == "⚔️ Player#AP · Performance Lab"
-    assert len(view.children) == 7
+    assert len(view.children) == 8
     assert view.overview_button.disabled is True
     assert view.section_select.disabled is True
+    assert view.round_select.disabled is True
+    assert view.render().title == "Performance overview"
+    assert view.render().fields == []
+    assert len(view.render_image()) > 15_000
 
     view.current_page = "coaching"
     view._refresh_buttons()
-    assert view.render().title == "Review plan · Player#AP"
+    assert view.render().title == "Post-match review plan"
     assert view.coaching_button.disabled is True
 
     view.current_page = "match:0"
-    assert view.render().title == "🟢 VICTORY · map-ascent"
+    assert view.render().title == "Match review · Summary"
 
     view.selected_match_index = 0
     view.current_page = "match:0:rounds"
-    assert view.render().title == "Round review · map-ascent"
+    assert view.render().title == "Match review · Rounds"
+    assert len(view.render_image()) > 15_000
 
     view.current_page = "match:0:economy"
-    assert view.render().title == "Economy review · map-ascent"
+    assert view.render().title == "Match review · Economy"
 
     view.current_page = "match:0:duels"
-    assert view.render().title == "Duel matrix · map-ascent"
+    assert view.render().title == "Match review · Duels"
+
+    view.current_page = "match:0:round:1"
+    assert view.render().title == "Match review · Round 1"

@@ -151,7 +151,7 @@ def test_general_site_and_dedicated_valorant_pages_render(monkeypatch):
     assert f"https://github.com/example/aestron/commit/{'a' * 40}" in updates.text
     assert updates_api.status_code == 200
     assert updates_api.json()["runtime"]["git_commit"] == "a" * 40
-    assert updates_api.json()["updates"][0]["category"] == "Commands"
+    assert updates_api.json()["updates"][0]["category"] == "Game dashboards"
 
 
 def test_api_discovery_health_and_private_service_auth():

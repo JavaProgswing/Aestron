@@ -305,6 +305,7 @@ def test_fun_leveling_and_minecraft_regressions_are_registered():
     assert "con.transaction()" in payment_source
     assert "MinecraftVoiceEffects.connect" in pvp_source
     assert "voice_channel: discord.VoiceChannel | None" in pvp_source
+    assert pvp_source.index("await ctx.defer") < pvp_source.index("asyncio.gather")
     view = main.Minecraftpvp(
         memberone_id=1,
         membertwo_id=2,
@@ -328,6 +329,10 @@ def test_fun_leveling_and_minecraft_regressions_are_registered():
         "Strike",
     }
     assert len(view.render_board()) > 10_000
+    attack_source = inspect.getsource(main.Minecraftpvp.attack)
+    assert attack_source.index("await interaction.response.defer") < (
+        attack_source.index("await self._refresh")
+    )
 
 
 def test_ticket_views_are_persistent_and_channel_names_are_safe():
