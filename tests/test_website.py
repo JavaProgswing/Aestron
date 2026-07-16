@@ -123,13 +123,20 @@ def _client():
     return TestClient(app), database
 
 
-def test_general_site_and_dedicated_valorant_pages_render():
+def test_general_site_and_dedicated_valorant_pages_render(monkeypatch):
+    monkeypatch.setenv("AESTRON_GIT_COMMIT", "a" * 40)
+    monkeypatch.setenv(
+        "AESTRON_SOURCE_REPOSITORY_URL",
+        "https://github.com/example/aestron.git",
+    )
     client, _ = _client()
     with client:
         home = client.get("/")
         privacy = client.get("/privacy")
         valorant = client.get("/valorant")
         dashboard = client.get("/valorant/dashboard")
+        updates = client.get("/updates")
+        updates_api = client.get("/api/v1/updates")
 
     assert home.status_code == 200
     assert "Moderation & safety" in home.text
@@ -139,6 +146,12 @@ def test_general_site_and_dedicated_valorant_pages_render():
     assert "prototype data" in dashboard.text
     assert "Riot Games" not in home.text
     assert home.headers["x-content-type-options"] == "nosniff"
+    assert updates.status_code == 200
+    assert "Social, fun, and Minecraft sessions rebuilt" in updates.text
+    assert f"https://github.com/example/aestron/commit/{'a' * 40}" in updates.text
+    assert updates_api.status_code == 200
+    assert updates_api.json()["runtime"]["git_commit"] == "a" * 40
+    assert updates_api.json()["updates"][0]["category"] == "Commands"
 
 
 def test_api_discovery_health_and_private_service_auth():

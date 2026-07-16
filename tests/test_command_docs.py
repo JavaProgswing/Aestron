@@ -86,6 +86,7 @@ def test_every_registered_command_has_complete_documentation():
                 "automod",
                 "community",
                 "fun",
+                "minecraft",
                 "social",
                 "valorant",
             } <= application_roots
@@ -98,6 +99,14 @@ def test_every_registered_command_has_complete_documentation():
                 "wanteduser",
                 "linkaccount",
                 "matchanalysis",
+                "balance",
+                "daily",
+                "weekly",
+                "pay",
+                "inventory",
+                "shop",
+                "pvp",
+                "mcstatus",
             }.isdisjoint(application_roots)
             community_group = bot.tree.get_command("community")
             assert isinstance(community_group, discord.app_commands.Group)
@@ -111,6 +120,19 @@ def test_every_registered_command_has_complete_documentation():
             }
             assert bot.get_command("youtube") is not None
             assert bot.get_command("ytvideo") is None
+            minecraft_group = bot.tree.get_command("minecraft")
+            assert isinstance(minecraft_group, discord.app_commands.Group)
+            assert {command.name for command in minecraft_group.commands} == {
+                "balance",
+                "daily",
+                "inventory",
+                "leaderboard",
+                "pay",
+                "pvp",
+                "server",
+                "shop",
+                "weekly",
+            }
             for command_name in (
                 "ban",
                 "clearwarnings",

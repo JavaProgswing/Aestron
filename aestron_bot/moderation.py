@@ -249,12 +249,13 @@ class Moderation(commands.Cog):
         reason: str = "No reason provided",
     ) -> None:
         """Purge recent messages with explicit bounds and optional filtering."""
-        check = None if member is None else lambda message: message.author == member
-        deleted = await ctx.channel.purge(
-            limit=amount,
-            check=check,
-            reason=_audit_reason(ctx, reason),
-        )
+        purge_options = {
+            "limit": amount,
+            "reason": _audit_reason(ctx, reason),
+        }
+        if member is not None:
+            purge_options["check"] = lambda message: message.author == member
+        deleted = await ctx.channel.purge(**purge_options)
         await self._log_action(
             ctx,
             "purge",

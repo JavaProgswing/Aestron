@@ -2,10 +2,12 @@
 
 import asyncio
 import inspect
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import discord
+from PIL import Image
 
 import main
 from aestron_bot.antiraid import DANGEROUS_ACTIONS, AntiRaid
@@ -16,11 +18,18 @@ from aestron_bot.automod import (
     AutoMod,
 )
 from aestron_bot.calls import CallInviteView, Calls
-from aestron_bot.fun import FunGames
+from aestron_bot.fun import (
+    TRIVIA_QUESTIONS,
+    FunGames,
+    RockPaperScissorsView,
+    TriviaView,
+    WouldYouRatherView,
+)
 from aestron_bot.giveaways import Giveaways, GiveawayView
 from aestron_bot.leveling import Leveling
 from aestron_bot.moderation import Moderation
 from aestron_bot.profiles import build_profile_embed
+from aestron_bot.social import _render_wanted, _render_welcome
 from aestron_bot.templates import Templates, _template_code
 from aestron_bot.tickets import (
     OpenTicketView,
@@ -57,6 +66,121 @@ def test_production_uses_maintained_safety_cogs():
         Calls,
     ):
         assert cog.__module__.startswith("aestron_bot.")
+
+
+def test_unfiltered_purge_omits_none_check_callback():
+    """discord.py must receive no check keyword when purging every author."""
+
+    async def run_test():
+        bot = SimpleNamespace(get_cog=lambda _name: None)
+        moderation = Moderation(bot)
+        channel = SimpleNamespace(
+            purge=AsyncMock(return_value=[object(), object()]),
+            mention="#general",
+        )
+        ctx = SimpleNamespace(
+            author=SimpleNamespace(id=42, __str__=lambda self: "Moderator"),
+            channel=channel,
+            guild=SimpleNamespace(id=99),
+            send=AsyncMock(),
+        )
+
+        await Moderation.purge.callback(
+            moderation,
+            ctx,
+            25,
+            None,
+            reason="cleanup",
+        )
+
+        options = channel.purge.await_args.kwargs
+        assert options["limit"] == 25
+        assert "check" not in options
+        ctx.send.assert_awaited_once()
+
+    asyncio.run(run_test())
+
+
+def test_legacy_custom_command_names_are_normalized_once(monkeypatch, caplog):
+    """Mixed-case database rows must not emit startup warnings forever."""
+
+    class AsyncContext:
+        def __init__(self, value):
+            self.value = value
+
+        async def __aenter__(self):
+            return self.value
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Connection:
+        def __init__(self):
+            self.executions = []
+
+        def transaction(self):
+            return AsyncContext(self)
+
+        async def fetch(self, *_args):
+            return [{"guildid": 9, "commandname": "Hi"}]
+
+        async def fetchval(self, *_args):
+            return False
+
+        async def execute(self, query, *args):
+            self.executions.append((query, args))
+
+    async def run_test():
+        connection = Connection()
+        pool = SimpleNamespace(acquire=lambda: AsyncContext(connection))
+        monkeypatch.setattr(main.client, "database", SimpleNamespace(pool=pool))
+
+        bot = SimpleNamespace(
+            wait_until_ready=AsyncMock(),
+            get_command=lambda _name: SimpleNamespace(extras={}),
+        )
+        custom_commands = main.CustomCommands(bot)
+        with caplog.at_level("WARNING", logger="aestron"):
+            await custom_commands._load_custom_commands()
+
+        assert connection.executions
+        query, args = connection.executions[0]
+        assert "UPDATE customcommands SET commandname" in query
+        assert args == ("hi", 9, "Hi")
+        assert not caplog.records
+
+    asyncio.run(run_test())
+
+
+def test_social_cards_render_at_shareable_resolution():
+    """Generated welcome and bounty assets should not depend on legacy backgrounds."""
+    source = BytesIO()
+    Image.new("RGB", (512, 512), (70, 120, 210)).save(source, format="PNG")
+    avatar = source.getvalue()
+
+    welcome = _render_welcome(avatar, "Builder", 128, "Block Party", "aurora")
+    wanted, bounty = _render_wanted(
+        avatar, "Griefer", "borrowed the diamonds", "chaos", 42
+    )
+
+    with Image.open(BytesIO(welcome)) as image:
+        assert image.size == (1200, 480)
+    with Image.open(BytesIO(wanted)) as image:
+        assert image.size == (1200, 480)
+    assert 10_000 <= bounty < 12_500
+
+
+def test_fun_sessions_expose_scored_and_public_controls():
+    """Core fun games should retain meaningful multi-step session state."""
+    rps = RockPaperScissorsView(1)
+    trivia = TriviaView(1, TRIVIA_QUESTIONS[0])
+    poll = WouldYouRatherView(1)
+
+    assert (rps.player_score, rps.bot_score, rps.round) == (0, 0, 0)
+    assert len(rps.children) == 3
+    assert trivia.round_number == 1 and trivia.score == 0
+    assert len(trivia.children) == 4
+    assert len(poll.children) == 3
 
 
 def test_antiraid_covers_destructive_actions_and_permissions():
@@ -171,12 +295,12 @@ def test_fun_leveling_and_minecraft_regressions_are_registered():
     assert {"coinflip", "roll", "choose", "eightball", "rate", "rps", "trivia"} <= (
         fun_commands
     )
-    assert main.MinecraftFun.voterewardweekly._buckets._cooldown.per == 604800
-    assert main.MinecraftFun.votereward._buckets._cooldown.per == 86400
-    daily_source = inspect.getsource(main.MinecraftFun.votereward.callback)
+    reward_source = inspect.getsource(main.MinecraftFun._claim_reward)
     payment_source = inspect.getsource(main.MinecraftFun.payment.callback)
     pvp_source = inspect.getsource(main.MinecraftFun.pvp.callback)
-    assert "await uservoted" in daily_source
+    assert "minecraft_reward_claims" in reward_source
+    assert "con.transaction()" in reward_source
+    assert "await uservoted" in reward_source
     assert "FOR UPDATE" in payment_source
     assert "con.transaction()" in payment_source
     assert "MinecraftVoiceEffects.connect" in pvp_source

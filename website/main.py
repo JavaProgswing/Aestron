@@ -35,6 +35,7 @@ from .security import (
     require_service_token,
     validate_oauth_state,
 )
+from .updates import public_updates
 
 LOGGER = logging.getLogger(__name__)
 BASE_DIRECTORY = Path(__file__).resolve().parent
@@ -238,6 +239,21 @@ def create_app(
             context=_page_context(request),
         )
 
+    @application.get("/updates", response_class=HTMLResponse, include_in_schema=False)
+    async def updates_page(request: Request):
+        """Show recent commands, fixes, and the running source revision."""
+        deployment = runtime_info()
+        return TEMPLATES.TemplateResponse(
+            request=request,
+            name="updates.html",
+            context={
+                **_page_context(request),
+                "runtime": deployment,
+                "uptime_label": _format_duration(deployment["uptime_seconds"]),
+                "updates": public_updates(),
+            },
+        )
+
     @application.get("/api/", tags=["meta"])
     async def api_root(request: Request) -> dict[str, Any]:
         """Describe the stable API root and useful discovery URLs."""
@@ -264,6 +280,11 @@ def create_app(
             "service_api": settings_value.service_api_configured,
             "admin_api": settings_value.admin_api_configured,
         }
+
+    @application.get("/api/v1/updates", tags=["meta"])
+    async def updates() -> dict[str, Any]:
+        """Return public release notes and the currently deployed revision."""
+        return {"runtime": runtime_info(), "updates": public_updates()}
 
     @application.get("/api/v1/valorant/status", tags=["valorant"])
     async def valorant_status(request: Request) -> dict[str, Any]:
@@ -467,6 +488,18 @@ def _page_context(request: Request) -> dict[str, Any]:
         "rso_ready": settings.rso_configured,
         "riot_page": False,
     }
+
+
+def _format_duration(seconds: int) -> str:
+    """Format process uptime without introducing a template-side calculation."""
+    days, remainder = divmod(max(0, int(seconds)), 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m {seconds}s"
 
 
 def _oauth_result(request: Request, success: bool, message: str):

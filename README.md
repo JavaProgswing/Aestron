@@ -35,6 +35,9 @@ The actively maintained runtime features are split into focused modules:
   website queue, with a configured Discord channel as a fallback.
 - `website/` is the standalone FastAPI product site and versioned API. The main
   pages cover the entire bot; VALORANT has a dedicated consent-aware area.
+  `/updates` publishes recent command and fix notes with the running version,
+  uptime, and a credential-free link to the exact deployed Git commit. The same
+  data is available as JSON from `/api/v1/updates`.
 
 ## Setup
 
@@ -112,11 +115,12 @@ when the node has no working audio source.
 - `/valorant history`, `/valorant match`, and `/valorant coach` — recent match cards,
   round-level match inspection, and evidence-based post-match review. Match
   history is also available from the selector in `/valorant stats`.
-- `/fun rps` and `/fun trivia` — interactive invoker-only games with replay.
-  `/fun coinflip|roll|choose|eightball|rate|ship|would-you-rather` provide
-  validated quick games and conversation starters.
-- `/social welcome` and `/social wanted` — public image cards with clean embeds;
-  the matching prefix commands are `a!welcome` and `a!wanted`.
+- `/fun rps` runs a first-to-three match and `/fun trivia` runs a scored
+  five-question session. Coin flips, dice, decisions, and eight-ball answers can
+  replay in place; would-you-rather uses a public one-vote-per-member poll.
+- `/social welcome` and `/social wanted` — generated 1200×480 cards with visual
+  themes, fictional bounty levels, and rate-limited community reaction buttons.
+  Prefix equivalents remain `a!welcome` and `a!wanted`.
 - `/community youtube` and `/community chess` — start Discord activities in your
   current voice channel.
 - `/antiraid enable|disable|status|configure` — configure a bounded destructive
@@ -140,11 +144,12 @@ when the node has no working audio source.
 - `/giveaway start|end|reroll|status` — run database-backed button giveaways
   that resume after a restart. Native Discord polls remain available through the
   prefix poll command.
-- `a!daily`, `a!weekly`, `a!pay`, `a!inventory`, `a!shop`, and `a!pvp` — the
-  Minecraft-style economy. Daily/weekly claims use the correct cooldowns,
-  transfers are atomic, and PvP can play optional local effects in a selected
-  voice channel without moving or replacing an active music player. Abandoned
-  fights release their temporary voice connection after five minutes.
+- `/minecraft balance|daily|weekly|pay|inventory|shop|pvp|leaderboard|server` —
+  the grouped Minecraft economy and competitive game. Reward cooldowns persist
+  across restarts, transfers and forge purchases are transaction-safe, trade-ins
+  return 60%, and PvP includes strikes, shields, one golden-apple heal, surrender
+  rewards, rankings, and optional local voice effects. Abandoned fights release
+  their temporary voice connection after five minutes.
 - `/call <member> [reason]`, `/calls privacy|status|hangup`, and `a!hangup` —
   opt-in private calls. Invitations use DM buttons, only DM messages are relayed,
   attachments are bounded, and either participant can stop the relay immediately.

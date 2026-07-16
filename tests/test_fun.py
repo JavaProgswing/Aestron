@@ -22,12 +22,12 @@ def test_rate_is_repeatable_for_a_user_and_subject():
         ctx = SimpleNamespace(author=SimpleNamespace(id=123), send=AsyncMock())
 
         await FunGames.rate.callback(cog, ctx, subject="clean code")
-        first = ctx.send.await_args.args[0]
+        first = ctx.send.await_args.kwargs["embed"]
         await FunGames.rate.callback(cog, ctx, subject="clean   code")
-        second = ctx.send.await_args.args[0]
+        second = ctx.send.await_args.kwargs["embed"]
 
-        assert first == second
-        assert "/100" in first
+        assert first.description == second.description
+        assert "/100" in first.description
 
     asyncio.run(run_test())
 

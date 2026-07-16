@@ -255,66 +255,75 @@ class MCShopSelect(discord.ui.Select):
             "Diamond Armor": 20585,
             "Netherite Armor": 70650,
         }
-        async with client.database.pool.acquire() as con:
-            memberoneeco = await con.fetchrow(
-                "SELECT * FROM mceconomy WHERE memberid = $1", self.author.id
-            )
-        if memberoneeco is None:
-            statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
-            newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, self.author.id, 500, json.dumps(newjson))
-            async with client.database.pool.acquire() as con:
-                memberoneeco = await con.fetchrow(
-                    "SELECT * FROM mceconomy WHERE memberid = $1", self.author.id
-                )
-        balance = memberoneeco["balance"]
         price = pricelist[shopitem]
-        if balance < price:
-            await interaction.response.send_message(
-                content=f"The item {shopitem} costs {price} while you only have {balance} in your wallet.",
-                ephemeral=True,
+        default_inventory = {"orechoice": "Leather", "swordchoice": "Wooden"}
+        async with client.database.pool.acquire() as con, con.transaction():
+            memberoneeco = await con.fetchrow(
+                "SELECT balance, inventory FROM mceconomy "
+                "WHERE memberid = $1 FOR UPDATE",
+                self.author.id,
             )
-            return
-        else:
-            inventory = json.loads(memberoneeco["inventory"])
+            if memberoneeco is None:
+                await con.execute(
+                    "INSERT INTO mceconomy (memberid, balance, inventory) "
+                    "VALUES ($1, $2, $3)",
+                    self.author.id,
+                    1500,
+                    json.dumps(default_inventory),
+                )
+                balance = 1500
+                inventory = default_inventory.copy()
+            else:
+                balance = int(memberoneeco["balance"])
+                inventory = json.loads(memberoneeco["inventory"])
+
             if shopitem in orechoice:
                 if (inventory["orechoice"] + " Armor") == shopitem:
                     await interaction.response.send_message(
-                        content="You already have this item in your inventory!",
+                        content="That armor is already equipped.",
                         ephemeral=True,
                     )
                     return
                 refurname = f"{inventory['orechoice']} Armor"
-                refurprice = pricelist[(refurname)] - 300
-                await addmoney(interaction.channel, self.author.id, refurprice)
-                await interaction.response.send_message(
-                    content=f"You have successfully sold your old armor {refurname} for {refurprice} and successfully bought {shopitem} for {price}.",
-                    ephemeral=True,
-                )
                 inventory["orechoice"] = shopitem.split(" ")[0]
             elif shopitem in swordchoice:
                 if (inventory["swordchoice"] + " Sword") == shopitem:
                     await interaction.response.send_message(
-                        content="You already have this item in your inventory!",
+                        content="That sword is already equipped.",
                         ephemeral=True,
                     )
                     return
                 refurname = f"{inventory['swordchoice']} Sword"
-                refurprice = pricelist[(refurname)] - 300
-                await addmoney(interaction.channel, self.author.id, refurprice)
+                inventory["swordchoice"] = shopitem.split(" ")[0]
+            resale = round(pricelist[refurname] * 0.6)
+            net_price = max(price - resale, 0)
+            if balance < net_price:
                 await interaction.response.send_message(
-                    content=f"You have successfully sold your old sword {refurname} for {refurprice} and successfully bought {shopitem} for {price}.",
+                    content=(
+                        f"**{shopitem}** costs {price:,}. Your **{refurname}** "
+                        f"trades in for {resale:,}, so you need {net_price:,} but "
+                        f"only have {balance:,} emeralds."
+                    ),
                     ephemeral=True,
                 )
-                inventory["swordchoice"] = shopitem.split(" ")[0]
-            async with client.database.pool.acquire() as con:
-                await con.execute(
-                    "UPDATE mceconomy SET inventory = $1 WHERE memberid = $2",
-                    json.dumps(inventory),
-                    self.author.id,
-                )
-            await addmoney(interaction.channel, self.author.id, (-1 * price))
+                return
+            new_balance = balance - net_price
+            await con.execute(
+                "UPDATE mceconomy SET balance = $1, inventory = $2 WHERE memberid = $3",
+                new_balance,
+                json.dumps(inventory),
+                self.author.id,
+            )
+        embed = discord.Embed(
+            title="Equipment forged ⚒️",
+            description=f"Equipped **{shopitem}**.",
+            color=0x55FF55,
+        )
+        embed.add_field(name="Purchase price", value=f"{price:,} emeralds")
+        embed.add_field(name="Trade-in", value=f"{resale:,} emeralds")
+        embed.add_field(name="Paid", value=f"{net_price:,} emeralds")
+        embed.set_footer(text=f"New balance: {new_balance:,} emeralds")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class MCShop(discord.ui.View):
@@ -695,7 +704,7 @@ class Confirmpvp(discord.ui.View):
     # When the confirm button is pressed, set the inner value to `True` and
     # stop the View from listening to more input.
     # We also send the user an ephemeral _message that we're confirming their choice.
-    @discord.ui.button(label="⚔️Confirm", style=discord.ButtonStyle.green)
+    @discord.ui.button(label="Accept duel", emoji="⚔️", style=discord.ButtonStyle.green)
     async def confirm(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
@@ -705,13 +714,13 @@ class Confirmpvp(discord.ui.View):
             )
             return
         await interaction.response.send_message(
-            "⚔️Confirming this fight!", ephemeral=True
+            "Challenge accepted. Prepare your loadout!", ephemeral=True
         )
         self.value = True
         self.stop()
 
     # This one is similar to the confirmation button except sets the inner value to `False`
-    @discord.ui.button(label="🎌Decline", style=discord.ButtonStyle.red)
+    @discord.ui.button(label="Decline", emoji="🏳️", style=discord.ButtonStyle.red)
     async def decline(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
@@ -720,9 +729,7 @@ class Confirmpvp(discord.ui.View):
                 "This user hasn't challenged you to this fight⚔️!", ephemeral=True
             )
             return
-        await interaction.response.send_message(
-            "🎌Declining this fight!", ephemeral=True
-        )
+        await interaction.response.send_message("Challenge declined.", ephemeral=True)
         self.value = False
         self.stop()
 
@@ -1055,10 +1062,101 @@ async def restart(ctx):
 
 
 class MinecraftFun(commands.Cog):
-    """Minecraft game related fun commands"""
+    """Interactive Minecraft economy, equipment, server, and PvP commands."""
+
+    minecraft = app_commands.Group(
+        name="minecraft",
+        description="Minecraft economy, equipment, PvP, and server tools.",
+    )
+
+    def __init__(self, bot: commands.Bot) -> None:
+        """Store the bot used for database-backed setup."""
+        self.bot = bot
+
+    async def cog_load(self) -> None:
+        """Create restart-safe reward cooldown storage."""
+        if not self.bot.database.connected:
+            return
+        async with self.bot.database.pool.acquire() as con:
+            await con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS minecraft_reward_claims (
+                    memberid BIGINT NOT NULL,
+                    reward_type TEXT NOT NULL,
+                    claimed_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (memberid, reward_type)
+                )
+                """
+            )
+
+    async def _claim_reward(
+        self,
+        ctx: commands.Context,
+        *,
+        reward_type: str,
+        amount: int,
+        cooldown: timedelta,
+    ) -> None:
+        """Claim a voted reward atomically with a persistent cooldown."""
+        if not (await uservoted(ctx.author) or checkstaff(ctx.author)):
+            raise commands.BadArgument(
+                f"Vote first at https://top.gg/bot/{client.user.id}/vote, then try again."
+            )
+        now = discord.utils.utcnow()
+        default_inventory = json.dumps(
+            {"orechoice": "Leather", "swordchoice": "Wooden"}
+        )
+        async with client.database.pool.acquire() as con, con.transaction():
+            claim = await con.fetchrow(
+                "SELECT claimed_at FROM minecraft_reward_claims "
+                "WHERE memberid = $1 AND reward_type = $2 FOR UPDATE",
+                ctx.author.id,
+                reward_type,
+            )
+            if claim is not None:
+                available_at = claim["claimed_at"] + cooldown
+                if available_at > now:
+                    raise commands.BadArgument(
+                        f"Your {reward_type} reward resets "
+                        f"{discord.utils.format_dt(available_at, 'R')}."
+                    )
+            await con.execute(
+                "INSERT INTO mceconomy (memberid, balance, inventory) "
+                "VALUES ($1, $2, $3) ON CONFLICT (memberid) DO NOTHING",
+                ctx.author.id,
+                1500,
+                default_inventory,
+            )
+            await con.execute(
+                "UPDATE mceconomy SET balance = balance + $1 WHERE memberid = $2",
+                amount,
+                ctx.author.id,
+            )
+            await con.execute(
+                "INSERT INTO minecraft_reward_claims (memberid, reward_type, claimed_at) "
+                "VALUES ($1, $2, $3) ON CONFLICT (memberid, reward_type) "
+                "DO UPDATE SET claimed_at = EXCLUDED.claimed_at",
+                ctx.author.id,
+                reward_type,
+                now,
+            )
+            balance = await con.fetchval(
+                "SELECT balance FROM mceconomy WHERE memberid = $1", ctx.author.id
+            )
+        embed = discord.Embed(
+            title=f"{reward_type.title()} reward claimed 🎁",
+            description=f"**+{amount:,} emeralds** added to your account.",
+            color=0x55FF55,
+        )
+        embed.add_field(name="New balance", value=f"💚 {balance:,}")
+        embed.add_field(
+            name="Next claim", value=discord.utils.format_dt(now + cooldown, "R")
+        )
+        await ctx.send(embed=embed, ephemeral=True)
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
+        with_app_command=False,
         aliases=["bal", "money", "account", "bank"],
         brief="Show a member's Minecraft economy balance.",
         description="Show the selected member's current Minecraft game currency balance.",
@@ -1080,14 +1178,31 @@ class MinecraftFun(commands.Cog):
             async with client.database.pool.acquire() as con:
                 await con.execute(statement, member.id, 1500, json.dumps(newjson))
             oldbalance = 1500
-        embed = discord.Embed(
-            title=f"{member.name}'s balance", description=f"{oldbalance} currency"
+        tier = (
+            "Netherite tycoon"
+            if oldbalance >= 50_000
+            else "Diamond merchant"
+            if oldbalance >= 20_000
+            else "Iron trader"
+            if oldbalance >= 5_000
+            else "Village adventurer"
         )
+        embed = discord.Embed(
+            title=f"{member.display_name}'s emerald vault 💚",
+            description=f"# {oldbalance:,} emeralds",
+            color=0x55FF55,
+        )
+        embed.add_field(name="Economy tier", value=tier)
+        embed.add_field(
+            name="Quick actions",
+            value="`/minecraft shop` • `/minecraft pay`",
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
         await ctx.send(embed=embed, ephemeral=True)
 
-    @commands.cooldown(1, 604800, BucketType.member)
     @commands.hybrid_command(
         name="weekly",
+        with_app_command=False,
         brief="Claim the weekly Minecraft currency reward.",
         description=(
             "Claim 1,500 Minecraft currency after voting on Top.gg. "
@@ -1097,35 +1212,16 @@ class MinecraftFun(commands.Cog):
     )
     @commands.guild_only()
     async def voterewardweekly(self, ctx):
-        async with client.database.pool.acquire() as con:
-            memberoneeco = await con.fetchrow(
-                "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
-            )
-        if memberoneeco is None:
-            statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
-            newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.author.id, 1500, json.dumps(newjson))
-            async with client.database.pool.acquire() as con:
-                memberoneeco = await con.fetchrow(
-                    "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
-                )
-        if await uservoted(ctx.author) or checkstaff(ctx.author):
-            await ctx.send(
-                "Nice , you have claimed your weekly of 1500 for this week!",
-                ephemeral=True,
-            )
-            await addmoney(ctx, ctx.author.id, 1500)
-        else:
-            ctx.command.reset_cooldown(ctx)
-            await send_generic_error_embed(
-                ctx, error_data="You have not voted for this bot on top.gg!"
-            )
-            return
+        await self._claim_reward(
+            ctx,
+            reward_type="weekly",
+            amount=1_500,
+            cooldown=timedelta(days=7),
+        )
 
-    @commands.cooldown(1, 86400, BucketType.member)
     @commands.hybrid_command(
         name="daily",
+        with_app_command=False,
         brief="Claim the daily Minecraft currency reward.",
         description=(
             "Claim 150 Minecraft currency after voting on Top.gg. "
@@ -1135,38 +1231,17 @@ class MinecraftFun(commands.Cog):
     )
     @commands.guild_only()
     async def votereward(self, ctx):
-        async with client.database.pool.acquire() as con:
-            memberoneeco = await con.fetchrow(
-                "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
-            )
-        if memberoneeco is None:
-            statement = """INSERT INTO mceconomy (memberid,balance,inventory) VALUES($1,$2,$3);"""
-            newjson = {"orechoice": "Leather", "swordchoice": "Wooden"}
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, ctx.author.id, 1500, json.dumps(newjson))
-            async with client.database.pool.acquire() as con:
-                memberoneeco = await con.fetchrow(
-                    "SELECT * FROM mceconomy WHERE memberid = $1", ctx.author.id
-                )
-        if await uservoted(ctx.author) or checkstaff(ctx.author):
-            await ctx.send(
-                "Nice , you have claimed your daily of 150 for today!", ephemeral=True
-            )
-            await addmoney(ctx, ctx.author.id, 150)
-        else:
-            ctx.command.reset_cooldown(ctx)
-            await send_generic_error_embed(
-                ctx,
-                error_data=(
-                    "You have not voted for this bot on top.gg.\n"
-                    f"Vote at https://top.gg/bot/{client.user.id}/vote"
-                ),
-            )
-            return
+        await self._claim_reward(
+            ctx,
+            reward_type="daily",
+            amount=150,
+            cooldown=timedelta(days=1),
+        )
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
         name="pay",
+        with_app_command=False,
         aliases=["give"],
         brief="Transfer Minecraft currency to another member.",
         description=(
@@ -1237,14 +1312,23 @@ class MinecraftFun(commands.Cog):
                 price,
                 ctx.author.id,
             )
-        await ctx.send(
-            f"You have successfully paid {member.name}#{member.discriminator} , {price} currency.",
-            ephemeral=True,
+        receipt = discord.Embed(
+            title="Emerald transfer complete ✅",
+            description=(
+                f"{ctx.author.mention} sent {member.mention} **{price:,} emeralds**."
+            ),
+            color=0x55FF55,
+            timestamp=discord.utils.utcnow(),
         )
+        receipt.set_footer(
+            text=f"Transfer ID: {ctx.message.id if ctx.message else ctx.author.id}"
+        )
+        await ctx.send(embed=receipt)
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
-        name="pvpboard",
+        name="inventory",
+        with_app_command=False,
         aliases=["inv", "backpack", "bag", "items"],
         brief="Show a member's equipped Minecraft items.",
         description="Show the selected member's equipped armor and sword.",
@@ -1255,7 +1339,9 @@ class MinecraftFun(commands.Cog):
         if member is None:
             member = ctx.author
         embed = discord.Embed(
-            title=f"{member.name}'s Minecraft inventory", description="** **"
+            title=f"{member.display_name}'s loadout 🎒",
+            description="Equipment currently used in interactive PvP.",
+            color=0x55AA55,
         )
         async with client.database.pool.acquire() as con:
             memberoneeco = await con.fetchrow(
@@ -1291,12 +1377,43 @@ class MinecraftFun(commands.Cog):
         armoremoji = orechoiceemoji[armorname]
         swordname = inventory["swordchoice"]
         swordemoji = swordchoiceemoji[swordname]
-        embed.add_field(name="Armor", value=f"{armoremoji}{armorname} Armor")
-        embed.add_field(name="Sword", value=f"{swordemoji}{swordname} Sword")
+        armor_stats = {
+            "Netherite": 85,
+            "Diamond": 75,
+            "Iron": 55,
+            "Chainmail": 45,
+            "Golden": 40,
+            "Leather": 28,
+        }
+        sword_stats = {
+            "Netherite": 12,
+            "Diamond": 10,
+            "Iron": 9,
+            "Golden": 8.5,
+            "Stone": 8,
+            "Wooden": 5,
+        }
+        armor_power = armor_stats.get(armorname, 0)
+        sword_power = sword_stats.get(swordname, 0)
+        embed.add_field(
+            name="Armor",
+            value=f"{armoremoji} **{armorname} Armor**\n{armor_power}% resistance",
+        )
+        embed.add_field(
+            name="Weapon",
+            value=f"{swordemoji} **{swordname} Sword**\n{sword_power:g} base damage",
+        )
+        embed.add_field(
+            name="Power estimate",
+            value=f"⚔️ {sword_power * (1 + armor_power / 100):.1f}",
+            inline=False,
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
         await ctx.send(embed=embed, ephemeral=True)
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
+        with_app_command=False,
         brief="Open the interactive Minecraft equipment shop.",
         description="Buy and equip armor or swords using Minecraft game currency.",
         usage="",
@@ -1313,14 +1430,19 @@ class MinecraftFun(commands.Cog):
             async with client.database.pool.acquire() as con:
                 await con.execute(statement, ctx.author.id, 1500, json.dumps(newjson))
         embed = discord.Embed(
-            title="Minecraft shop",
-            description="Click on dropdown to view items and buy them!",
+            title="Minecraft equipment forge ⚒️",
+            description=(
+                "Select an item to inspect its price and upgrade your active PvP "
+                "loadout. Your previous item is automatically traded in at 60%."
+            ),
+            color=0xF0A830,
         )
         view = MCShop(ctx.author)
         view.set_message(await ctx.send(embed=embed, view=view, ephemeral=True))
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
+        with_app_command=False,
         brief="Challenge another member to a Minecraft-style fight.",
         description=(
             "Start an interactive text battle using both players' equipped Minecraft "
@@ -1412,8 +1534,13 @@ class MinecraftFun(commands.Cog):
         ]
         if not self_combat:
             embed = discord.Embed(
-                title="Pvp invitation",
-                description=f"{memberone.mention}(Challenger) vs {membertwo.mention}",
+                title="⚔️ Minecraft PvP challenge",
+                description=(
+                    f"{memberone.mention} challenges {membertwo.mention}.\n\n"
+                    "Accept to start a turn-based equipment battle with shields, "
+                    "critical hits, and one golden-apple heal each."
+                ),
+                color=0xF0A830,
             )
             embed.set_thumbnail(url=memberone.display_avatar.url)
             view = Confirmpvp(member=membertwo.id)
@@ -1455,8 +1582,12 @@ class MinecraftFun(commands.Cog):
                     "The fight will continue normally without voice effects."
                 )
         embed = discord.Embed(
-            title="Pvp challenge",
-            description=f"`{memberone.name}(Challenger) vs {membertwo.name}`",
+            title="⚔️ Minecraft PvP arena",
+            description=(
+                f"**{memberone.display_name}** versus **{membertwo.display_name}**\n"
+                "Choose Strike, Defend, Heal, or Surrender when it is your turn."
+            ),
+            color=0x55AA55,
         )
         embed.set_thumbnail(url=memberone.display_avatar.url)
         embed.add_field(
@@ -1504,7 +1635,7 @@ class MinecraftFun(commands.Cog):
             voice_effects,
         )
         fight_message = await ctx.send(
-            content=f"{memberone.mention}'s turn to fight!",
+            content=f"{memberone.mention}, choose your opening move!",
             embed=embed,
             view=fight_view,
         )
@@ -1512,6 +1643,9 @@ class MinecraftFun(commands.Cog):
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
+        name="mcleaderboard",
+        with_app_command=False,
+        aliases=["pvpboard", "pvpleaderboard"],
         brief="Show the Minecraft PvP wins leaderboard.",
         description="Rank members by recorded wins from interactive Minecraft PvP fights.",
         usage="",
@@ -1541,6 +1675,7 @@ class MinecraftFun(commands.Cog):
     @commands.cooldown(1, 120, BucketType.member)
     @commands.hybrid_command(
         name="mcstatus",
+        with_app_command=False,
         brief="Check the live status of a Minecraft Java server.",
         description="Resolve a Minecraft Java address and show latency, players, and version.",
         usage="<server address>",
@@ -1550,14 +1685,26 @@ class MinecraftFun(commands.Cog):
         try:
             server = await JavaServer.async_lookup(ip)
             status = await server.async_status()
-        except Exception:
-            embed_one = discord.Embed(title=ip, description="** **", color=Color.red())
-            embed_one.add_field(name="Server Status ", value=" Offline ", inline=True)
+        except (TimeoutError, OSError, ValueError) as error:
+            LOGGER.info("Minecraft server lookup failed address=%s error=%s", ip, error)
+            embed_one = discord.Embed(
+                title=f"🔴 {ip}",
+                description="The Java server did not answer the status request.",
+                color=Color.red(),
+            )
+            embed_one.add_field(name="Status", value="Offline or unreachable")
+            embed_one.set_footer(
+                text="Check the hostname and optional :port, then try again"
+            )
             await ctx.send(embed=embed_one, ephemeral=True)
             return
         description = status.motd.to_plain()
         info = description[:50] + (".." if len(description) > 50 else "")
-        embed_one = discord.Embed(title=f"{ip}", description=info, color=Color.green())
+        embed_one = discord.Embed(
+            title=f"🟢 {ip}",
+            description=info or "Online",
+            color=Color.green(),
+        )
 
         embed_one.add_field(
             name="Server Version ", value=f"{status.version.name}", inline=True
@@ -1567,7 +1714,107 @@ class MinecraftFun(commands.Cog):
         embed_one.add_field(
             name="Players Online ", value=status.players.online, inline=True
         )
+        embed_one.add_field(name="Capacity", value=status.players.max, inline=True)
+        sample = getattr(status.players, "sample", None) or []
+        if sample:
+            embed_one.add_field(
+                name="Players",
+                value=", ".join(player.name for player in sample[:10])[:1024],
+                inline=False,
+            )
+        embed_one.set_footer(text="Live Java status • mcstatus protocol")
         await ctx.send(embed=embed_one, ephemeral=True)
+
+    @staticmethod
+    async def _interaction_context(
+        interaction: discord.Interaction,
+    ) -> commands.Context:
+        """Adapt a grouped slash interaction to the maintained prefix callback."""
+        return await commands.Context.from_interaction(interaction)
+
+    @minecraft.command(name="balance", description="Show a member's emerald balance.")
+    async def slash_balance(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+    ) -> None:
+        """Show an economy balance through `/minecraft balance`."""
+        ctx = await self._interaction_context(interaction)
+        await self.balance.callback(self, ctx, member)
+
+    @minecraft.command(name="daily", description="Claim the daily emerald reward.")
+    async def slash_daily(self, interaction: discord.Interaction) -> None:
+        """Claim a daily reward through `/minecraft daily`."""
+        ctx = await self._interaction_context(interaction)
+        await self.votereward.callback(self, ctx)
+
+    @minecraft.command(name="weekly", description="Claim the weekly emerald reward.")
+    async def slash_weekly(self, interaction: discord.Interaction) -> None:
+        """Claim a weekly reward through `/minecraft weekly`."""
+        ctx = await self._interaction_context(interaction)
+        await self.voterewardweekly.callback(self, ctx)
+
+    @minecraft.command(name="pay", description="Transfer emeralds to another member.")
+    async def slash_pay(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        amount: app_commands.Range[int, 1, 1_000_000],
+    ) -> None:
+        """Transfer currency through `/minecraft pay`."""
+        ctx = await self._interaction_context(interaction)
+        await self.payment.callback(self, ctx, amount, member)
+
+    @minecraft.command(
+        name="inventory", description="Inspect equipped armor and sword."
+    )
+    async def slash_inventory(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+    ) -> None:
+        """Inspect equipment through `/minecraft inventory`."""
+        ctx = await self._interaction_context(interaction)
+        await self.inventory.callback(self, ctx, member)
+
+    @minecraft.command(name="shop", description="Open the interactive equipment shop.")
+    async def slash_shop(self, interaction: discord.Interaction) -> None:
+        """Open the shop through `/minecraft shop`."""
+        ctx = await self._interaction_context(interaction)
+        await self.shop.callback(self, ctx)
+
+    @minecraft.command(name="pvp", description="Challenge a member to interactive PvP.")
+    async def slash_pvp(
+        self,
+        interaction: discord.Interaction,
+        opponent: discord.Member,
+        sounds: bool = False,
+    ) -> None:
+        """Start PvP through `/minecraft pvp`, optionally with voice effects."""
+        ctx = await self._interaction_context(interaction)
+        voice_channel = None
+        voice_state = getattr(interaction.user, "voice", None)
+        if sounds and voice_state is not None:
+            voice_channel = voice_state.channel
+        if sounds and voice_channel is None:
+            raise commands.BadArgument(
+                "Join a voice channel before enabling Minecraft sounds."
+            )
+        await self.pvp.callback(self, ctx, opponent, voice_channel)
+
+    @minecraft.command(name="leaderboard", description="Show the PvP wins leaderboard.")
+    async def slash_leaderboard(self, interaction: discord.Interaction) -> None:
+        """Show PvP rankings through `/minecraft leaderboard`."""
+        ctx = await self._interaction_context(interaction)
+        await self.pvpleaderboard.callback(self, ctx)
+
+    @minecraft.command(name="server", description="Check a Minecraft Java server.")
+    async def slash_server(
+        self, interaction: discord.Interaction, address: str
+    ) -> None:
+        """Check a Java server through `/minecraft server`."""
+        ctx = await self._interaction_context(interaction)
+        await self.mcservercheck.callback(self, ctx, address)
 
 
 class Misc(commands.Cog):
@@ -2516,6 +2763,8 @@ class Minecraftpvp(discord.ui.View):
         self.membertwo_resistance = False
         self.memberone_resiscooldown = False
         self.membertwo_resiscooldown = False
+        self.memberone_heal_available = True
+        self.membertwo_heal_available = True
         self.vc = vc
         self.message = None
         super().__init__(timeout=300)
@@ -2547,47 +2796,36 @@ class Minecraftpvp(discord.ui.View):
     ):
         if interaction.user.id not in self.memberids:
             await interaction.response.send_message(
-                "You are not participating in this pvp fight!",
+                "You are spectating this fight, not participating in it.",
                 ephemeral=True,
             )
             return
+        if interaction.user.id == self.memberoneid:
+            loser_id, loser_name = self.memberoneid, self.memberonename
+            winner_id, winner_name = self.membertwoid, self.membertwoname
         else:
-            if interaction.user.id == self.memberoneid:
-                await interaction.response.send_message(
-                    f"You surrendered to {self.membertwoname} .", ephemeral=True
-                )
-                _message = interaction.message
-                if _message is not None:
-                    embed = _message.embeds[0]
-                    embed.description = f"`{self.memberonename} surrendered against {self.membertwoname}`"
-                    embed.set_field_at(
-                        index=0,
-                        name=f"{self.memberonename} surrendered!",
-                        value="🧧Tie",
-                    )
-                    embed.set_field_at(
-                        index=1, name=f"{self.membertwoname}", value="🧧Tie"
-                    )
-                    await _message.edit(content="** **", embed=embed, view=None)
-            elif interaction.user.id == self.membertwoid:
-                await interaction.response.send_message(
-                    f"You surrendered to {self.memberonename} .", ephemeral=True
-                )
-                _message = interaction.message
-                if _message is not None:
-                    embed = _message.embeds[0]
-                    embed.description = f"`{self.membertwoname} surrendered against {self.memberonename}`"
-                    embed.set_field_at(
-                        index=0, name=f"{self.memberonename}", value="🧧Tie"
-                    )
-                    embed.set_field_at(
-                        index=1,
-                        name=f"{self.membertwoname} surrendered!",
-                        value="🧧Tie",
-                    )
-                    await _message.edit(content="** **", embed=embed, view=None)
-            play_minecraft_sound(self.vc, "Event_raidhorn4.ogg")
-            self._finish()
+            loser_id, loser_name = self.membertwoid, self.membertwoname
+            winner_id, winner_name = self.memberoneid, self.memberonename
+        await interaction.response.send_message(
+            f"You surrendered. {winner_name} receives the victory.", ephemeral=True
+        )
+        await addmoney(interaction.channel, winner_id, 25)
+        await addmoney(interaction.channel, loser_id, 5)
+        async with client.database.pool.acquire() as con:
+            await con.execute(
+                "INSERT INTO leaderboard (mention) VALUES($1)", str(winner_id)
+            )
+        if interaction.message is not None:
+            embed = interaction.message.embeds[0]
+            embed.title = "PvP victory by surrender 🏳️"
+            embed.description = (
+                f"**{loser_name}** surrendered to **{winner_name}**.\n"
+                "Winner: +25 emeralds • Challenger: +5 emeralds"
+            )
+            embed.color = discord.Color.gold()
+            await interaction.message.edit(content=None, embed=embed, view=None)
+        play_minecraft_sound(self.vc, "Event_raidhorn4.ogg")
+        self._finish()
 
     @discord.ui.button(
         label="🛡️ Defend",
@@ -2641,6 +2879,84 @@ class Minecraftpvp(discord.ui.View):
             await interaction.response.send_message(
                 "You have equipped your shields.", ephemeral=True
             )
+
+    @discord.ui.button(
+        label="🍯 Heal",
+        style=discord.ButtonStyle.blurple,
+        custom_id="minecraftpvp:heal",
+    )
+    async def heal(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Consume the player's one golden-apple heal and end their turn."""
+        if interaction.user.id not in self.memberids:
+            await interaction.response.send_message(
+                "You are spectating this fight, not participating in it.",
+                ephemeral=True,
+            )
+            return
+        if interaction.user.id != self.moveturn:
+            await interaction.response.send_message(
+                "Wait for your turn before healing.", ephemeral=True
+            )
+            return
+        if interaction.user.id == self.memberoneid:
+            if not self.memberone_heal_available:
+                await interaction.response.send_message(
+                    "You already consumed your golden apple.", ephemeral=True
+                )
+                return
+            self.memberone_heal_available = False
+            before = self.memberone_healthpoint
+            self.memberone_healthpoint = min(
+                self.total_memberone_healthpoint,
+                self.memberone_healthpoint + self.total_memberone_healthpoint * 0.25,
+            )
+            health = self.memberone_healthpoint
+            total = self.total_memberone_healthpoint
+            field_index = 0
+            player_name = self.memberonename
+            self.moveturn = self.membertwoid
+        else:
+            if not self.membertwo_heal_available:
+                await interaction.response.send_message(
+                    "You already consumed your golden apple.", ephemeral=True
+                )
+                return
+            self.membertwo_heal_available = False
+            before = self.membertwo_healthpoint
+            self.membertwo_healthpoint = min(
+                self.total_membertwo_healthpoint,
+                self.membertwo_healthpoint + self.total_membertwo_healthpoint * 0.25,
+            )
+            health = self.membertwo_healthpoint
+            total = self.total_membertwo_healthpoint
+            field_index = 1
+            player_name = self.membertwoname
+            self.moveturn = self.memberoneid
+        restored = health - before
+        if interaction.message is not None:
+            embed = interaction.message.embeds[0]
+            embed.description = (
+                f"🍯 **{player_name}** consumed a golden apple and restored "
+                f"**{restored:.1f} health**."
+            )
+            embed.set_field_at(
+                field_index,
+                name=f"{player_name}'s health ({health:.1f}/{total:.1f} ❤️)",
+                value=get_progress(round(health / total * 100)),
+                inline=False,
+            )
+            await interaction.response.edit_message(
+                content=f"<@{self.moveturn}>, choose your move.",
+                embed=embed,
+                view=self,
+            )
+        else:
+            await interaction.response.send_message(
+                f"Restored {restored:.1f} health.", ephemeral=True
+            )
+        play_minecraft_sound(self.vc, "Random_levelup.ogg")
 
     @discord.ui.button(
         label="⚔️ Attack",
@@ -2949,15 +3265,55 @@ class CustomCommands(commands.Cog):
 
     async def _load_custom_commands(self):
         await self.bot.wait_until_ready()
-        async with client.database.pool.acquire() as con:
+        normalized_names: set[str] = set()
+        async with client.database.pool.acquire() as con, con.transaction():
             rows = await con.fetch(
-                "SELECT DISTINCT commandname FROM customcommands ORDER BY commandname"
+                "SELECT DISTINCT guildid, commandname FROM customcommands "
+                "ORDER BY guildid, commandname"
             )
-        for row in rows:
-            command_name = row["commandname"]
+            for row in rows:
+                stored_name = str(row["commandname"]).strip()
+                command_name = stored_name.casefold()
+                if not re.fullmatch(r"[a-z0-9_-]{1,32}", command_name):
+                    LOGGER.debug(
+                        "Ignored unsupported stored custom command guild=%s name=%r",
+                        row["guildid"],
+                        stored_name,
+                    )
+                    continue
+                if command_name != stored_name:
+                    existing = await con.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM customcommands "
+                        "WHERE guildid = $1 AND commandname = $2)",
+                        row["guildid"],
+                        command_name,
+                    )
+                    if existing:
+                        await con.execute(
+                            "DELETE FROM customcommands "
+                            "WHERE guildid = $1 AND commandname = $2",
+                            row["guildid"],
+                            stored_name,
+                        )
+                    else:
+                        await con.execute(
+                            "UPDATE customcommands SET commandname = $1 "
+                            "WHERE guildid = $2 AND commandname = $3",
+                            command_name,
+                            row["guildid"],
+                            stored_name,
+                        )
+                    LOGGER.info(
+                        "Normalized custom command guild=%s name=%r to %r",
+                        row["guildid"],
+                        stored_name,
+                        command_name,
+                    )
+                normalized_names.add(command_name)
+        for command_name in sorted(normalized_names):
             if not self._register_custom_command(command_name):
-                LOGGER.warning(
-                    "Skipped custom command %r because its name is already registered",
+                LOGGER.debug(
+                    "Custom command name=%r is shadowed by an existing command",
                     command_name,
                 )
 

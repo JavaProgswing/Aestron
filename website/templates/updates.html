@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Aestron updates — commands, fixes, and releases{% endblock %}
+{% block page_id %}updates{% endblock %}
+{% block content %}
+<section class="page-hero section-shell updates-hero">
+  <div>
+    <p class="eyebrow"><span></span>Release feed</p>
+    <h1>What changed.<br><em>What works better.</em></h1>
+    <p>Recent command additions, behavior fixes, and platform updates for the version currently serving this page.</p>
+  </div>
+</section>
+
+<section class="section-shell deployment-card glass-card reveal" aria-labelledby="deployment-title">
+  <div>
+    <span class="section-index">Running deployment</span>
+    <h2 id="deployment-title">Version {{ runtime.version }}</h2>
+    <p>Branch <code>{{ runtime.git_branch }}</code> · uptime {{ uptime_label }}</p>
+  </div>
+  <div class="deployment-revision">
+    <small>Git revision</small>
+    {% if runtime.git_commit_url %}
+      <a href="{{ runtime.git_commit_url }}" rel="noreferrer" target="_blank" aria-label="Open deployed Git commit {{ runtime.git_commit_short }}">
+        <code>{{ runtime.git_commit_short }}</code><span>View commit ↗</span>
+      </a>
+    {% else %}
+      <code>{{ runtime.git_commit_short }}</code>
+      <span>Commit link becomes available in a Git-backed deployment.</span>
+    {% endif %}
+  </div>
+</section>
+
+<section class="section-shell updates-feed" aria-label="Recent Aestron updates">
+  {% for update in updates %}
+  <article class="update-entry reveal">
+    <header>
+      <div>
+        <span class="update-category">{{ update.category }}</span>
+        <time datetime="{{ update.published }}">{{ update.published }}</time>
+      </div>
+      <h2>{{ update.title }}</h2>
+      <p>{{ update.summary }}</p>
+    </header>
+    <ul>
+      {% for detail in update.details %}<li>{{ detail }}</li>{% endfor %}
+    </ul>
+    {% if update.commands %}
+    <div class="command-chips" aria-label="Related commands">
+      {% for command in update.commands %}<code>{{ command }}</code>{% endfor %}
+    </div>
+    {% endif %}
+  </article>
+  {% endfor %}
+</section>
+{% endblock %}
