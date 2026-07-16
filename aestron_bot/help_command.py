@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 from pathlib import Path
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from .command_docs import command_invocation
 from .help_ui import (
+    HELP_CATEGORY_LAYOUT,
     HelpCategory,
     InteractiveHelpView,
     build_command_help_embed,
@@ -19,6 +22,214 @@ from .help_ui import (
 from .settings import RuntimeSettings
 
 LOGGER = logging.getLogger("aestron.help")
+
+
+async def _command_is_visible(
+    command: commands.Command,
+    context: commands.Context,
+) -> bool:
+    """Return whether a prefix command is usable in an interaction context."""
+    if command.hidden or not command.enabled:
+        return False
+    try:
+        return await command.can_run(context)
+    except commands.CommandError:
+        return False
+    except Exception:
+        LOGGER.debug(
+            "Command visibility check failed command=%s",
+            command.qualified_name,
+            exc_info=True,
+        )
+        return False
+
+
+async def _visible_categories(
+    bot: commands.Bot,
+    context: commands.Context,
+) -> list[HelpCategory]:
+    """Build the task-based help categories visible to one interaction user."""
+    grouped: dict[str, tuple[str, list[commands.Command]]] = {}
+    for command in sorted(bot.commands, key=lambda item: item.qualified_name):
+        if not await _command_is_visible(command, context):
+            continue
+        category_name, summary = help_category_for(command.cog_name or "Other")
+        if category_name not in grouped:
+            grouped[category_name] = (summary, [])
+        grouped[category_name][1].append(command)
+
+    return [
+        HelpCategory(
+            name=name,
+            description=summary,
+            commands=tuple(sorted(category_commands, key=lambda item: item.name)),
+        )
+        for name, (summary, category_commands) in grouped.items()
+    ]
+
+
+def _help_footer(
+    embed: discord.Embed,
+    settings: RuntimeSettings,
+    *,
+    icon_url: str | None = None,
+) -> None:
+    """Apply the shared version and support footer to a help response."""
+    footer = f"Aestron v{settings.version}"
+    if settings.support_server_invite:
+        footer += f" · Support: {settings.support_server_invite}"
+    embed.set_footer(text=footer, icon_url=icon_url)
+
+
+async def _display_prefix(
+    bot: commands.Bot,
+    context: commands.Context,
+    fallback: str,
+) -> str:
+    """Resolve the guild's configured prefix without exposing mention prefixes."""
+    try:
+        prefixes = await bot.get_prefix(context.message)
+    except Exception:
+        LOGGER.debug("Could not resolve guild prefix for slash help", exc_info=True)
+        return fallback
+    if isinstance(prefixes, str):
+        return prefixes
+    usable = [prefix for prefix in prefixes if not prefix.startswith("<@")]
+    return usable[-1] if usable else fallback
+
+
+class SlashHelp(commands.Cog, name="Help"):
+    """Expose the interactive help browser as a real slash command."""
+
+    def __init__(self, bot: commands.Bot) -> None:
+        """Store the bot used for command discovery and permission checks."""
+        self.bot = bot
+
+    def _settings(self) -> RuntimeSettings:
+        settings = getattr(self.bot, "runtime_settings", None)
+        return settings if settings is not None else RuntimeSettings.from_environment()
+
+    @app_commands.command(
+        name="help",
+        description="Browse command categories or view detailed command usage.",
+    )
+    @app_commands.describe(
+        topic="Optional command or category, such as play or Safety & Moderation."
+    )
+    async def slash_help(
+        self,
+        interaction: discord.Interaction,
+        topic: app_commands.Range[str, 1, 100] | None = None,
+    ) -> None:
+        """Show permission-aware help privately and acknowledge immediately."""
+        await interaction.response.defer(ephemeral=True)
+        context = await commands.Context.from_interaction(interaction)
+        categories = await _visible_categories(self.bot, context)
+        settings = self._settings()
+        prefix = await _display_prefix(self.bot, context, settings.default_prefix)
+        avatar_url = str(interaction.user.display_avatar)
+
+        if topic:
+            requested = " ".join(topic.split())
+            command = self.bot.get_command(requested.casefold())
+            if command is not None and await _command_is_visible(command, context):
+                embed = build_command_help_embed(command, prefix)
+                _help_footer(embed, settings, icon_url=avatar_url)
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            category = next(
+                (
+                    item
+                    for item in categories
+                    if item.name.casefold() == requested.casefold()
+                ),
+                None,
+            )
+            if category is None:
+                candidates = [item.name for item in categories]
+                candidates.extend(
+                    command.qualified_name
+                    for command in self.bot.walk_commands()
+                    if not command.hidden
+                )
+                suggestions = difflib.get_close_matches(
+                    requested,
+                    candidates,
+                    n=3,
+                    cutoff=0.45,
+                )
+                hint = (
+                    " Try " + ", ".join(f"`{item}`" for item in suggestions) + "."
+                    if suggestions
+                    else " Choose a category from `/help` instead."
+                )
+                await interaction.followup.send(
+                    f"I could not find `{requested}`.{hint}",
+                    ephemeral=True,
+                )
+                return
+            initial_category = category.name
+        else:
+            initial_category = None
+
+        command_count = sum(len(category.commands) for category in categories)
+        embed = discord.Embed(
+            title="Aestron help",
+            description=(
+                "Choose a category below, or use `/help topic:<command or category>` "
+                "for a direct answer. Prefix users can also run "
+                f"`{prefix}help`."
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="Available commands",
+            value=f"{command_count} commands visible to you · Aestron v{settings.version}",
+            inline=False,
+        )
+        _help_footer(embed, settings, icon_url=avatar_url)
+        view = InteractiveHelpView(
+            bot=self.bot,
+            author_id=interaction.user.id,
+            prefix=prefix,
+            home_embed=embed,
+            categories=categories,
+            initial_category=initial_category,
+        )
+        view.message = await interaction.followup.send(
+            embed=view.render(),
+            view=view,
+            ephemeral=True,
+            wait=True,
+        )
+
+    @slash_help.autocomplete("topic")
+    async def topic_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Suggest task categories and registered command paths."""
+        del interaction
+        candidates = [layout[0] for layout in HELP_CATEGORY_LAYOUT]
+        candidates.extend(
+            command.qualified_name
+            for command in self.bot.walk_commands()
+            if not command.hidden
+        )
+        needle = current.casefold().strip()
+        matching = sorted(
+            {candidate for candidate in candidates if needle in candidate.casefold()},
+            key=lambda candidate: (
+                not candidate.casefold().startswith(needle),
+                candidate,
+            ),
+        )
+        return [
+            app_commands.Choice(name=candidate[:100], value=candidate[:100])
+            for candidate in matching[:25]
+        ]
 
 
 class AestronHelpCommand(commands.HelpCommand):
@@ -51,11 +262,15 @@ class AestronHelpCommand(commands.HelpCommand):
 
     def _set_footer(self, embed: discord.Embed, text: str | None = None) -> None:
         settings = self._runtime_settings()
-        footer_text = text or f"Aestron v{settings.version}"
-        if settings.support_server_invite:
-            footer_text += f" · Support: {settings.support_server_invite}"
-        embed.set_footer(
-            text=footer_text,
+        if text is not None:
+            embed.set_footer(
+                text=text,
+                icon_url=str(self.context.author.display_avatar),
+            )
+            return
+        _help_footer(
+            embed,
+            settings,
             icon_url=str(self.context.author.display_avatar),
         )
 

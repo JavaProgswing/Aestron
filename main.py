@@ -51,7 +51,7 @@ from aestron_bot.community import Community
 from aestron_bot.feedback import Feedback
 from aestron_bot.fun import FunGames
 from aestron_bot.giveaways import Giveaways
-from aestron_bot.help_command import AestronHelpCommand
+from aestron_bot.help_command import AestronHelpCommand, SlashHelp
 from aestron_bot.info import AestronInfo
 from aestron_bot.leveling import Leveling
 from aestron_bot.minecraft_ui import (
@@ -390,6 +390,7 @@ def get_cog_types():
         AuditLogging,
         Moderation,
         AutoMod,
+        SlashHelp,
         ServerOnboarding,
         Templates,
         Tickets,

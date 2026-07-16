@@ -105,9 +105,10 @@ when the node has no working audio source.
 - `/voicehealth` — diagnose the Lavalink node and latest voice error.
 - `/stats` — show commands used, successful/failed invocations, current and
   historical guild activity, uptime, latency, process activity, and music health.
-- `/help` presents eight task-based categories instead of exposing internal cog
-  boundaries. Command details include canonical usage, option descriptions,
-  aliases, permissions, and grouped subcommands.
+- `/help` (or `/help topic:<command or category>`) privately presents eight
+  task-based categories instead of exposing internal cog boundaries. It
+  acknowledges immediately, supports autocomplete, and shares the same
+  interactive command details as `a!help`.
 - `/suggest <title> <details>` and `/reportbug <feature> <details>` — submit
   validated feedback to the shared website/admin queue.
 - `/valorant link` and `/valorant unlink` — secure opt-in Riot account linking.

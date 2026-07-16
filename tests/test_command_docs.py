@@ -86,6 +86,7 @@ def test_every_registered_command_has_complete_documentation():
                 "automod",
                 "community",
                 "fun",
+                "help",
                 "minecraft",
                 "social",
                 "valorant",

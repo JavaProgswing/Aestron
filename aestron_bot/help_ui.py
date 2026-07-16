@@ -16,7 +16,14 @@ HELP_CATEGORY_LAYOUT = (
     (
         "Start Here",
         "Bot information, help, support, feedback, and runtime statistics.",
-        {"AestronInfo", "ServerOnboarding", "Support", "Feedback", "Statistics"},
+        {
+            "AestronInfo",
+            "Help",
+            "ServerOnboarding",
+            "Support",
+            "Feedback",
+            "Statistics",
+        },
     ),
     (
         "Safety & Moderation",
