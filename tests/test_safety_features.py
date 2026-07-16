@@ -16,6 +16,9 @@ from aestron_bot.automod import (
     LINK_PATTERN,
     SPAM_MESSAGES,
     AutoMod,
+    AutoModChannelSelect,
+    AutoModPolicy,
+    AutoModSetupView,
 )
 from aestron_bot.calls import CallInviteView, Calls
 from aestron_bot.fun import (
@@ -28,6 +31,7 @@ from aestron_bot.fun import (
 from aestron_bot.giveaways import Giveaways, GiveawayView
 from aestron_bot.leveling import Leveling
 from aestron_bot.moderation import Moderation
+from aestron_bot.onboarding import ServerGuideView, ServerOnboarding
 from aestron_bot.profiles import build_profile_embed
 from aestron_bot.social import _render_wanted, _render_welcome
 from aestron_bot.templates import Templates, _template_code
@@ -38,7 +42,7 @@ from aestron_bot.tickets import (
     _safe_channel_name,
 )
 from aestron_bot.valorant import Valorant
-from aestron_bot.verification import Captcha, VerificationView
+from aestron_bot.verification import Captcha, VerificationSetupView, VerificationView
 
 
 def test_production_uses_maintained_safety_cogs():
@@ -50,6 +54,7 @@ def test_production_uses_maintained_safety_cogs():
     assert Templates in cog_types
     assert Captcha in cog_types
     assert AutoMod in cog_types
+    assert ServerOnboarding in cog_types
     assert Giveaways in cog_types
     assert Leveling in cog_types
     assert Calls in cog_types
@@ -58,6 +63,7 @@ def test_production_uses_maintained_safety_cogs():
         AntiRaid,
         AuditLogging,
         AutoMod,
+        ServerOnboarding,
         Tickets,
         Templates,
         Captcha,
@@ -257,6 +263,7 @@ def test_safety_slash_groups_are_compact_and_complete():
     }
     assert {command.name for command in AutoMod.automod.commands} == {
         "set",
+        "setup",
         "status",
     }
     assert {command.name for command in Leveling.leveling.commands} == {
@@ -287,6 +294,10 @@ def test_automod_has_native_link_and_spam_enforcement():
     for _ in range(SPAM_MESSAGES - 1):
         assert not cog._is_spam(message)
     assert cog._is_spam(message)
+    custom = AutoModPolicy(spam_messages=3, spam_window_seconds=30)
+    for _ in range(2):
+        assert not cog._is_spam(message, custom)
+    assert cog._is_spam(message, custom)
 
 
 def test_fun_leveling_and_minecraft_regressions_are_registered():
@@ -398,6 +409,28 @@ def test_ticket_views_are_persistent_and_channel_names_are_safe():
     }
     assert _safe_channel_name(" JPR Coder!! ") == "jpr-coder"
     assert _safe_channel_name("✨") == "member"
+
+
+def test_guided_safety_setup_is_multi_channel_and_restart_safe():
+    """Guides cover multiple channel types while public buttons survive restarts."""
+    automod_source = inspect.getsource(AutoModSetupView)
+    verification_source = inspect.getsource(VerificationSetupView)
+    assert "max_values=25" in inspect.getsource(AutoModChannelSelect)
+    assert "configure_channels" in automod_source
+    assert "Use all public" in verification_source
+    setup_source = inspect.getsource(Captcha._setup)
+    assert "onboarding_default_ids" in setup_source
+    assert setup_source.index('reason="Aestron verified access"') < setup_source.index(
+        'reason="Aestron verification public-channel lock"'
+    )
+    guide = ServerGuideView()
+    assert guide.timeout is None
+    assert {item.custom_id for item in guide.children} == {
+        "aestron:guide:automod:v1",
+        "aestron:guide:verification:v1",
+        "aestron:guide:tickets:v1",
+        "aestron:guide:overview:v1",
+    }
 
 
 def test_verification_button_is_restart_safe_and_template_urls_are_validated():

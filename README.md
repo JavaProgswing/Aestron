@@ -133,19 +133,29 @@ when the node has no working audio source.
 - `/antiraid enable|disable|status|configure` — configure a bounded destructive
   audit-event window and choose log-only or dangerous-role removal. Bot owners, the
   guild owner, and managed roles are protected from automated action.
-- `/automod set|status` — enable spam, link/invite, or Perspective-backed
-  profanity filtering per channel and inspect required permissions. Actions use
-  Discord-native timeouts, notify the member privately when DMs are available,
-  and appear in the event log.
+- `/automod setup|set|status` — apply one persistent policy to as many as 25
+  text, announcement, forum/media, voice, or stage channels at once, or make a
+  single-channel adjustment. Spam count/window, timeout length, and Perspective
+  profanity threshold are configurable per channel. Forum/media policies cover
+  messages inside their posts. Actions use Discord-native timeouts, private
+  notices when DMs are available, and the configured event log.
 - `/logs setup|disable|overview` — configure audit/event output and inspect
   permission health, recent event counts, anti-raid state, AutoMod coverage,
   verification, active tickets, and active giveaways.
 - `/ticket setup|claim|lock|transcript|close|add|remove` — create a restart-safe
-  ticket panel and manage its channels. Opening is concurrency-safe, transcripts
-  are delivered privately, and closed tickets are archived instead of silently
-  deleted.
+  panel in a text, announcement, forum, or media channel. Setup can create a
+  non-mentionable Support Team role, Support Tickets category, and private log
+  automatically. Opening is concurrency-safe, transcripts are delivered
+  privately, and closed tickets are archived instead of silently deleted.
 - `/verification setup|status|disable|access|start` — configure a persistent
-  verification panel and issue each member a private, expiring CAPTCHA.
+  verification panel and issue each member a private, expiring CAPTCHA. Guided
+  setup creates or reuses the Verified role, auto-selects channels currently
+  visible to members, supports every guild channel type, and shows the access
+  plan before applying it. Community Onboarding default channels are detected,
+  reported, and left public because Discord requires them for Onboarding.
+- `/serverguide` — reopen the permission-aware setup guide sent when Aestron
+  joins. It recommends logging, AutoMod, verification, and ticket setup in a safe
+  order without enabling disruptive features automatically.
 - `/leveling rank|leaderboard|configure` — inspect progress or configure a
   channel. Only one message per member every 15 seconds earns progress.
 - `/giveaway start|end|reroll|status` — run database-backed button giveaways
@@ -293,6 +303,10 @@ CREATE TABLE profanechannels
 (channelid bigint PRIMARY KEY);
 CREATE TABLE linkchannels
 (channelid bigint PRIMARY KEY);
+CREATE TABLE automod_channel_settings
+(channel_id bigint PRIMARY KEY, guild_id bigint, spam_messages smallint,
+ spam_window_seconds smallint, timeout_seconds integer,
+ profanity_threshold real, updated_at timestamptz);
 CREATE TABLE levelsettings
 (setting boolean ,channelid bigint PRIMARY KEY);
 CREATE TABLE verifymsg

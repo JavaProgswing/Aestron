@@ -6,6 +6,7 @@ import collections
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import timedelta
 
 import aiohttp
@@ -43,6 +44,203 @@ FEATURE_QUERIES = {
         "DELETE FROM profanechannels WHERE channelid = $1",
     ),
 }
+FEATURE_WRITE_QUERIES = {
+    "spam": (
+        "INSERT INTO spamchannels (channelid) VALUES ($1) "
+        "ON CONFLICT (channelid) DO NOTHING",
+        "DELETE FROM spamchannels WHERE channelid = $1",
+    ),
+    "links": (
+        "INSERT INTO linkchannels (channelid) VALUES ($1) "
+        "ON CONFLICT (channelid) DO NOTHING",
+        "DELETE FROM linkchannels WHERE channelid = $1",
+    ),
+    "profanity": (
+        "INSERT INTO profanechannels (channelid) VALUES ($1) "
+        "ON CONFLICT (channelid) DO NOTHING",
+        "DELETE FROM profanechannels WHERE channelid = $1",
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class AutoModPolicy:
+    """Resolved per-channel filters and enforcement thresholds."""
+
+    spam: bool = False
+    links: bool = False
+    profanity: bool = False
+    spam_messages: int = SPAM_MESSAGES
+    spam_window_seconds: int = SPAM_WINDOW_SECONDS
+    timeout_seconds: int = ACTION_TIMEOUT_MINUTES * 60
+    profanity_threshold: float = 0.45
+
+    @property
+    def states(self) -> dict[str, bool]:
+        """Return filter switches keyed by their public feature names."""
+        return {
+            "spam": self.spam,
+            "links": self.links,
+            "profanity": self.profanity,
+        }
+
+
+class AutoModChannelSelect(discord.ui.ChannelSelect):
+    """Select message-capable channels that should receive one policy."""
+
+    def __init__(self, current_channel: discord.abc.GuildChannel) -> None:
+        """Default the multi-channel selector to the invoking channel."""
+        super().__init__(
+            channel_types=[
+                discord.ChannelType.text,
+                discord.ChannelType.news,
+                discord.ChannelType.forum,
+                discord.ChannelType.media,
+                discord.ChannelType.voice,
+                discord.ChannelType.stage_voice,
+            ],
+            placeholder="Choose up to 25 channels",
+            min_values=1,
+            max_values=25,
+            default_values=[discord.SelectDefaultValue.from_channel(current_channel)],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """Store the current selection and refresh its private preview."""
+        view = self.view
+        if not isinstance(view, AutoModSetupView):
+            return
+        view.channel_ids = {channel.id for channel in self.values}
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+
+class AutoModSetupView(discord.ui.View):
+    """Ephemeral bulk AutoMod setup owned by one administrator."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        current_channel: discord.abc.GuildChannel,
+        policy: AutoModPolicy,
+    ) -> None:
+        """Build a five-minute setup session for one administrator."""
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.channel_ids = {current_channel.id}
+        self.policy = policy
+        self.add_item(AutoModChannelSelect(current_channel))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Reject attempts to modify another administrator's setup."""
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "Only the administrator who opened this setup can use it.", ephemeral=True
+        )
+        return False
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        """Acknowledge setup failures instead of leaving a timed-out interaction."""
+        LOGGER.error(
+            "AutoMod setup interaction failed guild=%s item=%s",
+            interaction.guild_id,
+            getattr(item, "custom_id", None),
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        message = (
+            str(error)
+            if isinstance(error, (commands.CommandError, discord.HTTPException))
+            else "AutoMod setup failed unexpectedly. Check the bot logs and permissions."
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(message[:1900], ephemeral=True)
+        else:
+            await interaction.response.send_message(message[:1900], ephemeral=True)
+
+    def embed(self) -> discord.Embed:
+        """Render the selected scope and complete policy before applying it."""
+        enabled = [name.title() for name, state in self.policy.states.items() if state]
+        embed = discord.Embed(
+            title="AutoMod bulk setup",
+            description=(
+                f"Selected **{len(self.channel_ids)}** channel(s). Choose channels "
+                "above, review the policy, then apply it."
+            ),
+            color=0x5865F2,
+        )
+        embed.add_field(
+            name="Filters", value=", ".join(enabled) or "No filters enabled"
+        )
+        embed.add_field(
+            name="Spam",
+            value=(
+                f"{self.policy.spam_messages} messages in "
+                f"{self.policy.spam_window_seconds}s"
+            ),
+        )
+        embed.add_field(
+            name="Action",
+            value=(
+                f"{self.policy.timeout_seconds // 60} minute timeout"
+                if self.policy.timeout_seconds
+                else "Delete and warn only"
+            ),
+        )
+        embed.add_field(
+            name="Profanity threshold",
+            value=f"{self.policy.profanity_threshold:.0%}",
+        )
+        embed.set_footer(
+            text="This configuration is persistent and can be changed later"
+        )
+        return embed
+
+    @discord.ui.button(label="Apply policy", style=discord.ButtonStyle.success, row=1)
+    async def apply(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Persist the policy for every selected channel."""
+        cog = interaction.client.get_cog("AutoMod")
+        if cog is None or interaction.guild is None:
+            await interaction.response.send_message(
+                "AutoMod is unavailable right now.", ephemeral=True
+            )
+            return
+        channels = [
+            interaction.guild.get_channel(channel_id) for channel_id in self.channel_ids
+        ]
+        guild_channels = [
+            channel
+            for channel in channels
+            if isinstance(channel, discord.abc.GuildChannel)
+        ]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await cog.configure_channels(
+            interaction.guild, guild_channels, self.policy, interaction.user
+        )
+        self.stop()
+        await interaction.edit_original_response(
+            content=f"AutoMod policy applied to {len(guild_channels)} channel(s).",
+            embed=None,
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Close the setup without changing persistent configuration."""
+        self.stop()
+        await interaction.response.edit_message(
+            content="AutoMod setup cancelled.", embed=None, view=None
+        )
 
 
 class AutoMod(commands.Cog):
@@ -55,7 +253,7 @@ class AutoMod(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         """Store the bot used for database configuration and audit events."""
         self.bot = bot
-        self._state_cache: dict[int, tuple[float, dict[str, bool]]] = {}
+        self._state_cache: dict[int, tuple[float, AutoModPolicy]] = {}
         self._message_windows: dict[tuple[int, int, int], collections.deque[float]] = {}
 
     async def cog_load(self) -> None:
@@ -67,6 +265,23 @@ class AutoMod(commands.Cog):
                 await connection.execute(
                     f"CREATE TABLE IF NOT EXISTS {table} (channelid BIGINT PRIMARY KEY)"
                 )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS automod_channel_settings (
+                    channel_id BIGINT PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    spam_messages SMALLINT NOT NULL DEFAULT 6
+                        CHECK (spam_messages BETWEEN 3 AND 20),
+                    spam_window_seconds SMALLINT NOT NULL DEFAULT 7
+                        CHECK (spam_window_seconds BETWEEN 3 AND 60),
+                    timeout_seconds INTEGER NOT NULL DEFAULT 300
+                        CHECK (timeout_seconds BETWEEN 0 AND 86400),
+                    profanity_threshold REAL NOT NULL DEFAULT 0.45
+                        CHECK (profanity_threshold BETWEEN 0.1 AND 1.0),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
 
     @staticmethod
     def _table(feature: str) -> str:
@@ -78,10 +293,14 @@ class AutoMod(commands.Cog):
             ) from error
 
     async def _enabled(self, channel_id: int, feature: str) -> bool:
-        return (await self._states(channel_id))[feature]
+        return (await self._policy(channel_id)).states[feature]
 
     async def _states(self, channel_id: int) -> dict[str, bool]:
-        """Return all filter states with a short cache to avoid per-message churn."""
+        """Return all feature states for compatibility with status consumers."""
+        return (await self._policy(channel_id)).states
+
+    async def _policy(self, channel_id: int) -> AutoModPolicy:
+        """Return one complete policy with a short per-channel cache."""
         cached = self._state_cache.get(channel_id)
         now = time.monotonic()
         if cached and cached[0] > now:
@@ -92,15 +311,36 @@ class AutoMod(commands.Cog):
                 "EXISTS(SELECT 1 FROM spamchannels WHERE channelid = $1) AS spam, "
                 "EXISTS(SELECT 1 FROM linkchannels WHERE channelid = $1) AS links, "
                 "EXISTS(SELECT 1 FROM profanechannels WHERE channelid = $1) "
-                "AS profanity",
+                "AS profanity, settings.spam_messages, "
+                "settings.spam_window_seconds, settings.timeout_seconds, "
+                "settings.profanity_threshold FROM (SELECT $1::BIGINT AS channel_id) "
+                "selected LEFT JOIN automod_channel_settings settings "
+                "ON settings.channel_id = selected.channel_id",
                 channel_id,
             )
-        states = {
-            feature: bool(row[feature]) if row is not None else False
-            for feature in FEATURE_TABLES
-        }
-        self._state_cache[channel_id] = (now + 30, states)
-        return states
+        policy = AutoModPolicy(
+            spam=bool(row["spam"]) if row else False,
+            links=bool(row["links"]) if row else False,
+            profanity=bool(row["profanity"]) if row else False,
+            spam_messages=int(row["spam_messages"] or SPAM_MESSAGES)
+            if row
+            else SPAM_MESSAGES,
+            spam_window_seconds=(
+                int(row["spam_window_seconds"] or SPAM_WINDOW_SECONDS)
+                if row
+                else SPAM_WINDOW_SECONDS
+            ),
+            timeout_seconds=(
+                int(row["timeout_seconds"])
+                if row and row["timeout_seconds"] is not None
+                else ACTION_TIMEOUT_MINUTES * 60
+            ),
+            profanity_threshold=(
+                float(row["profanity_threshold"] or 0.45) if row else 0.45
+            ),
+        )
+        self._state_cache[channel_id] = (now + 30, policy)
+        return policy
 
     async def _set(
         self,
@@ -115,6 +355,12 @@ class AutoMod(commands.Cog):
         self._table(feature)
         select_query, insert_query, delete_query = FEATURE_QUERIES[feature]
         async with self.bot.database.pool.acquire() as connection:
+            await connection.execute(
+                "INSERT INTO automod_channel_settings (channel_id, guild_id) "
+                "VALUES ($1, $2) ON CONFLICT (channel_id) DO NOTHING",
+                channel.id,
+                guild.id,
+            )
             if enabled:
                 exists = await connection.fetchval(select_query, channel.id)
                 if not exists:
@@ -140,14 +386,80 @@ class AutoMod(commands.Cog):
                     "Could not log AutoMod configuration guild=%s", guild.id
                 )
 
+    async def configure_channels(
+        self,
+        guild: discord.Guild,
+        channels: list[discord.abc.GuildChannel],
+        policy: AutoModPolicy,
+        actor: discord.abc.User,
+    ) -> None:
+        """Apply one validated policy to several channels in one transaction."""
+        if not channels:
+            raise commands.BadArgument("Select at least one supported server channel.")
+        if any(channel.guild.id != guild.id for channel in channels):
+            raise commands.BadArgument("Every channel must belong to this server.")
+        if not (
+            3 <= policy.spam_messages <= 20
+            and 3 <= policy.spam_window_seconds <= 60
+            and 0 <= policy.timeout_seconds <= 86_400
+            and 0.1 <= policy.profanity_threshold <= 1.0
+        ):
+            raise commands.BadArgument("One or more AutoMod policy values are invalid.")
+        async with self.bot.database.pool.acquire() as connection:
+            async with connection.transaction():
+                for channel in channels:
+                    await connection.execute(
+                        "INSERT INTO automod_channel_settings "
+                        "(channel_id, guild_id, spam_messages, spam_window_seconds, "
+                        "timeout_seconds, profanity_threshold) "
+                        "VALUES ($1, $2, $3, $4, $5, $6) "
+                        "ON CONFLICT (channel_id) DO UPDATE SET "
+                        "guild_id = EXCLUDED.guild_id, "
+                        "spam_messages = EXCLUDED.spam_messages, "
+                        "spam_window_seconds = EXCLUDED.spam_window_seconds, "
+                        "timeout_seconds = EXCLUDED.timeout_seconds, "
+                        "profanity_threshold = EXCLUDED.profanity_threshold, "
+                        "updated_at = NOW()",
+                        channel.id,
+                        guild.id,
+                        policy.spam_messages,
+                        policy.spam_window_seconds,
+                        policy.timeout_seconds,
+                        policy.profanity_threshold,
+                    )
+                    for feature, enabled in policy.states.items():
+                        self._table(feature)
+                        insert_query, delete_query = FEATURE_WRITE_QUERIES[feature]
+                        if enabled:
+                            await connection.execute(insert_query, channel.id)
+                        else:
+                            await connection.execute(delete_query, channel.id)
+                    self._state_cache.pop(channel.id, None)
+        audit_logging = self.bot.get_cog("AuditLogging")
+        if audit_logging is not None:
+            try:
+                await audit_logging.dispatch(
+                    guild,
+                    kind="automod_config",
+                    title="Bulk AutoMod policy applied",
+                    target=", ".join(channel.mention for channel in channels)[:1000],
+                    actor_override=actor,
+                    reason_override=(
+                        f"Filters: {', '.join(name for name, enabled in policy.states.items() if enabled) or 'none'}; "
+                        f"spam={policy.spam_messages}/{policy.spam_window_seconds}s; "
+                        f"timeout={policy.timeout_seconds}s"
+                    ),
+                    color=discord.Color.orange(),
+                )
+            except Exception:
+                LOGGER.exception("Could not log bulk AutoMod setup guild=%s", guild.id)
+
     async def status_embed(
         self, guild: discord.Guild, channel: discord.TextChannel
     ) -> discord.Embed:
         """Show enabled filters and permission readiness for one channel."""
-        states = {
-            feature: await self._enabled(channel.id, feature)
-            for feature in FEATURE_TABLES
-        }
+        policy = await self._policy(channel.id)
+        states = policy.states
         bot_member = guild.me
         permissions = channel.permissions_for(bot_member) if bot_member else None
         missing = [
@@ -182,6 +494,15 @@ class AutoMod(commands.Cog):
             value="Ready" if not missing else "Missing: " + ", ".join(missing),
             inline=False,
         )
+        embed.add_field(
+            name="Policy",
+            value=(
+                f"Spam: **{policy.spam_messages} messages/{policy.spam_window_seconds}s** · "
+                f"Timeout: **{policy.timeout_seconds // 60}m** · "
+                f"Profanity: **{policy.profanity_threshold:.0%}**"
+            ),
+            inline=False,
+        )
         embed.set_footer(text="Use /automod set to change a filter")
         return embed
 
@@ -196,22 +517,24 @@ class AutoMod(commands.Cog):
             or member.guild_permissions.manage_guild
         )
 
-    def _is_spam(self, message: discord.Message) -> bool:
-        """Track a bounded seven-second message window per member and channel."""
+    def _is_spam(
+        self, message: discord.Message, policy: AutoModPolicy = AutoModPolicy()
+    ) -> bool:
+        """Track a bounded per-policy message window per member and channel."""
         key = (message.guild.id, message.channel.id, message.author.id)
         now = time.monotonic()
         window = self._message_windows.setdefault(key, collections.deque())
-        while window and window[0] <= now - SPAM_WINDOW_SECONDS:
+        while window and window[0] <= now - policy.spam_window_seconds:
             window.popleft()
         window.append(now)
-        if len(window) < SPAM_MESSAGES:
+        if len(window) < policy.spam_messages:
             return False
         window.clear()
         if len(self._message_windows) > 10_000:
             self._message_windows = {
                 item_key: timestamps
                 for item_key, timestamps in self._message_windows.items()
-                if timestamps and timestamps[-1] > now - SPAM_WINDOW_SECONDS
+                if timestamps and timestamps[-1] > now - policy.spam_window_seconds
             }
         return True
 
@@ -250,12 +573,17 @@ class AutoMod(commands.Cog):
             LOGGER.warning("Perspective API returned an unexpected response")
             return None
 
-    async def _notify(self, message: discord.Message, reason: str) -> None:
+    async def _notify(
+        self, message: discord.Message, reason: str, *, timeout_seconds: int
+    ) -> None:
         notice = (
             f"Your message in **{message.guild.name}** was removed by AutoMod "
-            f"for **{reason}**. A {ACTION_TIMEOUT_MINUTES}-minute timeout may "
-            "also have been applied."
+            f"for **{reason}**."
         )
+        if timeout_seconds:
+            notice += (
+                f" A {timeout_seconds // 60}-minute timeout may also have been applied."
+            )
         try:
             await message.author.send(notice)
             return
@@ -274,7 +602,9 @@ class AutoMod(commands.Cog):
                 message.author.id,
             )
 
-    async def _enforce(self, message: discord.Message, reason: str) -> None:
+    async def _enforce(
+        self, message: discord.Message, reason: str, *, timeout_seconds: int
+    ) -> None:
         """Delete the message, apply a native timeout, notify, and record the action."""
         try:
             await message.delete()
@@ -289,13 +619,14 @@ class AutoMod(commands.Cog):
         bot_member = message.guild.me
         if (
             isinstance(member, discord.Member)
+            and timeout_seconds > 0
             and bot_member is not None
             and bot_member.guild_permissions.moderate_members
             and member.top_role < bot_member.top_role
         ):
             try:
                 await member.timeout(
-                    discord.utils.utcnow() + timedelta(minutes=ACTION_TIMEOUT_MINUTES),
+                    discord.utils.utcnow() + timedelta(seconds=timeout_seconds),
                     reason=f"Aestron AutoMod: {reason}",
                 )
             except (discord.Forbidden, discord.HTTPException):
@@ -304,7 +635,7 @@ class AutoMod(commands.Cog):
                     message.guild.id,
                     member.id,
                 )
-        await self._notify(message, reason)
+        await self._notify(message, reason, timeout_seconds=timeout_seconds)
         audit_logging = self.bot.get_cog("AuditLogging")
         if audit_logging is not None:
             try:
@@ -327,27 +658,42 @@ class AutoMod(commands.Cog):
         self, message: discord.Message, *, edited: bool = False
     ) -> None:
         """Evaluate one new or edited guild message against configured filters."""
+        channel = message.channel
+        policy_channel = (
+            channel.parent if isinstance(channel, discord.Thread) else channel
+        )
         if (
             message.guild is None
-            or not isinstance(message.channel, discord.TextChannel)
+            or not isinstance(policy_channel, discord.abc.GuildChannel)
             or self._exempt(message)
             or not self.bot.database.connected
         ):
             return
-        states = await self._states(message.channel.id)
+        policy = await self._policy(policy_channel.id)
+        states = policy.states
         if states["links"] and LINK_PATTERN.search(message.content):
-            await self._enforce(message, "a blocked link or invite")
-            return
-        if not edited and states["spam"] and self._is_spam(message):
             await self._enforce(
                 message,
-                f"message spam ({SPAM_MESSAGES} messages/{SPAM_WINDOW_SECONDS}s)",
+                "a blocked link or invite",
+                timeout_seconds=policy.timeout_seconds,
+            )
+            return
+        if not edited and states["spam"] and self._is_spam(message, policy):
+            await self._enforce(
+                message,
+                f"message spam ({policy.spam_messages} messages/"
+                f"{policy.spam_window_seconds}s)",
+                timeout_seconds=policy.timeout_seconds,
             )
             return
         if states["profanity"]:
             score = await self._profanity_score(message.content)
-            if score is not None and score >= 0.45:
-                await self._enforce(message, "profanity")
+            if score is not None and score >= policy.profanity_threshold:
+                await self._enforce(
+                    message,
+                    "profanity",
+                    timeout_seconds=policy.timeout_seconds,
+                )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -439,6 +785,49 @@ class AutoMod(commands.Cog):
         if not isinstance(target, discord.TextChannel):
             raise commands.BadArgument("Choose a text channel.")
         await ctx.send(embed=await self.status_embed(ctx.guild, target), ephemeral=True)
+
+    @automod.command(
+        name="setup", description="Configure one policy across several channels."
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.checks.cooldown(1, 20, key=lambda interaction: interaction.guild_id)
+    async def slash_setup(
+        self,
+        interaction: discord.Interaction,
+        spam: bool = True,
+        links: bool = True,
+        profanity: bool = False,
+        spam_messages: app_commands.Range[int, 3, 20] = SPAM_MESSAGES,
+        spam_window_seconds: app_commands.Range[int, 3, 60] = SPAM_WINDOW_SECONDS,
+        timeout_minutes: app_commands.Range[int, 0, 1440] = ACTION_TIMEOUT_MINUTES,
+        profanity_threshold: app_commands.Range[float, 0.1, 1.0] = 0.45,
+    ) -> None:
+        """Open a channel selector for one complete, persistent policy."""
+        if interaction.guild is None or not isinstance(
+            interaction.channel, discord.abc.GuildChannel
+        ):
+            await interaction.response.send_message(
+                "Run this setup inside a server channel.", ephemeral=True
+            )
+            return
+        policy = AutoModPolicy(
+            spam=spam,
+            links=links,
+            profanity=profanity,
+            spam_messages=spam_messages,
+            spam_window_seconds=spam_window_seconds,
+            timeout_seconds=timeout_minutes * 60,
+            profanity_threshold=profanity_threshold,
+        )
+        view = AutoModSetupView(
+            owner_id=interaction.user.id,
+            current_channel=interaction.channel,
+            policy=policy,
+        )
+        await interaction.response.send_message(
+            embed=view.embed(), view=view, ephemeral=True
+        )
 
     @automod.command(name="set", description="Enable or disable a channel filter.")
     @app_commands.default_permissions(manage_guild=True)

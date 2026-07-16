@@ -8,6 +8,7 @@ import io
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import UTC
 
 import discord
@@ -15,6 +16,16 @@ from discord import app_commands
 from discord.ext import commands
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class TicketSetupResult:
+    """Resources created or reused by guided ticket setup."""
+
+    panel: discord.Message
+    support_role: discord.Role
+    category: discord.CategoryChannel
+    log_channel: discord.TextChannel
 
 
 def _safe_channel_name(name: str) -> str:
@@ -262,21 +273,88 @@ class Tickets(commands.Cog):
     async def setup_panel(
         self,
         guild: discord.Guild,
-        channel: discord.TextChannel,
-        support_role: discord.Role,
+        channel: discord.TextChannel | discord.ForumChannel,
+        support_role: discord.Role | None,
         category: discord.CategoryChannel | None,
+        log_channel: discord.TextChannel | None,
         message: str,
-    ) -> discord.Message:
-        """Create and persist one ticket panel."""
-        if channel.guild.id != guild.id or support_role.guild.id != guild.id:
-            raise commands.BadArgument(
-                "The channel and support role must be in this server."
-            )
+    ) -> TicketSetupResult:
+        """Create missing defaults and persist one ticket panel."""
+        if channel.guild.id != guild.id:
+            raise commands.BadArgument("The panel channel must be in this server.")
+        if support_role is not None and support_role.guild.id != guild.id:
+            raise commands.BadArgument("The support role must be in this server.")
         if category is not None and category.guild.id != guild.id:
             raise commands.BadArgument("The category must be in this server.")
+        if log_channel is not None and log_channel.guild.id != guild.id:
+            raise commands.BadArgument("The log channel must be in this server.")
         bot_member = guild.me
         if bot_member is None:
-            raise commands.BotMissingPermissions(["manage_channels"])
+            raise commands.BotMissingPermissions(["manage_channels", "manage_roles"])
+        if support_role is None:
+            support_role = discord.utils.get(guild.roles, name="Support Team")
+        if support_role is None:
+            if not bot_member.guild_permissions.manage_roles:
+                raise commands.BotMissingPermissions(["manage_roles"])
+            support_role = await guild.create_role(
+                name="Support Team",
+                reason="Aestron guided ticket setup",
+            )
+        if support_role.managed:
+            raise commands.BadArgument(
+                "Choose a normal server role; integration-managed roles cannot manage tickets."
+            )
+        if support_role >= bot_member.top_role:
+            raise commands.BadArgument(
+                "Move my highest role above the support role, then run setup again."
+            )
+        if category is None:
+            category = discord.utils.get(guild.categories, name="Support Tickets")
+        if category is None:
+            category = await guild.create_category(
+                "Support Tickets", reason="Aestron guided ticket setup"
+            )
+        if log_channel is None:
+            log_channel = discord.utils.get(category.text_channels, name="ticket-logs")
+        if log_channel is None:
+            log_channel = await guild.create_text_channel(
+                "ticket-logs",
+                category=category,
+                overwrites={
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    support_role: discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                    ),
+                    bot_member: discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                    ),
+                },
+                reason="Aestron guided ticket setup",
+            )
+        else:
+            await log_channel.set_permissions(
+                guild.default_role,
+                view_channel=False,
+                reason="Aestron private ticket logs",
+            )
+            await log_channel.set_permissions(
+                support_role,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                reason="Aestron support log access",
+            )
+            await log_channel.set_permissions(
+                bot_member,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                reason="Aestron ticket log access",
+            )
         channel_permissions = channel.permissions_for(bot_member)
         missing = [
             permission
@@ -298,7 +376,16 @@ class Tickets(commands.Cog):
             inline=False,
         )
         embed.set_footer(text="One open ticket per member")
-        panel_message = await channel.send(embed=embed, view=OpenTicketView())
+        if isinstance(channel, discord.ForumChannel):
+            created = await channel.create_thread(
+                name="Open a support ticket",
+                embed=embed,
+                view=OpenTicketView(),
+                reason="Aestron ticket panel setup",
+            )
+            panel_message = created.message
+        else:
+            panel_message = await channel.send(embed=embed, view=OpenTicketView())
         async with self.bot.database.pool.acquire() as connection:
             await connection.execute(
                 "INSERT INTO ticket_panels "
@@ -309,12 +396,17 @@ class Tickets(commands.Cog):
                 "category_id = EXCLUDED.category_id, log_channel_id = EXCLUDED.log_channel_id",
                 panel_message.id,
                 guild.id,
-                channel.id,
+                panel_message.channel.id,
                 support_role.id,
-                getattr(category, "id", None),
-                channel.id,
+                category.id,
+                log_channel.id,
             )
-        return panel_message
+        return TicketSetupResult(
+            panel=panel_message,
+            support_role=support_role,
+            category=category,
+            log_channel=log_channel,
+        )
 
     async def _open_for_member(
         self,
@@ -664,10 +756,15 @@ class Tickets(commands.Cog):
         message: str = "Click below to open a private support ticket.",
     ) -> None:
         """Create a ticket panel through a prefix command."""
-        panel = await self.setup_panel(
-            ctx.guild, channel, support_role, category, message
+        result = await self.setup_panel(
+            ctx.guild, channel, support_role, category, None, message
         )
-        await ctx.send(f"Ticket panel created: {panel.jump_url}", ephemeral=True)
+        await ctx.send(
+            f"Ticket panel created: {result.panel.jump_url} · Staff: "
+            f"{result.support_role.mention} · Rooms: **{result.category.name}** · "
+            f"Logs: {result.log_channel.mention}",
+            ephemeral=True,
+        )
 
     @ticket.command(name="setup", description="Create a persistent ticket panel.")
     @app_commands.default_permissions(manage_guild=True)
@@ -676,18 +773,37 @@ class Tickets(commands.Cog):
     async def slash_setup(
         self,
         interaction: discord.Interaction,
-        channel: discord.TextChannel,
-        support_role: discord.Role,
+        channel: discord.TextChannel | discord.ForumChannel | None = None,
+        support_role: discord.Role | None = None,
         category: discord.CategoryChannel | None = None,
+        log_channel: discord.TextChannel | None = None,
         message: str = "Click below to open a private support ticket.",
     ) -> None:
-        """Create a ticket panel through slash commands."""
+        """Create or reuse the role, category, logs, and ticket panel."""
+        panel_channel = channel or interaction.channel
+        if interaction.guild is None or not isinstance(
+            panel_channel, (discord.TextChannel, discord.ForumChannel)
+        ):
+            await interaction.response.send_message(
+                "Choose a text, announcement, forum, or media channel for the panel.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        panel = await self.setup_panel(
-            interaction.guild, channel, support_role, category, message
+        result = await self.setup_panel(
+            interaction.guild,
+            panel_channel,
+            support_role,
+            category,
+            log_channel,
+            message,
         )
         await interaction.followup.send(
-            f"Ticket panel created: {panel.jump_url}", ephemeral=True
+            f"Ticket panel created: {result.panel.jump_url}\n"
+            f"Staff: {result.support_role.mention} · "
+            f"Rooms: **{result.category.name}** · "
+            f"Logs: {result.log_channel.mention}",
+            ephemeral=True,
         )
 
     @ticket.command(name="claim", description="Claim the current support ticket.")

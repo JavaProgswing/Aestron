@@ -63,6 +63,7 @@ from aestron_bot.minecraft_ui import (
 )
 from aestron_bot.moderation import Moderation
 from aestron_bot.music import Music
+from aestron_bot.onboarding import ServerOnboarding
 from aestron_bot.profiles import build_profile_embed
 from aestron_bot.social import Social
 from aestron_bot.templates import Templates
@@ -389,6 +390,7 @@ def get_cog_types():
         AuditLogging,
         Moderation,
         AutoMod,
+        ServerOnboarding,
         Templates,
         Tickets,
         Captcha,
@@ -3542,61 +3544,6 @@ class CustomCommands(commands.Cog):
                     item for item in self.__cog_commands__ if item is not command
                 )
         await interaction.response.send_message(f"Removed `{name}`.", ephemeral=True)
-
-
-@client.event
-async def on_guild_join(guild):
-    try:
-        chars = ""
-        async with client.database.pool.acquire() as con:
-            prefixeslist = await con.fetchrow(
-                "SELECT * FROM prefixes WHERE guildid = $1", guild.id
-            )
-        if prefixeslist is None:
-            statement = """INSERT INTO prefixes (guildid,prefix) VALUES($1,$2);"""
-            async with client.database.pool.acquire() as con:
-                await con.execute(statement, guild.id, SETTINGS.default_prefix)
-            chars = SETTINGS.default_prefix
-        else:
-            chars = prefixeslist["prefix"]
-        prefix = chars
-        embed_one = discord.Embed(
-            title="Walkthrough Guide ",
-            description=f"Prefix {prefix}",
-            color=Color.green(),
-        )
-        for channel in guild.channels:
-            if (
-                channel.type == discord.ChannelType.text
-                and channel.permissions_for(guild.me).send_messages
-            ):
-                embed_one.add_field(
-                    name=f"Invoke our bot by sending {prefix}help in a channel in which bot has permissions to read.",
-                    value="** **",
-                    inline=False,
-                )
-
-                embed_one.add_field(
-                    name="Thanks for inviting "
-                    + client.user.name
-                    + " to "
-                    + str(guild.name),
-                    value="** **",
-                    inline=False,
-                )
-                if SETTINGS.support_server_invite:
-                    embed_one.add_field(
-                        name="Support server",
-                        value=SETTINGS.support_server_invite,
-                        inline=False,
-                    )
-                try:
-                    await channel.send(embed=embed_one)
-                except Exception:
-                    raise commands.BotMissingPermissions(["embed_links"])
-                break
-    except Exception as error:
-        logging.log(logging.ERROR, f" on_guild_join: {format_exception(error)}")
 
 
 @client.event

@@ -29,6 +29,208 @@ class VerificationConfig:
     enabled: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class VerificationSetupResult:
+    """Outcome of applying a verification access plan."""
+
+    role: discord.Role
+    panel: discord.Message
+    locked_channels: tuple[discord.abc.GuildChannel, ...]
+    access_channels: tuple[discord.abc.GuildChannel, ...]
+    skipped_channels: tuple[discord.abc.GuildChannel, ...]
+
+
+class VerificationChannelSelect(discord.ui.ChannelSelect):
+    """Choose channels or categories unlocked by the verified role."""
+
+    def __init__(self, default_channels: list[discord.abc.GuildChannel]) -> None:
+        """Show current public channels as the initial access plan."""
+        super().__init__(
+            channel_types=[
+                discord.ChannelType.text,
+                discord.ChannelType.news,
+                discord.ChannelType.forum,
+                discord.ChannelType.media,
+                discord.ChannelType.voice,
+                discord.ChannelType.stage_voice,
+                discord.ChannelType.category,
+            ],
+            placeholder="Choose verified channels or categories",
+            min_values=0,
+            max_values=25,
+            required=False,
+            default_values=[
+                discord.SelectDefaultValue.from_channel(channel)
+                for channel in default_channels[:25]
+            ],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """Replace the proposed access list with the administrator's selection."""
+        view = self.view
+        if not isinstance(view, VerificationSetupView):
+            return
+        view.channel_ids = {channel.id for channel in self.values}
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+
+class VerificationSetupView(discord.ui.View):
+    """Ephemeral verification access review owned by one administrator."""
+
+    def __init__(
+        self,
+        *,
+        owner_id: int,
+        guild: discord.Guild,
+        panel_channel: discord.TextChannel,
+        role: discord.Role | None,
+    ) -> None:
+        """Build a five-minute permission review for one administrator."""
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.guild = guild
+        self.panel_channel = panel_channel
+        self.role = role
+        self.public_channels = [
+            channel
+            for channel in guild.channels
+            if channel.id != panel_channel.id
+            and not isinstance(channel, (discord.Thread, discord.CategoryChannel))
+            and channel.permissions_for(guild.default_role).view_channel
+        ]
+        self.channel_ids = {channel.id for channel in self.public_channels}
+        self.add_item(VerificationChannelSelect(self.public_channels))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Reject attempts to modify another administrator's setup."""
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "Only the administrator who opened this setup can use it.", ephemeral=True
+        )
+        return False
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        """Acknowledge setup failures instead of leaving a timed-out interaction."""
+        LOGGER.error(
+            "Verification setup interaction failed guild=%s item=%s",
+            interaction.guild_id,
+            getattr(item, "custom_id", None),
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        message = (
+            str(error)
+            if isinstance(error, (commands.CommandError, discord.HTTPException))
+            else "Verification setup failed unexpectedly. Check the bot logs and permissions."
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(message[:1900], ephemeral=True)
+        else:
+            await interaction.response.send_message(message[:1900], ephemeral=True)
+
+    def embed(self) -> discord.Embed:
+        """Render the pending role and channel access plan."""
+        selected = [
+            channel.mention
+            for channel_id in self.channel_ids
+            if (channel := self.guild.get_channel(channel_id)) is not None
+        ]
+        embed = discord.Embed(
+            title="Verification access setup",
+            description=(
+                "Aestron auto-selected the channels currently visible to regular "
+                "members. These will require the verified role after you apply. "
+                "Use the selector to replace that list."
+            ),
+            color=0x5865F2,
+        )
+        embed.add_field(name="Panel", value=self.panel_channel.mention)
+        embed.add_field(
+            name="Verified role",
+            value=self.role.mention if self.role else "Create/reuse **Verified**",
+        )
+        embed.add_field(
+            name=f"Protected access ({len(selected)})",
+            value=" ".join(selected[:20])[:1024] or "No channels selected",
+            inline=False,
+        )
+        if len(self.public_channels) > 25:
+            embed.add_field(
+                name="Large server",
+                value=(
+                    "The selector can show 25 choices at once. **Use all public** "
+                    "restores the complete auto-detected list."
+                ),
+                inline=False,
+            )
+        embed.set_footer(
+            text="Community Onboarding default channels will be reported and left public"
+        )
+        return embed
+
+    @discord.ui.button(
+        label="Use all public", style=discord.ButtonStyle.secondary, row=1
+    )
+    async def use_all_public(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Restore the complete auto-detected channel list."""
+        self.channel_ids = {channel.id for channel in self.public_channels}
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Apply setup", style=discord.ButtonStyle.success, row=1)
+    async def apply(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Apply the reviewed permission plan and publish the panel."""
+        cog = interaction.client.get_cog("Captcha")
+        if cog is None:
+            await interaction.response.send_message(
+                "Verification is unavailable right now.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await cog._setup(
+            self.guild,
+            self.panel_channel,
+            self.role,
+            lock_public_channels=True,
+            access_channel_ids=self.channel_ids,
+        )
+        self.stop()
+        skipped = (
+            "\nLeft public because of Community Onboarding or Discord restrictions: "
+            + " ".join(channel.mention for channel in result.skipped_channels)
+            if result.skipped_channels
+            else ""
+        )
+        await interaction.edit_original_response(
+            content=(
+                f"Verification is ready: {result.panel.jump_url} · "
+                f"{result.role.mention} · protected "
+                f"{len(result.locked_channels)} channel(s).{skipped}"
+            )[:2000],
+            embed=None,
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Close setup without changing roles, channels, or the database."""
+        self.stop()
+        await interaction.response.edit_message(
+            content="Verification setup cancelled.", embed=None, view=None
+        )
+
+
 class VerificationView(discord.ui.View):
     """Restart-safe verification button, including legacy panel compatibility."""
 
@@ -263,7 +465,8 @@ class Captcha(commands.Cog):
         role: discord.Role | None,
         *,
         lock_public_channels: bool,
-    ) -> tuple[discord.Role, discord.Message, int]:
+        access_channel_ids: set[int] | None = None,
+    ) -> VerificationSetupResult:
         if channel.guild.id != guild.id:
             raise commands.BadArgument("Choose a text channel in this server.")
         bot_member = guild.me
@@ -281,42 +484,95 @@ class Captcha(commands.Cog):
             verified_role = await guild.create_role(
                 name="Verified", reason="Aestron verification setup"
             )
+        if verified_role.managed:
+            raise commands.BadArgument(
+                "Choose a normal server role; integration-managed roles cannot be granted."
+            )
+        privileged = [
+            permission
+            for permission in (
+                "administrator",
+                "manage_guild",
+                "manage_roles",
+                "manage_channels",
+                "kick_members",
+                "ban_members",
+                "moderate_members",
+            )
+            if getattr(verified_role.permissions, permission, False)
+        ]
+        if privileged:
+            raise commands.BadArgument(
+                "The verified role has unsafe moderation permissions: "
+                + ", ".join(name.replace("_", " ") for name in privileged)
+                + ". Choose a basic member role instead."
+            )
         if verified_role >= bot_member.top_role:
             raise commands.BadArgument(
                 "Move my highest role above the verified role, then run setup again."
             )
 
-        changed = 0
+        onboarding_default_ids: set[int] = set()
+        if "COMMUNITY" in guild.features:
+            try:
+                onboarding = await guild.onboarding()
+                if onboarding.enabled:
+                    onboarding_default_ids = set(onboarding.default_channel_ids)
+            except (discord.Forbidden, discord.HTTPException):
+                LOGGER.info("Could not inspect Community Onboarding guild=%s", guild.id)
+
+        access_targets = [
+            target
+            for target in guild.channels
+            if target.id != channel.id
+            and not isinstance(target, discord.Thread)
+            and (
+                target.id in access_channel_ids
+                if access_channel_ids is not None
+                else target.permissions_for(guild.default_role).view_channel
+            )
+        ]
+        locked: list[discord.abc.GuildChannel] = []
+        granted: list[discord.abc.GuildChannel] = []
+        skipped: list[discord.abc.GuildChannel] = []
         if lock_public_channels:
-            for target in guild.channels:
-                if target.id == channel.id or isinstance(target, discord.Thread):
-                    continue
+            for target in access_targets:
                 everyone = target.overwrites_for(guild.default_role)
                 effective_public = target.permissions_for(
                     guild.default_role
                 ).view_channel
-                if not effective_public:
-                    continue
                 verified = target.overwrites_for(verified_role)
-                everyone.view_channel = False
                 verified.view_channel = True
                 try:
-                    await target.set_permissions(
-                        guild.default_role,
-                        overwrite=everyone,
-                        reason="Aestron verification public-channel lock",
-                    )
+                    # Grant verified access first. If the later public lock is
+                    # rejected, members are never accidentally locked out.
                     await target.set_permissions(
                         verified_role,
                         overwrite=verified,
                         reason="Aestron verified access",
                     )
-                    changed += 1
-                except (discord.Forbidden, discord.HTTPException):
+                    granted.append(target)
+                    if not effective_public:
+                        continue
+                    if target.id in onboarding_default_ids:
+                        skipped.append(target)
+                        continue
+                    everyone.view_channel = False
+                    await target.set_permissions(
+                        guild.default_role,
+                        overwrite=everyone,
+                        reason="Aestron verification public-channel lock",
+                    )
+                    locked.append(target)
+                except (discord.Forbidden, discord.HTTPException) as error:
+                    skipped.append(target)
                     LOGGER.warning(
-                        "Could not lock verification channel guild=%s channel=%s",
+                        "Could not configure verification channel guild=%s channel=%s "
+                        "status=%s code=%s",
                         guild.id,
                         target.id,
+                        getattr(error, "status", None),
+                        getattr(error, "code", None),
                     )
 
         public = channel.overwrites_for(guild.default_role)
@@ -376,7 +632,13 @@ class Captcha(commands.Cog):
                 channel.id,
                 panel.id,
             )
-        return verified_role, panel, changed
+        return VerificationSetupResult(
+            role=verified_role,
+            panel=panel,
+            locked_channels=tuple(locked),
+            access_channels=tuple(granted),
+            skipped_channels=tuple(dict.fromkeys(skipped)),
+        )
 
     async def _set_access(
         self, guild: discord.Guild, channel: discord.abc.GuildChannel, *, add: bool
@@ -388,11 +650,7 @@ class Captcha(commands.Cog):
         if role is None:
             raise commands.BadArgument("The configured verified role was deleted.")
         overwrite = channel.overwrites_for(role)
-        overwrite.update(
-            view_channel=True if add else None,
-            send_messages=True if add else None,
-            read_message_history=True if add else None,
-        )
+        overwrite.update(view_channel=True if add else None)
         await channel.set_permissions(
             role,
             overwrite=overwrite,
@@ -435,15 +693,16 @@ class Captcha(commands.Cog):
         lock_public_channels: bool = False,
     ) -> None:
         """Create verification through a prefix command."""
-        verified_role, panel, changed = await self._setup(
+        result = await self._setup(
             ctx.guild,
             channel,
             role,
             lock_public_channels=lock_public_channels,
         )
         await ctx.send(
-            f"Verification panel created: {panel.jump_url}. Role: "
-            f"{verified_role.mention}. Locked {changed} public channel(s).",
+            f"Verification panel created: {result.panel.jump_url}. Role: "
+            f"{result.role.mention}. Locked {len(result.locked_channels)} public "
+            f"channel(s); skipped {len(result.skipped_channels)}.",
             ephemeral=True,
         )
 
@@ -561,22 +820,26 @@ class Captcha(commands.Cog):
     async def slash_setup(
         self,
         interaction: discord.Interaction,
-        channel: discord.TextChannel,
+        channel: discord.TextChannel | None = None,
         role: discord.Role | None = None,
-        lock_public_channels: bool = False,
     ) -> None:
-        """Configure verification through slash commands."""
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        verified_role, panel, changed = await self._setup(
-            interaction.guild,
-            channel,
-            role,
-            lock_public_channels=lock_public_channels,
+        """Open the guided role and channel-access setup."""
+        panel_channel = channel or interaction.channel
+        if interaction.guild is None or not isinstance(
+            panel_channel, discord.TextChannel
+        ):
+            await interaction.response.send_message(
+                "Choose a text channel for the verification panel.", ephemeral=True
+            )
+            return
+        view = VerificationSetupView(
+            owner_id=interaction.user.id,
+            guild=interaction.guild,
+            panel_channel=panel_channel,
+            role=role,
         )
-        await interaction.followup.send(
-            f"Panel created: {panel.jump_url}. Role: {verified_role.mention}. "
-            f"Locked {changed} public channel(s).",
-            ephemeral=True,
+        await interaction.response.send_message(
+            embed=view.embed(), view=view, ephemeral=True
         )
 
     @verification.command(name="status", description="Show verification health.")
