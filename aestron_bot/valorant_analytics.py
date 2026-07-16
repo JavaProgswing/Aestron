@@ -18,6 +18,15 @@ def _integer(value: Any) -> int:
         return 0
 
 
+def _round_number(value: Any, fallback: int) -> int:
+    """Convert Riot's zero-based round index to a one-based display number."""
+    try:
+        number = int(value) + 1
+    except (TypeError, ValueError):
+        return fallback
+    return number if number > 0 else fallback
+
+
 @dataclass(frozen=True, slots=True)
 class AssetCatalog:
     """Resolve Riot content identifiers to current localized display names."""
@@ -336,6 +345,9 @@ def analyze_match(
     round_details: list[RoundPerformance] = []
     kill_locations: list[KillLocation] = []
     for fallback_number, round_result in enumerate(round_results, start=1):
+        display_round_number = _round_number(
+            round_result.get("roundNum"), fallback_number
+        )
         player_stats = [
             item
             for item in (round_result.get("playerStats") or [])
@@ -402,8 +414,7 @@ def analyze_match(
                 finishing_damage = kill.get("finishingDamage") or {}
                 kill_locations.append(
                     KillLocation(
-                        round_number=_integer(round_result.get("roundNum"))
-                        or fallback_number,
+                        round_number=display_round_number,
                         x=location_x,
                         y=location_y,
                         outcome="kill" if killer == puuid else "death",
@@ -420,7 +431,7 @@ def analyze_match(
         winning_team = round_result.get("winningTeam")
         round_details.append(
             RoundPerformance(
-                number=_integer(round_result.get("roundNum")) or fallback_number,
+                number=display_round_number,
                 won=(winning_team == team_id) if winning_team is not None else None,
                 result=str(
                     round_result.get("roundResult")

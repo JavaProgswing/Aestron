@@ -41,7 +41,7 @@ def _match(*, won: bool = True):
         ],
         "roundResults": [
             {
-                "roundNum": 1,
+                "roundNum": 0,
                 "winningTeam": "Blue",
                 "roundResult": "Eliminated",
                 "playerStats": [
@@ -78,7 +78,7 @@ def _match(*, won: bool = True):
                 ],
             },
             {
-                "roundNum": 2,
+                "roundNum": 1,
                 "winningTeam": "Red",
                 "roundResult": "Eliminated",
                 "playerStats": [
@@ -212,3 +212,8 @@ def test_stats_panel_restores_interactive_drill_downs():
 
     view.current_page = "match:0:round:1"
     assert view.render().title == "Match review · Round 1"
+
+    view.round_select.configure(summary.performances[0])
+    round_values = [option.value for option in view.round_select.options]
+    assert round_values == ["1:1", "2:2"]
+    assert len(round_values) == len(set(round_values))

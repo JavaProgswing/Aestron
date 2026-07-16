@@ -337,9 +337,12 @@ class RoundSelect(discord.ui.Select):
                     f"{detail.kills}/{detail.deaths}/{detail.assists} · "
                     f"{detail.damage} damage · {detail.loadout_value:,} loadout"
                 )[:100],
-                value=str(detail.number),
+                # Prefixing the display number with its stable list position
+                # keeps Discord values unique even if an upstream payload is
+                # malformed or repeats a round index.
+                value=f"{position}:{detail.number}",
             )
-            for detail in match.round_details[:25]
+            for position, detail in enumerate(match.round_details[:25], start=1)
         ]
         self.disabled = False
 
@@ -354,7 +357,8 @@ class RoundSelect(discord.ui.Select):
                 "Select a match first.", ephemeral=True
             )
             return
-        await view._show(interaction, f"match:{index}:round:{self.values[0]}")
+        round_number = self.values[0].rsplit(":", maxsplit=1)[-1]
+        await view._show(interaction, f"match:{index}:round:{round_number}")
 
 
 class ValorantStatsView(discord.ui.View):
