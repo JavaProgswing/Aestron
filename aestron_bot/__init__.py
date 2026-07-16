@@ -2,9 +2,11 @@
 
 from .command_docs import (
     CommandDocumentationIssue,
+    audit_application_command_metadata,
     audit_command_metadata,
     command_invocation,
     infer_usage,
+    normalize_application_command_metadata,
     normalize_command_metadata,
 )
 from .database import DatabaseService
@@ -27,8 +29,10 @@ __all__ = (
     "RuntimeState",
     "Statistics",
     "audit_command_metadata",
+    "audit_application_command_metadata",
     "command_invocation",
     "format_exception",
     "infer_usage",
     "normalize_command_metadata",
+    "normalize_application_command_metadata",
 )

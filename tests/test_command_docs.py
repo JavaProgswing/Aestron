@@ -7,11 +7,14 @@ from discord.ext import commands
 
 import main
 from aestron_bot.command_docs import (
+    audit_application_command_metadata,
     audit_command_metadata,
     command_invocation,
     infer_usage,
+    normalize_application_command_metadata,
     normalize_command_metadata,
 )
+from aestron_bot.help_command import AestronHelpCommand
 from aestron_bot.help_ui import (
     HelpCategorySelect,
     HelpCommandSelect,
@@ -64,18 +67,50 @@ def test_every_registered_command_has_complete_documentation():
         bot = main.MyBot(
             command_prefix="!",
             intents=discord.Intents.none(),
-            help_command=main.MyHelp(),
+            help_command=AestronHelpCommand(),
         )
         try:
             for cog in main.get_cog_types():
                 await bot.add_cog(cog(bot))
             await bot.add_cog(main.Statistics(bot, bot.statistics))
             normalize_command_metadata(bot)
+            normalize_application_command_metadata(bot)
 
             assert len(list(bot.walk_commands())) >= 100
             # Related actions are grouped to stay comfortably below Discord's
             # 100 global root-command limit.
-            assert len(bot.tree.get_commands()) >= 70
+            application_roots = {command.name for command in bot.tree.get_commands()}
+            assert 50 <= len(application_roots) <= 80
+            assert {
+                "antiraid",
+                "automod",
+                "community",
+                "fun",
+                "social",
+                "valorant",
+            } <= application_roots
+            assert {
+                "enableantiraid",
+                "modsettings",
+                "disallowlinks",
+                "allowprofane",
+                "welcomeuser",
+                "wanteduser",
+                "linkaccount",
+                "matchanalysis",
+            }.isdisjoint(application_roots)
+            community_group = bot.tree.get_command("community")
+            assert isinstance(community_group, discord.app_commands.Group)
+            assert {command.name for command in community_group.commands} == {
+                "chat",
+                "chess",
+                "profile",
+                "server",
+                "translate",
+                "youtube",
+            }
+            assert bot.get_command("youtube") is not None
+            assert bot.get_command("ytvideo") is None
             for command_name in (
                 "ban",
                 "clearwarnings",
@@ -87,6 +122,7 @@ def test_every_registered_command_has_complete_documentation():
             ):
                 assert bot.get_command(command_name) is not None
             assert audit_command_metadata(bot) == []
+            assert audit_application_command_metadata(bot) == []
 
             help_command = bot.get_command("help")
             assert help_command is not None
@@ -114,8 +150,21 @@ def test_every_registered_command_has_complete_documentation():
             bot_help = channel.send.await_args.kwargs["embed"]
             bot_help_view = channel.send.await_args.kwargs["view"]
             assert bot_help.title == "Aestron help"
-            assert any(field.name.startswith("Music") for field in bot_help.fields)
-            assert any(field.name.startswith("Statistics") for field in bot_help.fields)
+            category_names = {
+                field.name.rsplit(" (", maxsplit=1)[0]
+                for field in bot_help.fields
+                if field.name != "Available commands"
+            }
+            assert category_names == {
+                "Start Here",
+                "Safety & Moderation",
+                "Server Setup",
+                "Community",
+                "Games & Fun",
+                "Music & Voice",
+                "VALORANT",
+                "Utilities",
+            }
             assert len(bot_help.fields) <= 25
             assert len(bot_help) <= 6000
             assert isinstance(bot_help_view, InteractiveHelpView)

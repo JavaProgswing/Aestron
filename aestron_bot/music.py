@@ -1,4 +1,4 @@
-"""Modern Wavelink 3 music commands and playback controls."""
+"""Wavelink 3 music commands and playback controls."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Modern, opt-in VALORANT commands backed by official Riot APIs."""
+"""Opt-in VALORANT commands backed by official Riot APIs."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from .valorant_analytics import (
@@ -623,6 +624,10 @@ class ValorantStatsView(discord.ui.View):
 class Valorant(commands.Cog):
     """Opt-in VALORANT match summaries and post-match review tools."""
 
+    valorant = app_commands.Group(
+        name="valorant", description="Link Riot and analyze VALORANT performance."
+    )
+
     def __init__(self, bot: commands.Bot) -> None:
         """Create the command service from the bot's validated settings."""
         self.bot = bot
@@ -664,7 +669,8 @@ class Valorant(commands.Cog):
             return None
 
     @commands.hybrid_command(
-        aliases=["vallink"],
+        name="vallink",
+        with_app_command=False,
         brief="Securely link your Riot account.",
         description="Creates a private, expiring Riot Sign On link for your Discord account.",
         usage="",
@@ -710,7 +716,8 @@ class Valorant(commands.Cog):
         )
 
     @commands.hybrid_command(
-        aliases=["valunlink"],
+        name="valunlink",
+        with_app_command=False,
         brief="Unlink your Riot account and cached data.",
         description="Removes your linked Riot identity and cached match references.",
         usage="",
@@ -728,6 +735,7 @@ class Valorant(commands.Cog):
         )
 
     @commands.hybrid_command(
+        with_app_command=False,
         aliases=["valstats"],
         brief="Open an interactive VALORANT performance lab.",
         description=(
@@ -789,7 +797,8 @@ class Valorant(commands.Cog):
         view.message = await ctx.send(embed=view.render(), view=view, ephemeral=True)
 
     @commands.hybrid_command(
-        aliases=["lastmatch", "valmatch"],
+        with_app_command=False,
+        name="valmatch",
         brief="Analyze one recent VALORANT match in depth.",
         description=(
             "Open a selected recent match with score, KDA, ACS, ADR, damage delta, "
@@ -826,6 +835,7 @@ class Valorant(commands.Cog):
         view.message = await ctx.send(embed=view.render(), view=view, ephemeral=True)
 
     @commands.hybrid_command(
+        with_app_command=False,
         brief="Turn recent VALORANT matches into a review plan.",
         description=(
             "Build transparent practice prompts from opening duels, damage, survival, "
@@ -854,3 +864,77 @@ class Valorant(commands.Cog):
             initial_page="coaching",
         )
         view.message = await ctx.send(embed=view.render(), view=view, ephemeral=True)
+
+    async def _interaction_context(
+        self, interaction: discord.Interaction
+    ) -> commands.Context:
+        """Build a supported hybrid context for shared command implementations."""
+        return await commands.Context.from_interaction(interaction)
+
+    @valorant.command(name="link", description="Securely link your Riot account.")
+    @app_commands.checks.cooldown(1, 30, key=lambda interaction: interaction.user.id)
+    async def slash_link(self, interaction: discord.Interaction) -> None:
+        """Create a Riot Sign On link through `/valorant link`."""
+        await self.linkaccount.callback(
+            self, await self._interaction_context(interaction)
+        )
+
+    @valorant.command(name="unlink", description="Remove your linked Riot data.")
+    @app_commands.checks.cooldown(1, 30, key=lambda interaction: interaction.user.id)
+    async def slash_unlink(self, interaction: discord.Interaction) -> None:
+        """Remove the Riot link through `/valorant unlink`."""
+        await self.unlinkaccount.callback(
+            self, await self._interaction_context(interaction)
+        )
+
+    @valorant.command(name="stats", description="Open your interactive match lab.")
+    @app_commands.checks.cooldown(1, 20, key=lambda interaction: interaction.user.id)
+    async def slash_stats(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+        matches: app_commands.Range[int, 1, 10] = 8,
+    ) -> None:
+        """Open match statistics through `/valorant stats`."""
+        await self.vstats.callback(
+            self, await self._interaction_context(interaction), member, matches
+        )
+
+    @valorant.command(name="history", description="Browse recent matches.")
+    @app_commands.checks.cooldown(1, 20, key=lambda interaction: interaction.user.id)
+    async def slash_history(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+        matches: app_commands.Range[int, 1, 10] = 8,
+    ) -> None:
+        """Browse history through `/valorant history`."""
+        await self.matchhistory.callback(
+            self, await self._interaction_context(interaction), member, matches
+        )
+
+    @valorant.command(name="match", description="Analyze one recent match in depth.")
+    @app_commands.checks.cooldown(1, 20, key=lambda interaction: interaction.user.id)
+    async def slash_match(
+        self,
+        interaction: discord.Interaction,
+        number: app_commands.Range[int, 1, 10] = 1,
+        member: discord.Member | None = None,
+    ) -> None:
+        """Analyze a match through `/valorant match`."""
+        await self.matchanalysis.callback(
+            self, await self._interaction_context(interaction), number, member
+        )
+
+    @valorant.command(name="coach", description="Build a match-based practice plan.")
+    @app_commands.checks.cooldown(1, 20, key=lambda interaction: interaction.user.id)
+    async def slash_coach(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+        matches: app_commands.Range[int, 1, 10] = 8,
+    ) -> None:
+        """Build coaching prompts through `/valorant coach`."""
+        await self.valcoach.callback(
+            self, await self._interaction_context(interaction), member, matches
+        )

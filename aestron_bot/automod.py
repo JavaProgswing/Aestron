@@ -379,115 +379,62 @@ class AutoMod(commands.Cog):
             ephemeral=True,
         )
 
-    @commands.cooldown(2, 10, commands.BucketType.guild)
-    @commands.hybrid_command(
-        with_app_command=False,
-        aliases=["disableantispam", "enablespam", "allowspamming"],
-        brief="Disable spam enforcement in a channel.",
-        description="Allow repeated messages in the selected or current channel.",
-        usage="[channel]",
+    @commands.group(
+        name="automod",
+        invoke_without_command=True,
+        brief="Configure or inspect channel AutoMod.",
+        description=(
+            "Configure spam, link, and profanity filters for a text channel. Run "
+            "without a subcommand to show the current channel's status."
+        ),
+        usage="[set|status]",
     )
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
-    async def allowspam(
-        self, ctx: commands.Context, channel: discord.TextChannel | None = None
-    ) -> None:
-        """Disable spam filtering through a prefix command."""
-        await self._prefix_set(ctx, "spam", False, channel)
+    async def automod_prefix(self, ctx: commands.Context) -> None:
+        """Show the current channel status when no subcommand is supplied."""
+        if not isinstance(ctx.channel, discord.TextChannel):
+            raise commands.BadArgument("Use this command in a text channel.")
+        await ctx.send(
+            embed=await self.status_embed(ctx.guild, ctx.channel), ephemeral=True
+        )
 
-    @commands.cooldown(2, 10, commands.BucketType.guild)
-    @commands.hybrid_command(
-        with_app_command=False,
-        aliases=["enableantispam", "disablespam", "disallowspamming"],
-        brief="Enable spam enforcement in a channel.",
-        description="Delete repeated-message spam and apply the configured timeout response.",
-        usage="[channel]",
+    @automod_prefix.command(
+        name="set",
+        brief="Enable or disable one AutoMod filter.",
+        description=(
+            "Enable or disable `spam`, `links`, or `profanity` filtering in the "
+            "selected or current text channel."
+        ),
+        usage="<spam|links|profanity> <true|false> [channel]",
     )
-    @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
-    async def disallowspam(
-        self, ctx: commands.Context, channel: discord.TextChannel | None = None
-    ) -> None:
-        """Enable spam filtering through a prefix command."""
-        await self._prefix_set(ctx, "spam", True, channel)
-
     @commands.cooldown(2, 10, commands.BucketType.guild)
-    @commands.hybrid_command(
-        with_app_command=False,
-        aliases=["disableprofanefilter", "enableprofane", "disablefilter"],
-        brief="Disable profanity enforcement in a channel.",
-        description="Stop profanity checks in the selected or current channel.",
-        usage="[channel]",
-    )
-    @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
-    async def allowprofane(
-        self, ctx: commands.Context, channel: discord.TextChannel | None = None
+    async def prefix_set(
+        self,
+        ctx: commands.Context,
+        feature: str,
+        enabled: bool,
+        channel: discord.TextChannel | None = None,
     ) -> None:
-        """Disable profanity filtering through a prefix command."""
-        await self._prefix_set(ctx, "profanity", False, channel)
+        """Configure one filter through a canonical prefix subcommand."""
+        feature = feature.casefold()
+        self._table(feature)
+        await self._prefix_set(ctx, feature, enabled, channel)
 
-    @commands.cooldown(2, 10, commands.BucketType.guild)
-    @commands.hybrid_command(
-        with_app_command=False,
-        aliases=["enableprofanefilter", "disableprofane", "enablefilter"],
-        brief="Enable profanity enforcement in a channel.",
-        description="Delete detected profanity and escalate repeat offenses.",
-        usage="[channel]",
-    )
-    @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
-    async def disallowprofane(
-        self, ctx: commands.Context, channel: discord.TextChannel | None = None
-    ) -> None:
-        """Enable profanity filtering through a prefix command."""
-        await self._prefix_set(ctx, "profanity", True, channel)
-
-    @commands.cooldown(2, 10, commands.BucketType.guild)
-    @commands.hybrid_command(
-        with_app_command=False,
-        aliases=["enablelinks", "disablelinkcheck"],
-        brief="Disable link and invite enforcement in a channel.",
-        description="Allow links and Discord invites in the selected or current channel.",
-        usage="[channel]",
-    )
-    @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
-    async def allowlinks(
-        self, ctx: commands.Context, channel: discord.TextChannel | None = None
-    ) -> None:
-        """Disable link filtering through a prefix command."""
-        await self._prefix_set(ctx, "links", False, channel)
-
-    @commands.cooldown(2, 10, commands.BucketType.guild)
-    @commands.hybrid_command(
-        with_app_command=False,
-        aliases=["disablelinks", "enablelinkcheck"],
-        brief="Enable link and invite enforcement in a channel.",
-        description="Delete links and Discord invites from regular members.",
-        usage="[channel]",
-    )
-    @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
-    async def disallowlinks(
-        self, ctx: commands.Context, channel: discord.TextChannel | None = None
-    ) -> None:
-        """Enable link filtering through a prefix command."""
-        await self._prefix_set(ctx, "links", True, channel)
-
-    @commands.hybrid_command(
-        with_app_command=False,
-        aliases=["settings"],
+    @automod_prefix.command(
+        name="status",
         brief="Show AutoMod filters and permission health.",
-        description="Show spam, link, profanity, and bot-permission status for a channel.",
+        description=(
+            "Show spam, link, profanity, integration, and bot-permission health "
+            "for the selected or current text channel."
+        ),
         usage="[channel]",
     )
-    @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
-    async def modsettings(
+    @commands.cooldown(2, 10, commands.BucketType.guild)
+    async def prefix_status(
         self, ctx: commands.Context, channel: discord.TextChannel | None = None
     ) -> None:
-        """Show AutoMod status through a prefix command."""
+        """Show AutoMod health through a canonical prefix subcommand."""
         target = channel or ctx.channel
         if not isinstance(target, discord.TextChannel):
             raise commands.BadArgument("Choose a text channel.")

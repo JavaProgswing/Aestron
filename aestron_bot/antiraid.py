@@ -312,17 +312,33 @@ class AntiRaid(commands.Cog):
                 guild_id,
             )
 
-    @commands.hybrid_command(
-        with_app_command=False,
-        aliases=["enableantiraid"],
-        brief="Enable audit-backed anti-raid protection.",
-        description="Enable burst detection and dangerous-role removal with an alert channel.",
-        usage="[channel]",
+    @commands.group(
+        name="antiraid",
+        invoke_without_command=True,
+        brief="Configure and inspect anti-raid protection.",
+        description=(
+            "Configure audit-backed raid detection, enforcement thresholds, alerts, "
+            "and incident history. Run without a subcommand to show status."
+        ),
+        usage="[enable|disable|status|configure]",
     )
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
+    async def antiraid_prefix(self, ctx: commands.Context) -> None:
+        """Show anti-raid status when no prefix subcommand is supplied."""
+        await ctx.send(embed=await self.status_embed(ctx.guild), ephemeral=True)
+
+    @antiraid_prefix.command(
+        name="enable",
+        brief="Enable anti-raid and select its alert channel.",
+        description=(
+            "Enable destructive-action burst detection and send incident alerts "
+            "to the selected or current text channel."
+        ),
+        usage="[channel]",
+    )
     @commands.cooldown(1, 10, commands.BucketType.guild)
-    async def activateantiraid(
+    async def prefix_enable(
         self, ctx: commands.Context, channel: discord.TextChannel | None = None
     ) -> None:
         """Enable anti-raid through a prefix command."""
@@ -335,20 +351,63 @@ class AntiRaid(commands.Cog):
             ephemeral=True,
         )
 
-    @commands.hybrid_command(
-        with_app_command=False,
-        aliases=["disableantiraid"],
+    @antiraid_prefix.command(
+        name="disable",
         brief="Disable anti-raid protection.",
         description="Disable enforcement immediately while retaining incident history.",
         usage="",
     )
-    @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
     @commands.cooldown(1, 10, commands.BucketType.guild)
-    async def deactivateantiraid(self, ctx: commands.Context) -> None:
+    async def prefix_disable(self, ctx: commands.Context) -> None:
         """Disable anti-raid through a prefix command."""
         await self._disable(ctx.guild.id)
         await ctx.send("Anti-raid is disabled.", ephemeral=True)
+
+    @antiraid_prefix.command(
+        name="status",
+        brief="Show anti-raid health and recent incidents.",
+        description=(
+            "Show whether anti-raid is enabled, its alert destination, thresholds, "
+            "response, and recent incidents."
+        ),
+        usage="",
+    )
+    @commands.cooldown(2, 10, commands.BucketType.guild)
+    async def prefix_status(self, ctx: commands.Context) -> None:
+        """Show current anti-raid health through a prefix command."""
+        await ctx.send(embed=await self.status_embed(ctx.guild), ephemeral=True)
+
+    @antiraid_prefix.command(
+        name="configure",
+        brief="Set the anti-raid response and rate window.",
+        description=(
+            "Choose `log_only` or `remove_roles`, then set the number of destructive "
+            "actions allowed within a time window."
+        ),
+        usage="<log_only|remove_roles> [threshold=3] [window_seconds=20]",
+    )
+    @commands.cooldown(1, 10, commands.BucketType.guild)
+    async def prefix_configure(
+        self,
+        ctx: commands.Context,
+        action: str,
+        threshold: int = 3,
+        window_seconds: int = 20,
+    ) -> None:
+        """Configure anti-raid thresholds through a prefix command."""
+        action = action.casefold()
+        if action not in {"log_only", "remove_roles"}:
+            raise commands.BadArgument("Action must be `log_only` or `remove_roles`.")
+        if not 2 <= threshold <= 10:
+            raise commands.BadArgument("Threshold must be between 2 and 10.")
+        if not 5 <= window_seconds <= 120:
+            raise commands.BadArgument("Window seconds must be between 5 and 120.")
+        await self._configure(ctx.guild.id, action, threshold, window_seconds)
+        await ctx.send(
+            f"Anti-raid set to **{action.replace('_', ' ')}** at "
+            f"**{threshold}** actions per **{window_seconds}s**.",
+            ephemeral=True,
+        )
 
     @antiraid.command(name="enable", description="Enable anti-raid protection.")
     @app_commands.default_permissions(manage_guild=True)

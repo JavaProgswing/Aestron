@@ -1,7 +1,9 @@
 """Regression tests for moderation, anti-raid, logging, and tickets."""
 
+import asyncio
 import inspect
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import discord
 
@@ -26,10 +28,11 @@ from aestron_bot.tickets import (
     Tickets,
     _safe_channel_name,
 )
+from aestron_bot.valorant import Valorant
 from aestron_bot.verification import Captcha, VerificationView
 
 
-def test_production_uses_modern_safety_cogs():
+def test_production_uses_maintained_safety_cogs():
     """Production must register each maintained modular cog exactly once."""
     cog_types = main.get_cog_types()
     assert AntiRaid in cog_types
@@ -137,10 +140,18 @@ def test_safety_slash_groups_are_compact_and_complete():
         "leaderboard",
         "configure",
     }
+    assert {command.name for command in Valorant.valorant.commands} == {
+        "link",
+        "unlink",
+        "stats",
+        "history",
+        "match",
+        "coach",
+    }
 
 
 def test_automod_has_native_link_and_spam_enforcement():
-    """Modern AutoMod must detect links and use a bounded spam window."""
+    """AutoMod must detect links and use a bounded spam window."""
     assert LINK_PATTERN.search("visit https://example.com/path")
     assert LINK_PATTERN.search("discord.gg/example")
     cog = AutoMod(SimpleNamespace())
@@ -198,6 +209,33 @@ def test_verification_button_is_restart_safe_and_template_urls_are_validated():
     assert view.timeout is None
     assert [item.custom_id for item in view.children] == ["verification:green"]
     assert _template_code("https://discord.new/AbC-123") == "AbC-123"
+
+
+def test_template_backup_refreshes_discords_single_existing_template():
+    """Backup must sync and edit the existing template instead of creating a second."""
+
+    async def run_test():
+        updated = SimpleNamespace()
+        synced = SimpleNamespace(edit=AsyncMock(return_value=updated))
+        existing = SimpleNamespace(sync=AsyncMock(return_value=synced))
+        guild = SimpleNamespace(
+            name="Example Guild",
+            templates=AsyncMock(return_value=[existing]),
+            create_template=AsyncMock(),
+        )
+        cog = Templates(SimpleNamespace())
+
+        result = await cog._create_backup(guild, "Current server state")
+
+        assert result is updated
+        existing.sync.assert_awaited_once_with()
+        synced.edit.assert_awaited_once_with(
+            name="Example Guild backup",
+            description="Current server state",
+        )
+        guild.create_template.assert_not_awaited()
+
+    asyncio.run(run_test())
 
 
 def test_giveaway_buttons_are_restart_safe():

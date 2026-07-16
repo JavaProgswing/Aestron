@@ -75,9 +75,9 @@ sender.
 3. Confirm `/valorant` visibly explains opt-in, visibility, unlinking, and the
    prohibition on scouting/live advice.
 4. Register the exact callback and Product URL in the Riot Developer Portal.
-5. Test `/linkaccount` with the bot and confirm the callback stores only Riot
+5. Test `/valorant link` with the bot and confirm the callback stores only Riot
    identity and routing shard—not OAuth tokens.
-6. Test `/vstats`, `/valcoach`, and `/unlinkaccount` with an opted-in account.
+6. Test `/valorant stats`, `/valorant coach`, and `/valorant unlink` with an opted-in account.
 
 The product uses a signed, ten-minute OAuth state rather than a raw Discord ID,
 exchanges the authorization code server-side, resolves the active shard while

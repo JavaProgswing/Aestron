@@ -8,6 +8,7 @@ import secrets
 from dataclasses import dataclass
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 ACCENT = 0xFF4655
@@ -16,6 +17,76 @@ ACCENT = 0xFF4655
 def _pick(values: tuple[str, ...] | list[str]) -> str:
     """Choose one value using the operating system random source."""
     return values[secrets.randbelow(len(values))]
+
+
+def _coinflip_embed(count: int) -> discord.Embed:
+    """Build a bounded result for one or more fair coin flips."""
+    results = [_pick(("Heads", "Tails")) for _ in range(count)]
+    heads = results.count("Heads")
+    embed = discord.Embed(
+        title="Coin flip 🪙",
+        description=" • ".join(results),
+        color=ACCENT,
+    )
+    embed.set_footer(text=f"Heads {heads} • Tails {count - heads}")
+    return embed
+
+
+def _dice_embed(dice: int, sides: int) -> discord.Embed:
+    """Build a dice result with individual rolls, total, and average."""
+    values = [secrets.randbelow(sides) + 1 for _ in range(dice)]
+    embed = discord.Embed(
+        title=f"{dice}d{sides} 🎲",
+        description=" + ".join(map(str, values)) + f" = **{sum(values)}**",
+        color=ACCENT,
+    )
+    if dice > 1:
+        embed.set_footer(text=f"Average {sum(values) / dice:.1f}")
+    return embed
+
+
+def _options(value: str) -> list[str]:
+    """Validate a comma- or pipe-separated choice list."""
+    separator = "|" if "|" in value else ","
+    choices = [item.strip() for item in value.split(separator) if item.strip()]
+    if not 2 <= len(choices) <= 25:
+        raise commands.BadArgument("Provide between 2 and 25 non-empty options.")
+    if any(len(item) > 100 for item in choices):
+        raise commands.BadArgument("Each option must be at most 100 characters.")
+    return choices
+
+
+def _rating(user_id: int, subject: str) -> tuple[str, int]:
+    """Return a normalized subject and stable user-specific rating."""
+    normalized = " ".join(subject.split())
+    if not 1 <= len(normalized) <= 100:
+        raise commands.BadArgument("The subject must be 1 to 100 characters long.")
+    seed = f"{user_id}:{normalized.casefold()}".encode()
+    score = int.from_bytes(hashlib.blake2b(seed, digest_size=2).digest()) % 101
+    return normalized, score
+
+
+EIGHT_BALL_ANSWERS = (
+    "It is certain.",
+    "Outlook good.",
+    "Signs point to yes.",
+    "Ask again later.",
+    "Cannot predict now.",
+    "Don't count on it.",
+    "Very doubtful.",
+    "My sources say no.",
+)
+
+WOULD_YOU_RATHER = (
+    "Always know when someone is lying, or always get away with one lie a day?",
+    "Explore a new planet, or the deepest point of the ocean?",
+    "Have perfect aim, or perfect game sense?",
+    "Pause time for ten seconds, or rewind time for ten seconds?",
+    "Give up music for a year, or games for a year?",
+    "Be the funniest person in every room, or the smartest?",
+    "Only play ranked, or never play ranked again?",
+    "Have unlimited travel, or unlimited food?",
+)
 
 
 class InvokerView(discord.ui.View):
@@ -170,8 +241,27 @@ class TriviaAnswerButton(discord.ui.Button):
             description=(f"**Answer:** {answer}\n\n{view.question.explanation}"),
             color=discord.Color.green() if correct else discord.Color.red(),
         )
+        view.add_item(TriviaAgainButton())
         await interaction.response.edit_message(embed=embed, view=view)
-        view.stop()
+
+
+class TriviaAgainButton(discord.ui.Button):
+    """Start another reviewed trivia question without rerunning the command."""
+
+    def __init__(self) -> None:
+        """Create the replay control on a separate row."""
+        super().__init__(label="Another question", emoji="🔁", row=2)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """Replace the result with a fresh question for the same player."""
+        old_view = self.view
+        if not isinstance(old_view, TriviaView):
+            return
+        choices = [item for item in TRIVIA_QUESTIONS if item != old_view.question]
+        new_view = TriviaView(old_view.author_id, _pick(choices))
+        new_view.message = interaction.message
+        old_view.stop()
+        await interaction.response.edit_message(embed=new_view.embed(), view=new_view)
 
 
 class TriviaView(InvokerView):
@@ -196,6 +286,10 @@ class TriviaView(InvokerView):
 class FunGames(commands.Cog):
     """Lightweight games and conversation starters."""
 
+    fun = app_commands.Group(
+        name="fun", description="Play quick games and use conversation starters."
+    )
+
     def __init__(self, bot: commands.Bot) -> None:
         """Store the bot instance."""
         self.bot = bot
@@ -211,16 +305,7 @@ class FunGames(commands.Cog):
         self, ctx: commands.Context, count: commands.Range[int, 1, 20] = 1
     ) -> None:
         """Flip virtual coins."""
-        results = [_pick(("Heads", "Tails")) for _ in range(count)]
-        heads = results.count("Heads")
-        embed = discord.Embed(
-            title="Coin flip 🪙",
-            description=" • ".join(results),
-            color=ACCENT,
-        )
-        if count > 1:
-            embed.set_footer(text=f"Heads {heads} • Tails {count - heads}")
-        await ctx.send(embed=embed)
+        await ctx.send(embed=_coinflip_embed(count))
 
     @commands.hybrid_command(
         with_app_command=False,
@@ -236,14 +321,7 @@ class FunGames(commands.Cog):
         sides: commands.Range[int, 2, 1000] = 6,
     ) -> None:
         """Roll dice and show each result plus its total."""
-        values = [secrets.randbelow(sides) + 1 for _ in range(dice)]
-        await ctx.send(
-            embed=discord.Embed(
-                title=f"{dice}d{sides} 🎲",
-                description=" + ".join(map(str, values)) + f" = **{sum(values)}**",
-                color=ACCENT,
-            )
-        )
+        await ctx.send(embed=_dice_embed(dice, sides))
 
     @commands.hybrid_command(
         with_app_command=False,
@@ -254,10 +332,7 @@ class FunGames(commands.Cog):
     @commands.cooldown(2, 4, commands.BucketType.user)
     async def choose(self, ctx: commands.Context, *, options: str) -> None:
         """Choose one clean, non-empty option."""
-        separator = "|" if "|" in options else ","
-        choices = [value.strip() for value in options.split(separator) if value.strip()]
-        if not 2 <= len(choices) <= 25:
-            raise commands.BadArgument("Provide between 2 and 25 options.")
+        choices = _options(options)
         await ctx.send(f"I choose: **{discord.utils.escape_markdown(_pick(choices))}**")
 
     @commands.hybrid_command(
@@ -275,20 +350,13 @@ class FunGames(commands.Cog):
             raise commands.BadArgument(
                 "Ask a complete question (at least 5 characters)."
             )
-        answers = (
-            "It is certain.",
-            "Outlook good.",
-            "Signs point to yes.",
-            "Ask again later.",
-            "Cannot predict now.",
-            "Don't count on it.",
-            "Very doubtful.",
-            "My sources say no.",
-        )
         await ctx.send(
             embed=discord.Embed(
                 title="Magic eight ball 🎱",
-                description=f"**Q:** {question[:500]}\n**A:** {_pick(answers)}",
+                description=(
+                    f"**Q:** {discord.utils.escape_markdown(question[:500])}\n"
+                    f"**A:** {_pick(EIGHT_BALL_ANSWERS)}"
+                ),
                 color=ACCENT,
             )
         )
@@ -301,11 +369,7 @@ class FunGames(commands.Cog):
     )
     async def rate(self, ctx: commands.Context, *, subject: str) -> None:
         """Generate a stable user-specific score without global randomness."""
-        subject = " ".join(subject.split())
-        if not 1 <= len(subject) <= 100:
-            raise commands.BadArgument("The subject must be 1 to 100 characters long.")
-        seed = f"{ctx.author.id}:{subject.casefold()}".encode()
-        score = int.from_bytes(hashlib.blake2b(seed, digest_size=2).digest()) % 101
+        subject, score = _rating(ctx.author.id, subject)
         await ctx.send(
             f"I rate **{discord.utils.escape_markdown(subject)}** **{score}/100**."
         )
@@ -340,3 +404,164 @@ class FunGames(commands.Cog):
         """Start one interactive trivia question."""
         view = TriviaView(ctx.author.id, _pick(TRIVIA_QUESTIONS))
         view.message = await ctx.send(embed=view.embed(), view=view)
+
+    @commands.hybrid_command(
+        with_app_command=False,
+        brief="Measure the stable compatibility between two members.",
+        description="Generate a repeatable, playful compatibility score.",
+        usage="<first member> [second member]",
+    )
+    @commands.guild_only()
+    @commands.cooldown(2, 5, commands.BucketType.user)
+    async def ship(
+        self,
+        ctx: commands.Context,
+        first: discord.Member,
+        second: discord.Member | None = None,
+    ) -> None:
+        """Show a stable, clearly playful compatibility score."""
+        second = second or ctx.author
+        score = self._ship_score(first.id, second.id)
+        await ctx.send(embed=self._ship_embed(first, second, score))
+
+    @commands.hybrid_command(
+        with_app_command=False,
+        aliases=["wyr"],
+        brief="Get a would-you-rather question.",
+        description="Start a quick conversation with a reviewed either-or prompt.",
+        usage="",
+    )
+    @commands.cooldown(2, 5, commands.BucketType.user)
+    async def wouldyourather(self, ctx: commands.Context) -> None:
+        """Send one bounded conversation prompt."""
+        await ctx.send(embed=self._would_you_rather_embed())
+
+    @staticmethod
+    def _ship_score(first_id: int, second_id: int) -> int:
+        pair = ":".join(map(str, sorted((first_id, second_id)))).encode()
+        return int.from_bytes(hashlib.blake2b(pair, digest_size=2).digest()) % 101
+
+    @staticmethod
+    def _ship_embed(
+        first: discord.Member, second: discord.Member, score: int
+    ) -> discord.Embed:
+        filled = round(score / 10)
+        meter = "💗" * filled + "🖤" * (10 - filled)
+        return discord.Embed(
+            title="Compatibility check 💞",
+            description=(
+                f"{first.mention} × {second.mention}\n\n{meter}\n**{score}% compatible**"
+            ),
+            color=ACCENT,
+        ).set_footer(text="Just for fun — compatibility is not a real measurement.")
+
+    @staticmethod
+    def _would_you_rather_embed() -> discord.Embed:
+        return discord.Embed(
+            title="Would you rather…? 🤔",
+            description=_pick(WOULD_YOU_RATHER),
+            color=ACCENT,
+        ).set_footer(text="Tell the channel your choice and why.")
+
+    @fun.command(name="coinflip", description="Flip between one and twenty coins.")
+    @app_commands.checks.cooldown(2, 4, key=lambda interaction: interaction.user.id)
+    async def slash_coinflip(
+        self,
+        interaction: discord.Interaction,
+        count: app_commands.Range[int, 1, 20] = 1,
+    ) -> None:
+        """Flip coins through `/fun coinflip`."""
+        await interaction.response.send_message(embed=_coinflip_embed(count))
+
+    @fun.command(name="roll", description="Roll configurable virtual dice.")
+    @app_commands.checks.cooldown(2, 4, key=lambda interaction: interaction.user.id)
+    async def slash_roll(
+        self,
+        interaction: discord.Interaction,
+        dice: app_commands.Range[int, 1, 20] = 1,
+        sides: app_commands.Range[int, 2, 1000] = 6,
+    ) -> None:
+        """Roll dice through `/fun roll`."""
+        await interaction.response.send_message(embed=_dice_embed(dice, sides))
+
+    @fun.command(name="choose", description="Choose from comma-separated options.")
+    @app_commands.checks.cooldown(2, 4, key=lambda interaction: interaction.user.id)
+    async def slash_choose(
+        self, interaction: discord.Interaction, options: str
+    ) -> None:
+        """Choose one supplied option through `/fun choose`."""
+        choices = _options(options)
+        result = discord.utils.escape_markdown(_pick(choices))
+        await interaction.response.send_message(f"I choose: **{result}**")
+
+    @fun.command(name="eightball", description="Ask the magic eight ball a question.")
+    @app_commands.checks.cooldown(2, 5, key=lambda interaction: interaction.user.id)
+    async def slash_eightball(
+        self, interaction: discord.Interaction, question: str
+    ) -> None:
+        """Ask the eight ball through `/fun eightball`."""
+        question = question.strip()
+        if len(question) < 5:
+            raise commands.BadArgument("Ask a complete question of 5+ characters.")
+        embed = discord.Embed(
+            title="Magic eight ball 🎱",
+            description=(
+                f"**Q:** {discord.utils.escape_markdown(question[:500])}\n"
+                f"**A:** {_pick(EIGHT_BALL_ANSWERS)}"
+            ),
+            color=ACCENT,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @fun.command(name="rate", description="Give a subject a stable playful rating.")
+    async def slash_rate(self, interaction: discord.Interaction, subject: str) -> None:
+        """Rate one subject through `/fun rate`."""
+        subject, score = _rating(interaction.user.id, subject)
+        subject = discord.utils.escape_markdown(subject)
+        await interaction.response.send_message(
+            f"I rate **{subject}** **{score}/100**."
+        )
+
+    @fun.command(name="rps", description="Play interactive rock-paper-scissors.")
+    @app_commands.checks.cooldown(1, 5, key=lambda interaction: interaction.user.id)
+    async def slash_rps(self, interaction: discord.Interaction) -> None:
+        """Start rock-paper-scissors through `/fun rps`."""
+        view = RockPaperScissorsView(interaction.user.id)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="Rock, paper, scissors",
+                description="Choose your move below.",
+                color=ACCENT,
+            ),
+            view=view,
+        )
+        view.message = await interaction.original_response()
+
+    @fun.command(name="trivia", description="Play interactive multiple-choice trivia.")
+    @app_commands.checks.cooldown(1, 8, key=lambda interaction: interaction.user.id)
+    async def slash_trivia(self, interaction: discord.Interaction) -> None:
+        """Start trivia through `/fun trivia`."""
+        view = TriviaView(interaction.user.id, _pick(TRIVIA_QUESTIONS))
+        await interaction.response.send_message(embed=view.embed(), view=view)
+        view.message = await interaction.original_response()
+
+    @fun.command(name="ship", description="Check two members' playful compatibility.")
+    @app_commands.checks.cooldown(2, 5, key=lambda interaction: interaction.user.id)
+    async def slash_ship(
+        self,
+        interaction: discord.Interaction,
+        first: discord.Member,
+        second: discord.Member | None = None,
+    ) -> None:
+        """Show compatibility through `/fun ship`."""
+        second = second or interaction.user
+        score = self._ship_score(first.id, second.id)
+        await interaction.response.send_message(
+            embed=self._ship_embed(first, second, score)
+        )
+
+    @fun.command(name="would-you-rather", description="Get an either-or prompt.")
+    @app_commands.checks.cooldown(2, 5, key=lambda interaction: interaction.user.id)
+    async def slash_would_you_rather(self, interaction: discord.Interaction) -> None:
+        """Send a conversation prompt through `/fun would-you-rather`."""
+        await interaction.response.send_message(embed=self._would_you_rather_embed())

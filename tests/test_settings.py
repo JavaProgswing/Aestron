@@ -46,6 +46,7 @@ def test_runtime_settings_have_safe_project_agnostic_defaults():
     assert settings.support_server_invite is None
     assert settings.default_prefix == "a!"
     assert settings.version == "development"
+    assert settings.sync_commands_on_startup is True
 
 
 def test_runtime_settings_parse_optional_values():
@@ -74,6 +75,7 @@ def test_runtime_settings_parse_optional_values():
         ({"DEFAULT_PREFIX": ""}, "DEFAULT_PREFIX"),
         ({"AESTRON_SITE_BASE_URL": "not-a-url"}, "absolute HTTP"),
         ({"AESTRON_SERVICE_TOKEN": "too-short"}, "at least 32"),
+        ({"SYNC_COMMANDS_ON_STARTUP": "sometimes"}, "must be one of"),
     ],
 )
 def test_runtime_settings_reject_invalid_values(environment, message):

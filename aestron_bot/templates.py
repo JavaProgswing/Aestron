@@ -68,10 +68,36 @@ class Templates(commands.Cog):
     async def _create_backup(
         self, guild: discord.Guild, description: str | None = None
     ) -> discord.Template:
-        return await guild.create_template(
-            name=f"{guild.name} backup",
-            description=(description or "Aestron server backup")[:120],
-        )
+        """Create the guild template or refresh Discord's single existing one."""
+        name = f"{guild.name} backup"[:100]
+        template_description = (description or "Aestron server backup")[:120]
+        templates = await guild.templates()
+        if templates:
+            synced = await templates[0].sync()
+            return await synced.edit(
+                name=name,
+                description=template_description,
+            )
+
+        try:
+            return await guild.create_template(
+                name=name,
+                description=template_description,
+            )
+        except discord.HTTPException as error:
+            # Another process may create the one allowed guild template after
+            # our initial lookup. Recover from that race instead of surfacing
+            # Discord error 30031 to the command user.
+            if error.code != 30031:
+                raise
+            templates = await guild.templates()
+            if not templates:
+                raise
+            synced = await templates[0].sync()
+            return await synced.edit(
+                name=name,
+                description=template_description,
+            )
 
     async def _owned_template(
         self, guild: discord.Guild, code: str
@@ -90,8 +116,12 @@ class Templates(commands.Cog):
     @commands.hybrid_command(
         with_app_command=False,
         aliases=["genbackuptemplate", "backup"],
-        brief="Create a private backup template for this server.",
-        description="Create a new Discord template without deleting existing backups.",
+        brief="Create or refresh this server's private backup template.",
+        description=(
+            "Create the server's Discord template, or refresh its existing template "
+            "from the current channels, roles, and settings. Discord allows one "
+            "template per server."
+        ),
         usage="[description]",
     )
     @commands.guild_only()
@@ -100,7 +130,7 @@ class Templates(commands.Cog):
     async def backuptemplate(
         self, ctx: commands.Context, *, description: str | None = None
     ) -> None:
-        """Create a backup and deliver its secret URL privately when possible."""
+        """Create or refresh a backup and deliver its URL privately when possible."""
         lock = self._lock(ctx.guild.id)
         if lock.locked():
             raise commands.MaxConcurrencyReached(1, commands.BucketType.guild)
@@ -116,7 +146,9 @@ class Templates(commands.Cog):
                 ephemeral=True,
             )
             return
-        await ctx.send("Backup created and sent to your DMs.", ephemeral=True)
+        await ctx.send(
+            "Backup template refreshed and sent to your DMs.", ephemeral=True
+        )
 
     @commands.cooldown(2, 20, commands.BucketType.member)
     @commands.hybrid_command(
@@ -137,7 +169,7 @@ class Templates(commands.Cog):
         await ctx.send(embed=_template_embed(fetched), ephemeral=True)
 
     @template.command(
-        name="backup", description="Create a private server backup template."
+        name="backup", description="Create or refresh the server backup template."
     )
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -145,7 +177,7 @@ class Templates(commands.Cog):
     async def slash_backup(
         self, interaction: discord.Interaction, description: str | None = None
     ) -> None:
-        """Create a backup through slash commands."""
+        """Create or refresh the server backup through slash commands."""
         await interaction.response.defer(ephemeral=True, thinking=True)
         lock = self._lock(interaction.guild_id)
         if lock.locked():

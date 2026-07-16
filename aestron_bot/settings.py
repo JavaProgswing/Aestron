@@ -21,6 +21,19 @@ def _optional_snowflake(values: Mapping[str, str], name: str) -> int | None:
     return value
 
 
+def _boolean_setting(values: Mapping[str, str], name: str, *, default: bool) -> bool:
+    """Parse a strict environment boolean with an actionable failure."""
+    raw_value = values.get(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    normalized = raw_value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be one of: 1, 0, true, false, yes, no, on, off.")
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeSettings:
     """Safe operational settings; optional integrations are disabled when unset."""
@@ -35,6 +48,7 @@ class RuntimeSettings:
     version: str
     site_base_url: str | None
     aestron_service_token: str | None
+    sync_commands_on_startup: bool
 
     @classmethod
     def from_environment(
@@ -100,6 +114,9 @@ class RuntimeSettings:
             ),
             site_base_url=site_base_url or None,
             aestron_service_token=service_token or None,
+            sync_commands_on_startup=_boolean_setting(
+                values, "SYNC_COMMANDS_ON_STARTUP", default=True
+            ),
         )
 
 

@@ -62,7 +62,7 @@ For development checks, install `requirements-dev.txt` instead, then run:
 The command validator registers the same cogs as production without logging in.
 It rejects duplicate names/aliases and commands missing a summary, description,
 help body, or parameter usage. The in-bot help command, category help, command
-help, and `/cmdusage <command>` views all use this validated metadata; usage
+help, and `/usage <command>` views all use this validated metadata; usage
 remains available even when no demonstration GIF exists. The prefix defaults to
 `a!` and can be changed with `DEFAULT_PREFIX`.
 
@@ -101,18 +101,26 @@ when the node has no working audio source.
 - `/voicehealth` — diagnose the Lavalink node and latest voice error.
 - `/stats` — show commands used, successful/failed invocations, current and
   historical guild activity, uptime, latency, process activity, and music health.
+- `/help` presents eight task-based categories instead of exposing internal cog
+  boundaries. Command details include canonical usage, option descriptions,
+  aliases, permissions, and grouped subcommands.
 - `/suggest <title> <details>` and `/reportbug <feature> <details>` — submit
   validated feedback to the shared website/admin queue.
-- `/linkaccount` and `/unlinkaccount` — secure opt-in Riot account linking.
-- `/vstats [member] [matches]` — interactive overview, history, agent/map
+- `/valorant link` and `/valorant unlink` — secure opt-in Riot account linking.
+- `/valorant stats [member] [matches]` — interactive overview, history, agent/map
   context, match selector, coaching prompts, and metric guide.
-- `a!matchhistory`, `/matchanalysis`, and `/valcoach` — recent match cards,
+- `/valorant history`, `/valorant match`, and `/valorant coach` — recent match cards,
   round-level match inspection, and evidence-based post-match review. Match
-  history is also available from the selector in `/vstats`.
-- `a!rps` and `a!trivia` — interactive invoker-only games. Additional text games
-  are `a!coinflip`, `a!roll`, `a!choose`, `a!eightball`, and `a!rate`.
+  history is also available from the selector in `/valorant stats`.
+- `/fun rps` and `/fun trivia` — interactive invoker-only games with replay.
+  `/fun coinflip|roll|choose|eightball|rate|ship|would-you-rather` provide
+  validated quick games and conversation starters.
+- `/social welcome` and `/social wanted` — public image cards with clean embeds;
+  the matching prefix commands are `a!welcome` and `a!wanted`.
+- `/community youtube` and `/community chess` — start Discord activities in your
+  current voice channel.
 - `/antiraid enable|disable|status|configure` — configure a bounded destructive
-  audit-event window and choose a quarantine or ban response. Bot owners, the
+  audit-event window and choose log-only or dangerous-role removal. Bot owners, the
   guild owner, and managed roles are protected from automated action.
 - `/automod set|status` — enable spam, link/invite, or Perspective-backed
   profanity filtering per channel and inspect required permissions. Actions use
@@ -213,6 +221,7 @@ CHANNEL_BUG_LOGGING_ID=your-bug-channel-id
 CHANNEL_DEV_ID=your-development-channel-id
 SUPPORT_SERVER_INVITE=https://discord.gg/your-invite
 DEFAULT_PREFIX=a!
+SYNC_COMMANDS_ON_STARTUP=true
 BOT_VERSION=development
 ```
 

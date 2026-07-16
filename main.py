@@ -10,24 +10,19 @@ import re
 import secrets
 import sys
 import time
-from collections import Counter
 from datetime import datetime, timedelta
-from io import BytesIO
 from pathlib import Path
 
 import aiohttp
 import discord
 import mystbin
-import psutil
 from aiohttp.client import ClientTimeout
-from bs4 import BeautifulSoup
 from discord import Color, app_commands
 from discord.ext import commands
 from discord.ext.commands import BucketType
 from dotenv import load_dotenv
-from langdetect import detect
+from langdetect import LangDetectException, detect
 from mcstatus import JavaServer
-from PIL import Image, ImageDraw, ImageFont
 from translate import Translator
 
 from aestron_bot import (
@@ -39,9 +34,11 @@ from aestron_bot import (
     RuntimeSettings,
     RuntimeState,
     Statistics,
+    audit_application_command_metadata,
     audit_command_metadata,
     command_invocation,
     format_exception,
+    normalize_application_command_metadata,
     normalize_command_metadata,
 )
 from aestron_bot.antiraid import AntiRaid
@@ -49,18 +46,17 @@ from aestron_bot.audit_logging import AuditLogging
 from aestron_bot.automod import AutoMod
 from aestron_bot.calculator import evaluate_expression
 from aestron_bot.calls import Calls
+from aestron_bot.community import Community
 from aestron_bot.feedback import Feedback
 from aestron_bot.fun import FunGames
 from aestron_bot.giveaways import Giveaways
-from aestron_bot.help_ui import (
-    HelpCategory,
-    InteractiveHelpView,
-    build_command_help_embed,
-)
+from aestron_bot.help_command import AestronHelpCommand
+from aestron_bot.info import AestronInfo
 from aestron_bot.leveling import Leveling
 from aestron_bot.moderation import Moderation
 from aestron_bot.music import Music
 from aestron_bot.profiles import build_profile_embed
+from aestron_bot.social import Social
 from aestron_bot.templates import Templates
 from aestron_bot.tickets import Tickets
 from aestron_bot.valorant import Valorant
@@ -85,12 +81,6 @@ PERSPECTIVE_ANALYZE_URL = (
 
 mystbin_client = mystbin.Client()
 
-EMBEDDED_APPLICATION_IDS = {
-    "youtube": 880218394199220334,
-    "poker": 755827207812677713,
-    "chess": 832012774040141894,
-}
-
 
 async def search_sphinx_docs(location, query):
     url = "https://idevision.net/api/public/rtfm.sphinx"
@@ -106,16 +96,6 @@ async def search_sphinx_docs(location, query):
     return result.get("nodes", {})
 
 
-async def create_activity_invite(channel, activity, *, max_age=3600, max_uses=0):
-    invite = await channel.create_invite(
-        max_age=max_age,
-        max_uses=max_uses,
-        target_type=discord.InviteTarget.embedded_application,
-        target_application_id=EMBEDDED_APPLICATION_IDS[activity],
-    )
-    return str(invite)
-
-
 async def send_to_configured_channel(channel_id, *args, **kwargs):
     """Send to an optional configured channel with consistent diagnostics."""
     if channel_id is None:
@@ -128,19 +108,6 @@ async def send_to_configured_channel(channel_id, *args, **kwargs):
     return await channel.send(*args, **kwargs)
 
 
-async def chatbotfetch(session, url, params):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36"
-    }
-    timeout = ClientTimeout(total=15)
-    async with session.get(
-        url, params=params, headers=headers, timeout=timeout
-    ) as resp:
-        resp.raise_for_status()
-        response_json = await resp.json()
-    return response_json["cnt"]
-
-
 async def fetch_json(session, url, headers=None):
     if headers is None:
         headers = {}
@@ -149,261 +116,6 @@ async def fetch_json(session, url, headers=None):
     ) as response:
         response.raise_for_status()
         return await response.json()
-
-
-class ChatExtractor:
-    async def aget_response(self, _message, author):
-        session = client.session
-        url = "https://api.brainshop.ai/get"
-        resp = await chatbotfetch(
-            session,
-            url,
-            {
-                "bid": CHATBOT_ID,
-                "key": CHATBOT_TOKEN,
-                "uid": author.id,
-                "msg": _message,
-            },
-        )
-        return resp
-
-
-class LyricsExtractor:
-    async def aget_lyrics(self, songname):
-        url = "https://api.popcat.xyz/lyrics"
-        session = client.session
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36"
-        }
-        timeout = ClientTimeout(total=15)
-        async with session.get(
-            url,
-            params={"song": songname},
-            headers=headers,
-            timeout=timeout,
-        ) as resp:
-            resp.raise_for_status()
-            resptext = await resp.json()
-        return resptext
-
-
-extract_lyrics = LyricsExtractor()
-# Sql database 1
-# REQUIRES API KEY
-
-CHATBOT_ID = os.getenv("CHATBOT_ID")
-CHATBOT_TOKEN = os.getenv("CHATBOT_TOKEN")
-CHANNEL_ERROR_LOGGING_ID = SETTINGS.error_logging_channel_id
-CHANNEL_BUG_LOGGING_ID = SETTINGS.bug_logging_channel_id
-CHANNEL_DEV_ID = SETTINGS.development_channel_id
-# REQUIRES API KEY
-# https://brainshop.ai/
-
-
-async def get_guild_prefixid(guildid):
-    if guildid:
-        try:
-            async with client.database.pool.acquire() as con:
-                prefixeslist = await con.fetchrow(
-                    "SELECT * FROM prefixes WHERE guildid = $1", guildid
-                )
-            if prefixeslist is None:
-                statement = """INSERT INTO prefixes (guildid,
-                                    prefix) VALUES($1, $2);"""
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, guildid, SETTINGS.default_prefix)
-                chars = SETTINGS.default_prefix
-            else:
-                chars = prefixeslist["prefix"]
-        except Exception:
-            chars = SETTINGS.default_prefix
-    else:
-        chars = SETTINGS.default_prefix
-    return chars
-
-
-async def get_guild_prefix(guild):
-    if guild:
-        try:
-            async with client.database.pool.acquire() as con:
-                prefixeslist = await con.fetchrow(
-                    "SELECT * FROM prefixes WHERE guildid = $1", guild.id
-                )
-            if prefixeslist is None:
-                statement = """INSERT INTO prefixes (guildid,
-                                    prefix) VALUES($1, $2);"""
-                async with client.database.pool.acquire() as con:
-                    await con.execute(statement, guild.id, SETTINGS.default_prefix)
-                chars = SETTINGS.default_prefix
-            else:
-                chars = prefixeslist["prefix"]
-        except Exception:
-            chars = SETTINGS.default_prefix
-    else:
-        chars = SETTINGS.default_prefix
-    return chars
-
-
-class MyHelp(commands.HelpCommand):
-    """Render consistent bot, category, group, and command documentation."""
-
-    def __init__(self):
-        attrs = {
-            "cooldown": commands.CooldownMapping.from_cooldown(
-                1, 5, commands.BucketType.member
-            ),
-            "aliases": ["commands"],
-            "brief": "Show command categories or detailed command help.",
-            "description": (
-                "Show available command categories, or get usage and aliases for "
-                "one command or category."
-            ),
-            "help": (
-                "Show available command categories, or get usage and aliases for "
-                "one command or category."
-            ),
-            "usage": "[command or category]",
-        }
-        super().__init__(command_attrs=attrs)
-
-    def set_footer(self, embed, text=None):
-        """Add a consistent footer without assuming a project-specific invite."""
-        footer_text = text or f"Aestron v{SETTINGS.version}"
-        if SETTINGS.support_server_invite:
-            footer_text += f" · Support: {SETTINGS.support_server_invite}"
-        embed.set_footer(
-            text=footer_text,
-            icon_url=str(self.context.author.display_avatar),
-        )
-
-    async def on_help_command_error(self, ctx, error):
-        await super().on_help_command_error(ctx, error)
-
-    async def send_bot_help(self, mapping):
-        prefix = self.context.clean_prefix
-        embed = discord.Embed(
-            title="Aestron help",
-            description=(
-                f"Use `{prefix}help <command>` for detailed usage or "
-                f"`{prefix}help <category>` to list that category's commands."
-            ),
-            color=discord.Color.blurple(),
-        )
-        command_count = 0
-        categories: list[HelpCategory] = []
-        for cog, cog_commands in mapping.items():
-            visible = await self.filter_commands(cog_commands, sort=True)
-            if not visible:
-                continue
-            command_count += len(visible)
-            category = cog.qualified_name if cog is not None else "Other"
-            summary = (
-                cog.description if cog is not None else "Other commands"
-            ) or "Commands"
-            categories.append(
-                HelpCategory(
-                    name=category,
-                    description=summary,
-                    commands=tuple(visible),
-                )
-            )
-        embed.add_field(
-            name="Available commands",
-            value=(
-                f"{command_count} commands visible to you · Aestron v{SETTINGS.version}"
-            ),
-            inline=False,
-        )
-        self.set_footer(embed)
-        view = InteractiveHelpView(
-            bot=self.context.bot,
-            author_id=getattr(self.context.author, "id", 0),
-            prefix=prefix,
-            home_embed=embed,
-            categories=categories,
-        )
-        view.message = await self.context.send(embed=view.render(), view=view)
-
-    # !help <command>
-    async def send_command_help(self, commandname):
-        command = commandname
-        embed = build_command_help_embed(command, self.context.clean_prefix)
-        channel = self.get_destination()
-        self.set_footer(embed)
-        usage_path = Path(f"resources/command_usages/{command.name}.gif")
-        if await asyncio.to_thread(usage_path.is_file):
-            embed.set_image(url=f"attachment://{command.name}.gif")
-            try:
-                file = discord.File(usage_path, filename=f"{command.name}.gif")
-                await channel.send(embed=embed, file=file)
-                return
-            except (OSError, discord.HTTPException):
-                LOGGER.warning(
-                    "Could not send usage image command=%s", command.name, exc_info=True
-                )
-                embed.remove_image()
-        await channel.send(embed=embed)
-
-    # !help <group>
-    async def send_group_help(self, commandname):
-        command = commandname
-        visible = await self.filter_commands(command.commands, sort=True)
-        embed = discord.Embed(
-            title=f"{command.qualified_name} help",
-            description=command.help or command.description,
-            color=0x7C5CFC,
-        )
-        for c in visible[:8]:
-            embed.add_field(
-                name=command_invocation(c, self.context.clean_prefix),
-                value=c.brief,
-                inline=False,
-            )
-        channel = self.get_destination()
-        self.set_footer(embed)
-        category = HelpCategory(
-            name=command.qualified_name,
-            description=command.help or command.description,
-            commands=tuple(visible),
-        )
-        view = InteractiveHelpView(
-            bot=self.context.bot,
-            author_id=getattr(self.context.author, "id", 0),
-            prefix=self.context.clean_prefix,
-            home_embed=embed,
-            categories=[category],
-            initial_category=category.name,
-        )
-        view.message = await channel.send(embed=view.render(), view=view)
-
-    # !help <cog>
-    async def send_cog_help(self, cog):
-        visible = await self.filter_commands(cog.get_commands(), sort=True)
-        if not visible:
-            await self.context.send(
-                "No commands in this category are available to you."
-            )
-            return
-        category = HelpCategory(
-            name=cog.qualified_name,
-            description=cog.description or "Commands in this category.",
-            commands=tuple(visible),
-        )
-        home_embed = discord.Embed(
-            title=f"{cog.qualified_name} help",
-            description=category.description,
-            color=0x7C5CFC,
-        )
-        self.set_footer(home_embed)
-        view = InteractiveHelpView(
-            bot=self.context.bot,
-            author_id=getattr(self.context.author, "id", 0),
-            prefix=self.context.clean_prefix,
-            home_embed=home_embed,
-            categories=[category],
-            initial_category=category.name,
-        )
-        view.message = await self.context.send(embed=view.render(), view=view)
 
 
 async def addmoney(ctx, userid, money):
@@ -668,14 +380,13 @@ def get_cog_types():
         Valorant,
         Misc,
         Calls,
-        Fun,
+        Community,
         FunGames,
         Social,
         Giveaways,
         Support,
         Feedback,
         Music,
-        YoutubeTogether,
         CustomCommands,
     )
 
@@ -700,7 +411,10 @@ async def run_bot():
     await client.add_cog(Statistics(client, client.statistics))
     await client.load_extension("jishaku")
     normalize_command_metadata(client)
-    documentation_issues = audit_command_metadata(client)
+    normalize_application_command_metadata(client)
+    documentation_issues = audit_command_metadata(
+        client
+    ) + audit_application_command_metadata(client)
     if documentation_issues:
         details = "; ".join(
             f"{issue.command}.{issue.field}: {issue.detail}"
@@ -712,14 +426,57 @@ async def run_bot():
         len(list(client.walk_commands())),
         len(client.tree.get_commands()),
     )
+    await sync_application_commands()
     client.start_status = BotStartStatus.COMPLETED
     logging.log(
         logging.DEBUG,
         f"Bot has started in {discord.utils.utcnow() - client.launch_time}s!",
     )
     if len(sys.argv) > 1 and sys.argv[1] == "restart":
-        channel_id = int(sys.argv[2]) if len(sys.argv) > 2 else CHANNEL_DEV_ID
-        client.create_background_task(notify_restart(channel_id), name="notify-restart")
+        channel_id = (
+            int(sys.argv[2]) if len(sys.argv) > 2 else SETTINGS.development_channel_id
+        )
+        if channel_id is not None:
+            client.create_background_task(
+                notify_restart(channel_id), name="notify-restart"
+            )
+
+
+async def sync_application_commands() -> None:
+    """Reconcile Discord's global slash commands with the loaded command tree."""
+    if not SETTINGS.sync_commands_on_startup:
+        LOGGER.warning(
+            "Slash-command startup sync is disabled; removed commands may remain visible"
+        )
+        return
+
+    retry_delays = (1, 3)
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            synced = await client.tree.sync()
+        except discord.HTTPException:
+            if attempt == len(retry_delays):
+                LOGGER.exception(
+                    "Could not reconcile global slash commands after %s attempts",
+                    attempt + 1,
+                )
+                return
+            delay = retry_delays[attempt]
+            LOGGER.warning(
+                "Slash-command sync attempt %s failed; retrying in %ss",
+                attempt + 1,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        names = ", ".join(command.name for command in synced)
+        LOGGER.info(
+            "Global slash commands reconciled count=%s names=%s",
+            len(synced),
+            names,
+        )
+        return
 
 
 async def notify_restart(channel_id):
@@ -735,96 +492,6 @@ async def restart_process(channel_id=None):
         args.append(str(channel_id))
     await client.close()
     await asyncio.create_subprocess_exec(*args)
-
-
-def render_level_rank_image(top_members, destination):
-    """Render a level leaderboard off the Discord event loop."""
-    coordinates = [(52, 5), (290, 5), (512, 5), (729, 5), (962, 5)]
-    level_coordinates = [(86, 158), (339, 157), (555, 158), (783, 158), (1014, 157)]
-    rank_coordinates = [(86, 196), (339, 192), (555, 196), (783, 196), (1014, 194)]
-    name_coordinates = [(25, 234), (283, 237), (500, 236), (723, 241), (954, 237)]
-    with Image.open("./resources/levelrank/background.jpg") as source:
-        background = source.copy()
-    draw = ImageDraw.Draw(background)
-    font = ImageFont.truetype("./resources/common/consolasbold.ttf", 20)
-    for index, member in enumerate(top_members):
-        draw.text(
-            level_coordinates[index],
-            str(member["level"]),
-            (0, 125, 232),
-            font=font,
-        )
-        draw.text(rank_coordinates[index], str(index + 1), (255, 255, 255), font=font)
-        draw.text(name_coordinates[index], member["name"], (255, 255, 255), font=font)
-        with Image.open(BytesIO(member["avatar_bytes"])) as avatar_source:
-            avatar = avatar_source.convert("RGB").resize(
-                (100, 100), Image.Resampling.LANCZOS
-            )
-        background.paste(avatar, coordinates[index])
-    background.save(destination)
-
-
-def render_level_image(
-    avatar_bytes, member_name, rank, message_count, messages_per_level, destination
-):
-    """Render one member's level card off the Discord event loop."""
-    with Image.open("./resources/level/background.jpg") as source:
-        background = source.copy()
-    with Image.open(BytesIO(avatar_bytes)) as avatar_source:
-        avatar = avatar_source.convert("RGB").resize(
-            (239, 222), Image.Resampling.LANCZOS
-        )
-    background.paste(avatar, (71, 43))
-    draw = ImageDraw.Draw(background)
-    font = ImageFont.truetype("./resources/common/consolasbold.ttf", 30)
-    draw.text((402, 123), member_name, (255, 255, 255), font=font)
-    draw.text((796, 29), str(rank), (255, 255, 255), font=font)
-    level = message_count // messages_per_level
-    draw.text((1067, 25), str(level), (0, 125, 232), font=font)
-    total_level = (level // 20 + 1) * 20
-    current_level = level % 20
-    draw.text(
-        (1027, 122),
-        f"{current_level}/{total_level}",
-        (240, 240, 240),
-        font=font,
-    )
-    draw_progress_bar(draw, 401, 161, 737, 50, current_level / total_level)
-    background.save(destination)
-
-
-def render_welcome_image(
-    avatar_bytes, member_name, member_count, guild_name, destination
-):
-    """Render a welcome card off the Discord event loop."""
-    with Image.open("./resources/welcomeuser/background.jpg") as source:
-        background = source.copy()
-    with Image.open(BytesIO(avatar_bytes)) as avatar_source:
-        avatar = avatar_source.convert("RGB").resize(
-            (170, 170), Image.Resampling.LANCZOS
-        )
-    background.paste(avatar, (388, 195))
-    draw = ImageDraw.Draw(background)
-    font = ImageFont.truetype("./resources/common/consolasbold.ttf", 18)
-    draw.text(
-        (8, 465),
-        f"Welcome {member_name}, you are member {member_count} of {guild_name}.",
-        (255, 255, 255),
-        font=font,
-    )
-    background.save(destination)
-
-
-def render_wanted_image(avatar_bytes, destination):
-    """Render a wanted poster off the Discord event loop."""
-    with Image.open("./resources/wanteduser/background.jpg") as source:
-        background = source.copy()
-    with Image.open(BytesIO(avatar_bytes)) as avatar_source:
-        avatar = avatar_source.convert("RGB").resize(
-            (139, 172), Image.Resampling.LANCZOS
-        )
-    background.paste(avatar, (114, 153))
-    background.save(destination)
 
 
 class MyBot(commands.Bot):
@@ -898,7 +565,7 @@ client = MyBot(
     case_insensitive=True,
     intents=intents,
     activity=Dactivity,
-    help_command=MyHelp(),
+    help_command=AestronHelpCommand(),
     strip_after_prefix=True,
 )
 
@@ -919,7 +586,11 @@ class MinecraftVoiceEffects:
     ) -> "MinecraftVoiceEffects":
         """Connect without moving or replacing a music player."""
         author_voice = getattr(ctx.author, "voice", None)
-        if author_voice is None or author_voice.channel != channel:
+        if (
+            author_voice is None
+            or author_voice.channel is None
+            or author_voice.channel.id != channel.id
+        ):
             raise commands.BadArgument(
                 "Join the selected voice channel before enabling PvP sounds."
             )
@@ -1056,31 +727,6 @@ class Confirmpvp(discord.ui.View):
         self.stop()
 
 
-class ConfirmDecline(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=299)
-        self.value = None
-        self.authorcancel = None
-
-    # When the confirm button is pressed, set the inner value to `True` and
-    # stop the View from listening to more input.
-    # We also send the user an ephemeral message that we're confirming their choice.
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red)
-    async def confirm(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        # await interaction.response.send_message('Confirming', ephemeral=True)
-        if not interaction.channel.permissions_for(interaction.user).manage_guild:
-            await interaction.response.send_message(
-                "You do not have permissions to do so!", ephemeral=True
-            )
-            return
-        self.authorcancel = interaction.user.mention
-        self.value = True
-        self.stop()
-
-
 @client.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
@@ -1164,7 +810,20 @@ async def on_app_command_error(
 ):
     """Return private, actionable errors for grouped slash commands."""
     original = getattr(error, "original", error)
-    if isinstance(error, app_commands.CommandOnCooldown):
+    if isinstance(error, app_commands.CommandNotFound):
+        stale_name = getattr(error, "name", "that command")
+        LOGGER.info(
+            "Discord invoked stale application command name=%s user=%s guild=%s",
+            stale_name,
+            interaction.user.id,
+            interaction.guild_id,
+        )
+        message = (
+            f"`/{stale_name}` was removed or reorganized. Reopen Discord and use "
+            "`/help` to see the current command. Aestron reconciles its command list "
+            "at every startup."
+        )
+    elif isinstance(error, app_commands.CommandOnCooldown):
         message = f"That command is on cooldown. Try again in {error.retry_after:.1f}s."
     elif isinstance(error, app_commands.MissingPermissions):
         message = "You are missing: " + ", ".join(
@@ -1244,74 +903,11 @@ async def send_error_log_embed(ctx, error):
             inline=False,
         )
     try:
-        await send_to_configured_channel(CHANNEL_ERROR_LOGGING_ID, embed=embederror)
+        await send_to_configured_channel(
+            SETTINGS.error_logging_channel_id, embed=embederror
+        )
     except Exception:
         LOGGER.exception("Could not publish the command exception to Discord")
-
-
-def newaccount(member):
-    now_datetime = datetime.now()
-    added_seconds = timedelta(7, 0)
-    new_datetime = now_datetime - added_seconds
-    tuplea = new_datetime.timetuple()
-    timestamp_new = int(
-        datetime(
-            tuplea.tm_year,
-            tuplea.tm_mon,
-            tuplea.tm_mday,
-            tuplea.tm_hour,
-            tuplea.tm_min,
-            tuplea.tm_sec,
-        ).timestamp()
-    )
-    author_datetime = member.created_at
-    tuplea = author_datetime.timetuple()
-    timestamp_author = int(
-        datetime(
-            tuplea.tm_year,
-            tuplea.tm_mon,
-            tuplea.tm_mday,
-            tuplea.tm_hour,
-            tuplea.tm_min,
-            tuplea.tm_sec,
-        ).timestamp()
-    )
-    return timestamp_author > timestamp_new
-
-
-def getcodeblock(code):
-    lang = "None"
-    onecharstrip = "`"
-    threecharstrip = "```"
-    if code.startswith(threecharstrip) and code.endswith(threecharstrip):
-        langsep = code.split()[0]
-        if langsep != threecharstrip:
-            code = code.strip(onecharstrip)
-            lang = code.split()[0]
-            code = code.replace(lang, "", 1)
-        else:
-            code = code.strip(onecharstrip)
-            lang = "None"
-    elif code.startswith(onecharstrip) and code.endswith(onecharstrip):
-        code = code.strip(onecharstrip)
-    return (lang, code)
-
-
-async def loginfo(logguild, title, description, changes):
-    logchannel = None
-    async with client.database.pool.acquire() as con:
-        logchannellist = await con.fetchrow(
-            "SELECT * FROM logchannels WHERE guildid = $1", logguild.id
-        )
-    if logchannellist:
-        channelid = logchannellist["channelid"]
-        logchannel = logguild.get_channel(channelid)
-    msgsent = None
-    if logchannel:
-        embed = discord.Embed(title=title, description=description, color=Color.blue())
-        embed.add_field(name="** **", value=changes)
-        msgsent = await logchannel.send(embed=embed)
-    return msgsent
 
 
 async def uservoted(member: discord.Member):
@@ -1334,39 +930,12 @@ def is_bot_staff():
     return commands.check(predicate)
 
 
-def is_guild_owner():
-    def predicate(ctx):
-        return ctx.guild is not None and ctx.guild.owner_id == ctx.author.id
-
-    return commands.check(predicate)
-
-
 def checkstaff(member):
     return member.id in SETTINGS.owner_ids
 
 
-def check_caps_num(sentence):
-    orig_length = len(sentence)
-    count = 0
-    for element in sentence:
-        if element == "":
-            count += 1
-        if element.isupper():
-            count += 1
-    return (count / orig_length) * 100
-
-
-def check_emoji(value):
-    if value is None:
-        return "⚪"
-    if value:
-        return "🟢"
-    elif not value:
-        return "⚫"
-
-
 def get_progress(value, divisions=10):
-    value = int(value)
+    value = max(0, min(100, int(value)))
     progressstr = ""
     firstemojiload = "▰"
     middleemojiload = "▰"
@@ -1374,8 +943,6 @@ def get_progress(value, divisions=10):
     firstemojiunload = "▱"
     middleemojiunload = "▱"
     lastemojiunload = "▱"
-    if value < divisions:
-        value = divisions
     emojiscount = value // divisions
     totdivisions = 100 // divisions
     rememojiscount = totdivisions - emojiscount
@@ -1433,132 +1000,6 @@ async def check_profane(_message):
     return score_value >= 0.45
 
 
-def minimum_price(items):
-    min_cost = 0
-    for item in items:
-        if item.cost > 0 and item.cost > min_cost:
-            min_cost = item.cost
-    return min_cost
-
-
-def buy_sequence(items, bal, result):
-    if minimum_price(items) > bal:
-        logging.log(logging.DEBUG, result)
-    else:
-        for item_a in items:
-            if item_a.cost <= bal:
-                if isinstance(item_a, Armor) and (
-                    Armor("No shields", 0) in items
-                    or Armor("Heavy shields", 1000) in items
-                    or Armor("Light shields", 400) in items
-                ):
-                    continue
-                result = result + item_a.name + ","
-                bal = bal - item_a.cost
-                buy_sequence(items, bal, result)
-
-
-class Armor:
-    def __init__(self, name, cost):
-        self.name = name
-        self.cost = cost
-
-    @staticmethod
-    def getarmor():
-        return [
-            Armor("Heavy shields", 1000),
-            Armor("Light shields", 400),
-            Armor("No shields", 0),
-        ]
-
-    def __eq__(self, other):
-        if not isinstance(other, Armor):
-            # don't attempt to compare against unrelated types
-            return NotImplemented
-
-        return self.name == other.name and self.cost == other.cost
-
-
-def get_loadout_permutation(abilities, weapons, spenteco):
-    shields = Armor.getarmor()
-    items = abilities + weapons + shields
-    for item in items:
-        spenteco = spenteco - item.cost
-        if item.cost <= spenteco:
-            buy_sequence(items, spenteco, item.name + ",")
-
-
-async def check_spam(_message):
-    response = await analyze_message(_message, ["SPAM"])
-    if response is None:
-        return False
-    attribute_dict = response["attributeScores"]["SPAM"]
-    return attribute_dict["spanScores"][0]["score"]["value"] >= 0.9
-
-
-async def check_incoherent(_message):
-    response = await analyze_message(_message, ["INCOHERENT"])
-    if response is None:
-        return False
-    attribute_dict = response["attributeScores"]["INCOHERENT"]
-    return attribute_dict["spanScores"][0]["score"]["value"] >= 0.9
-
-
-async def dang_perm(ctx, author, the_channel=None):
-    if the_channel is None:
-        the_channel = ctx.channel
-    the_guild = the_channel.guild
-    if isinstance(the_channel, int):
-        the_channel = the_guild.get_channel(the_channel)
-    if author is None:
-        author = the_guild.me
-    if isinstance(author, int):
-        author = the_guild.get_member(int(author))
-    my_perms_value = the_channel.permissions_for(author)
-    if isinstance(my_perms_value, int):
-        my_perms = discord.Permissions(my_perms_value)
-    else:
-        my_perms = my_perms_value
-    dangerousperms = ""
-    if my_perms.administrator:
-        dangerousperms += "Admistrator  \n"
-    if my_perms.kick_members:
-        dangerousperms += "Kick members  \n"
-    if my_perms.ban_members:
-        dangerousperms += "Ban members  \n"
-    if my_perms.manage_guild:
-        dangerousperms += "Change server name/regions and add bots  \n"
-    if my_perms.manage_webhooks:
-        dangerousperms += "Create/Edit/Delete webhooks  \n"
-    if my_perms.manage_messages:
-        dangerousperms += "Delete/pin messages from other users  \n"
-    if my_perms.manage_roles:
-        toprole = "top role"
-        try:
-            toprole = author.top_role.mention
-        except Exception:
-            pass
-        dangerousperms += f"Create/Edit/Delete roles below {toprole}  \n"
-    if my_perms.manage_channels:
-        dangerousperms += "Edit Channels  \n"
-    if my_perms.manage_emojis:
-        dangerousperms += "Edit emojis  \n"
-    if my_perms.move_members:
-        accessiblechannels = "no visible channels"
-        for vc in the_guild.voice_channels:
-            if vc.permissions_for(author).view_channel:
-                if accessiblechannels == "no visible channels":
-                    accessiblechannels = f"{vc.mention} "
-                else:
-                    accessiblechannels += f"| {vc.mention} "
-        dangerousperms += f"Move members between {accessiblechannels}  \n"
-    if my_perms.manage_nicknames:
-        dangerousperms += "Change nicknames of other users  \n"
-    if dangerousperms == "":
-        dangerousperms = "No dangerous permissions"
-    return dangerousperms
-
-
 def convert(timesen):
     totaltime = 0
     if timesen is None:
@@ -1593,36 +1034,10 @@ def convertword(time):
     return val * time_dict[unit]
 
 
-async def get_url_image(url):
-    session = client.session
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36"
-    }
-    timeout = ClientTimeout(total=15)
-    async with session.get(url, headers=headers, timeout=timeout) as resp:
-        resp.raise_for_status()
-        html = await resp.text()
-    soup = BeautifulSoup(html, "html.parser")
-    meta_og_image = soup.find("meta", property="og:image")
-    return meta_og_image.get("content") if meta_og_image else None
-
-
-async def removeguildantiraidlog(guildid):
-    await asyncio.sleep(300)
-    async with client.database.pool.acquire() as con:
-        await con.execute("DELETE FROM antiraid WHERE guildid = $1", guildid)
-
-
 def check_ensure_permissions(ctx, member, perms):
     for perm in perms:
         if not getattr(ctx.channel.permissions_for(member), perm):
             raise discord.ext.commands.errors.BotMissingPermissions([perm])
-
-
-def convert_sec(seconds):
-    min, sec = divmod(seconds, 60)
-    hour, min = divmod(min, 60)
-    return f"{hour:d}h {min:02d}m {sec:02d}s"
 
 
 @client.command()
@@ -1639,127 +1054,14 @@ async def restart(ctx):
     await restart_process(ctx.channel.id)
 
 
-class AestronInfo(commands.Cog):
-    """Aestron bot information"""
-
-    @commands.hybrid_command(
-        aliases=["tutorial", "usage"],
-        brief="This command provides the bot command usage information.",
-        description="This command provides the bot command usage information.",
-        usage="<command>",
-    )
-    async def cmdusage(self, ctx, command: str):
-        requested_command = client.get_command(command)
-        if requested_command is None:
-            await send_generic_error_embed(
-                ctx, error_data="The requested command with name was not found."
-            )
-            return
-
-        prefix = ctx.clean_prefix
-        invocation = command_invocation(requested_command, prefix)
-        aliases = (
-            ", ".join(f"`{alias}`" for alias in requested_command.aliases) or "None"
-        )
-        base_embed = discord.Embed(
-            title=f"{requested_command.qualified_name} usage",
-            description=requested_command.help or requested_command.description,
-            color=discord.Color.green(),
-        )
-        base_embed.add_field(name="Usage", value=f"`{invocation}`", inline=False)
-        base_embed.add_field(name="Aliases", value=aliases, inline=False)
-
-        usage_directory = Path("resources/command_usages")
-        command_name = requested_command.name
-        usage_paths = await asyncio.to_thread(
-            lambda: [
-                path
-                for path in (
-                    usage_directory / f"{command_name}.gif",
-                    *(
-                        usage_directory / f"{command_name}_{index}.gif"
-                        for index in range(1, 9)
-                    ),
-                )
-                if path.is_file()
-            ]
-        )
-        if not usage_paths:
-            await ctx.send(embed=base_embed, ephemeral=True)
-            return
-
-        embeds = []
-        files = []
-        for index, usage_path in enumerate(usage_paths, start=1):
-            embed = base_embed.copy()
-            embed.set_footer(text=f"Example {index} of {len(usage_paths)}")
-            embed.set_image(url=f"attachment://{usage_path.name}")
-            embeds.append(embed)
-            files.append(discord.File(usage_path, filename=usage_path.name))
-        await ctx.send(embeds=embeds, files=files, ephemeral=True)
-
-    @commands.hybrid_command(
-        aliases=["info"],
-        brief="This command provides the bot information.",
-        description="This command provides the bot information.",
-        usage="",
-    )
-    async def botinfo(self, ctx):
-        embed_var = discord.Embed(
-            title=f"{client.user}", description="", color=0x00FF00
-        )
-        embed_var.add_field(
-            name="CPU usage ",
-            value=f"{await asyncio.to_thread(psutil.cpu_percent, 0.1)}%",
-            inline=False,
-        )
-        embed_var.add_field(
-            name="RAM usage ", value=f"{psutil.virtual_memory()[2]}%", inline=False
-        )
-        if SETTINGS.owner_ids:
-            owners = ", ".join(f"<@{owner_id}>" for owner_id in SETTINGS.owner_ids)
-            embed_var.add_field(name="Configured owners", value=owners, inline=False)
-        embed_var.add_field(
-            name="Information",
-            value="""An all in one anti-raid , moderation , captcha , tickets and fun discord bot with customisable commands and more...""",
-            inline=False,
-        )
-        embed_var.add_field(
-            name="Server count", value=round(len(client.guilds) / 10) * 10
-        )
-        totalmembercount = 0
-        for guild in client.guilds:
-            totalmembercount += guild.member_count
-        embed_var.add_field(name="Member count", value=totalmembercount)
-        delta_uptime = discord.utils.utcnow() - client.launch_time
-        hours, remainder = divmod(int(delta_uptime.total_seconds()), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        days, hours = divmod(hours, 24)
-        embed_var.add_field(
-            name="Uptime",
-            value=f"I have been online for {days}:{hours}:{minutes}:{seconds}.",
-        )
-        if dbltoken:
-            embed_var.add_field(
-                name="Top.gg",
-                value=f"https://top.gg/bot/{client.user.id}",
-                inline=False,
-            )
-        embed_var.add_field(
-            name="Bot version and info.", value=f"v{SETTINGS.version}", inline=False
-        )
-        embed_var.set_thumbnail(url=client.user.display_avatar.url)
-        await ctx.send(embed=embed_var, ephemeral=True)
-
-
 class MinecraftFun(commands.Cog):
     """Minecraft game related fun commands"""
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
         aliases=["bal", "money", "account", "bank"],
-        brief="This command is used to check your balance.",
-        description="This command is used to check your balance.",
+        brief="Show a member's Minecraft economy balance.",
+        description="Show the selected member's current Minecraft game currency balance.",
         usage="",
     )
     @commands.guild_only()
@@ -1785,7 +1087,7 @@ class MinecraftFun(commands.Cog):
 
     @commands.cooldown(1, 604800, BucketType.member)
     @commands.hybrid_command(
-        aliases=["weekly"],
+        name="weekly",
         brief="Claim the weekly Minecraft currency reward.",
         description=(
             "Claim 1,500 Minecraft currency after voting on Top.gg. "
@@ -1823,7 +1125,7 @@ class MinecraftFun(commands.Cog):
 
     @commands.cooldown(1, 86400, BucketType.member)
     @commands.hybrid_command(
-        aliases=["daily"],
+        name="daily",
         brief="Claim the daily Minecraft currency reward.",
         description=(
             "Claim 150 Minecraft currency after voting on Top.gg. "
@@ -1864,7 +1166,8 @@ class MinecraftFun(commands.Cog):
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
-        aliases=["give", "pay"],
+        name="pay",
+        aliases=["give"],
         brief="Transfer Minecraft currency to another member.",
         description=(
             "Atomically transfer a positive amount from your balance to another "
@@ -1941,9 +1244,10 @@ class MinecraftFun(commands.Cog):
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
+        name="pvpboard",
         aliases=["inv", "backpack", "bag", "items"],
-        brief="This command is used to see your inventory.",
-        description="This command is used to see your inventory.",
+        brief="Show a member's equipped Minecraft items.",
+        description="Show the selected member's equipped armor and sword.",
         usage="",
     )
     @commands.guild_only()
@@ -1993,8 +1297,8 @@ class MinecraftFun(commands.Cog):
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
-        brief="This command is used to buy minecraft stuff.",
-        description="This command is used to buy minecraft stuff.",
+        brief="Open the interactive Minecraft equipment shop.",
+        description="Buy and equip armor or swords using Minecraft game currency.",
         usage="",
     )
     @commands.guild_only()
@@ -2122,7 +1426,7 @@ class MinecraftFun(commands.Cog):
                 except Exception:
                     pass
             elif view.value:
-                await statmsg.reply("Ok this fight has been accepted , lets start!")
+                await statmsg.reply("⚔️ Challenge accepted. The fight begins!")
                 # Minecraftpvp
                 memberone_healthpoint = 30 + random.randint(-10, 10)
                 memberone_healthpoint += 1
@@ -2147,7 +1451,7 @@ class MinecraftFun(commands.Cog):
                 voice_effects = await MinecraftVoiceEffects.connect(ctx, voice_channel)
             except (commands.BadArgument, commands.BotMissingPermissions) as error:
                 await ctx.send(
-                    f"🔇 **PvP sounds unavailable:** {error}\n"
+                    f"🔇 **Voice effects skipped:** {error}\n"
                     "The fight will continue normally without voice effects."
                 )
         embed = discord.Embed(
@@ -2208,49 +1512,38 @@ class MinecraftFun(commands.Cog):
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
-        brief="This command is used to check the leaderboard of the pvp and soundpvp command.",
-        description="This command is used to check the leaderboard of the pvp and soundpvp command.",
+        brief="Show the Minecraft PvP wins leaderboard.",
+        description="Rank members by recorded wins from interactive Minecraft PvP fights.",
         usage="",
     )
     @commands.guild_only()
     async def pvpleaderboard(self, ctx):
         async with client.database.pool.acquire() as con:
-            leader_board = await con.fetch("SELECT * FROM leaderboard")
-        count_point = []
-        count_names = []
-        count_dictionary = Counter(leader_board)
-        for member in leader_board:
-            if member not in count_names:
-                count_names.append(member)
-                count_point.append(int(count_dictionary[member]))
-        sorted_point = sorted(count_point, reverse=True)
-        sorted_names = []
-        for point in sorted_point:
-            index_name = count_point.index(point)
-            count_point[index_name] = -1
-            sorted_names.append(count_names[index_name])
+            leaders = await con.fetch(
+                "SELECT mention, COUNT(*) AS wins FROM leaderboard "
+                "GROUP BY mention ORDER BY wins DESC, mention ASC LIMIT 10"
+            )
 
         embed_one = discord.Embed(
             title="Battle leaderboard", description="Season one", color=Color.green()
         )
-        postfix = ["st", "nd", "rd", "th", "th", "th", "th", "th", "th", "th"]
-        for i in range(10):
-            try:
-                name = sorted_names[i]["mention"]
-            except Exception:
-                name = "- - -"
+        medals = ("🥇", "🥈", "🥉")
+        for index, leader in enumerate(leaders, start=1):
             embed_one.add_field(
-                name=str(i + 1) + f"{postfix[i]} member",
-                value=f"<@{name}>",
+                name=f"{medals[index - 1] if index <= 3 else f'#{index}'} · {leader['wins']} win(s)",
+                value=f"<@{leader['mention']}>",
                 inline=False,
             )
+        if not leaders:
+            embed_one.description = "No completed PvP fights have been recorded yet."
         await ctx.send(embed=embed_one, ephemeral=True)
 
     @commands.cooldown(1, 120, BucketType.member)
     @commands.hybrid_command(
-        brief="This command is used to check the server status of a minecraft server ip.",
-        description="This command is used to check the server status of a minecraft server ip.",
-        usage="server-ip",
+        name="mcstatus",
+        brief="Check the live status of a Minecraft Java server.",
+        description="Resolve a Minecraft Java address and show latency, players, and version.",
+        usage="<server address>",
     )
     @commands.guild_only()
     async def mcservercheck(self, ctx, ip: str):
@@ -2277,141 +1570,6 @@ class MinecraftFun(commands.Cog):
         await ctx.send(embed=embed_one, ephemeral=True)
 
 
-def list_to_string(s):
-    # initialize an empty string
-    str1 = ""
-
-    # traverse in the string
-    for ele in s:
-        str1 += str(ele.mention) + ","
-    str2 = str1.rstrip(str1[-1]) + "."
-    # return string
-    return str2
-
-
-def draw_progress_bar(d, x, y, w, h, progress, bg=(127, 127, 127), fg=(0, 125, 232)):
-    # draw background
-    d.ellipse((x + w, y, x + h + w, y + h), fill=bg)
-    d.ellipse((x, y, x + h, y + h), fill=bg)
-    d.rectangle((x + (h / 2), y, x + w + (h / 2), y + h), fill=bg)
-
-    # draw progress bar
-    w *= progress
-    d.ellipse((x + w, y, x + h + w, y + h), fill=fg)
-    d.ellipse((x, y, x + h, y + h), fill=fg)
-    d.rectangle((x + (h / 2), y, x + w + (h / 2), y + h), fill=fg)
-
-    return d
-
-
-def get_count(e):
-    return e["count"]
-
-
-class PaginateEmbed(discord.ui.View):  # EMBED PAGINATOR
-    def __init__(self, embeds):
-        super().__init__(timeout=120)
-        self.count = 0
-        self.embed = embeds[self.count]
-        self.limit = len(embeds) - 1
-        self.embeds = embeds
-        self._message = None
-
-    def set_message(self, _message):
-        self._message = _message
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        await self._message.edit(view=self)
-
-    @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.green)
-    async def firstmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        self.count = 0
-        self.embed = self.embeds[self.count]
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except Exception:
-            pass
-
-    @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.green)
-    async def leftmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if not self.count == 0:
-            self.count = self.count - 1
-        self.embed = self.embeds[self.count]
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except Exception:
-            pass
-
-    @discord.ui.button(emoji="🛑", style=discord.ButtonStyle.green)
-    async def stopmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if isinstance(self._message, discord.InteractionResponse):
-            try:
-                await self._message.edit_message(view=None)
-            except Exception:
-                pass
-        elif isinstance(self._message, discord.Interaction):
-            await self._message.delete_original_message()
-        else:
-            await self._message.edit(view=None)
-        self.stop()
-
-    @discord.ui.button(emoji="➡️", style=discord.ButtonStyle.green)
-    async def rightmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        if not self.count == self.limit:
-            self.count = self.count + 1
-        self.embed = self.embeds[self.count]
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except Exception:
-            pass
-
-    @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.green)
-    async def lastmove(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer()
-        self.count = self.limit
-        self.embed = self.embeds[self.count]
-        try:
-            if isinstance(self._message, discord.InteractionResponse):
-                await self._message.edit_message(embed=self.embed)
-            elif isinstance(self._message, discord.Interaction):
-                await self._message.edit_original_response(embed=self.embed)
-            else:
-                await self._message.edit(embed=self.embed)
-        except Exception:
-            pass
-
-
 class Misc(commands.Cog):
     """Misc commands."""
 
@@ -2436,9 +1594,9 @@ class Misc(commands.Cog):
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
         aliases=["remind", "reminder", "alarm"],
-        brief="This command can be used to create a reminder.",
-        description="This command can be used to create a reminder.",
-        usage="time reason",
+        brief="Schedule a private reminder.",
+        description="Schedule a reminder after a validated duration and receive it by DM.",
+        usage="<duration> [reason...]",
     )
     async def setreminder(self, ctx, time: str, *, reason: str = "⏰Reminder finished"):
         timenum = convert(time)
@@ -2482,8 +1640,8 @@ class Misc(commands.Cog):
     @commands.cooldown(1, 6, BucketType.member)
     @commands.hybrid_command(
         aliases=["setafk"],
-        brief=" This command can be used to mark yourself as afk for a specified reason.",
-        description=" This command can be used to mark yourself as afk for a specified reason.",
+        brief="Mark yourself as away with an optional reason.",
+        description="Set an AFK status that is cleared automatically when you return.",
     )
     async def afk(self, ctx, *, reason: str = "No reason provided"):
         if await check_profane(reason):
@@ -2497,8 +1655,8 @@ class Misc(commands.Cog):
     @commands.cooldown(1, 6, BucketType.member)
     @commands.command(
         aliases=["math", "calculate"],
-        brief=" This command can be used to calculate math.",
-        description="This command can be used to calculate math.",
+        brief="Safely evaluate a mathematical expression.",
+        description="Evaluate supported arithmetic and functions without executing Python code.",
     )
     async def calc(self, ctx, expression: str):
         try:
@@ -2513,9 +1671,9 @@ class Misc(commands.Cog):
     @commands.cooldown(1, 30, BucketType.member)
     @commands.command(
         aliases=["dpyrtfm", "drtfm"],
-        brief="This command can be used to rtfm search on discord.py.",
-        description="This command can be used to rtfm search on discord.py.",
-        usage="search-term",
+        brief="Search the discord.py documentation.",
+        description="Search indexed discord.py API documentation and return matching links.",
+        usage="<search term...>",
     )
     @is_bot_staff()
     async def discordpyrtfm(self, ctx, *, query: str):
@@ -2548,9 +1706,9 @@ class Misc(commands.Cog):
 
     @commands.cooldown(1, 15, BucketType.member)
     @commands.hybrid_command(
-        brief="This command can be used to get current weather of a city.",
-        description="This command can be used to get current weather of a city.",
-        usage="city-name",
+        brief="Show current weather for a city.",
+        description="Look up current conditions, temperature, humidity, and wind for a city.",
+        usage="<city name...>",
     )
     async def weather(self, ctx, *, city: str):
         embed_var = discord.Embed(
@@ -2611,8 +1769,8 @@ class Misc(commands.Cog):
 
     @commands.cooldown(1, 60, BucketType.member)
     @commands.hybrid_command(
-        brief="This command can be used to get current user response time(ping).",
-        description="This command can be used to get current user response time(ping) in milliseconds.",
+        brief="Measure Discord gateway and message latency.",
+        description="Show the bot's current Discord gateway and response latency in milliseconds.",
         usage="",
     )
     async def ping(self, ctx):
@@ -2657,9 +1815,9 @@ class Misc(commands.Cog):
 
     @commands.hybrid_command(
         aliases=["changeprefix"],
-        brief="This command can be used to set bot prefix in a guild by members.",
-        description="This command can be used to set bot prefix in a guild by members(requires manage guild).",
-        usage="prefix",
+        brief="Change this server's command prefix.",
+        description="Set a validated 1-10 character prefix for commands in this server.",
+        usage="<prefix...>",
     )
     @commands.guild_only()
     @commands.check_any(is_bot_staff(), commands.has_permissions(manage_guild=True))
@@ -2719,353 +1877,14 @@ class Misc(commands.Cog):
                 pass
 
 
-@commands.cooldown(1, 45, BucketType.member)
-@client.tree.command(
-    description="This command can be used to translate text into another language."
-)
-@app_commands.describe(
-    text="Text to translate to language.", language="Destination language."
-)
-async def translatetext(
-    interaction: discord.Interaction, text: str, language: str = "en"
-):
-    origmessage = text
-    origlanguage = await asyncio.to_thread(detect, text)
-    translator = Translator(to_lang=language, from_lang=origlanguage)
-    translatedmessage = await asyncio.to_thread(translator.translate, origmessage)
-    embed_one = discord.Embed(
-        title="Language : " + language, description=translatedmessage
-    )
-    await interaction.response.send_message(embed=embed_one, ephemeral=True)
-
-
-class Fun(commands.Cog):
-    """General fun commands"""
-
-    @commands.cooldown(1, 6, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["talk", "cb", "chatbot"],
-        brief=" This command can be used to talk to chatbot.",
-        description=" This command can be used to talk to chatbot.",
-    )
-    async def communicate(self, ctx, *, _message):
-        chatextract = ChatExtractor()
-        response = await chatextract.aget_response(_message, ctx.author)
-        embed = discord.Embed(title="Chatbot", description=response)
-        await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.cooldown(1, 3600, BucketType.member)
-    @commands.guild_only()
-    @commands.group(
-        invoke_without_command=True,
-        brief=" This command can be used to play Chess in the Park (chess)",
-        description=" This command can be used to play Chess in the Park (chess)",
-    )
-    async def playgame(self, ctx):
-        await send_generic_error_embed(
-            ctx, error_data="No argument was provided in the playgame command."
-        )
-        return
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @playgame.command(
-        brief="This command can be used to play Chess in the Park in a vc.",
-        description="This command can be used to play Chess in the Park in a vc.",
-        usage="",
-        aliases=["chessgame", "chesspark"],
-    )
-    async def chess(self, ctx):
-        check_ensure_permissions(ctx, ctx.guild.me, ["create_instant_invite"])
-        link = await create_activity_invite(
-            ctx.author.voice.channel, "chess", max_age=3600
-        )
-        embed_var = discord.Embed(
-            title="",
-            description=f'[Start playing]({link} "Join your friends in a Chess in the Park activity.")',
-            color=0x00FF00,
-        )
-        embed_var.set_author(
-            name="Chess-Park Game",
-            icon_url=client.user.display_avatar.url,
-        )
-        embed_var.set_footer(
-            text="This game is a discord beta feature only supported on desktop versions of discord."
-        )
-        await ctx.send(embed=embed_var)
-
-    @chess.before_invoke
-    async def ensure_voice(self, ctx):
-
-        if ctx.voice_client is None:
-            if ctx.author.voice:
-                pass
-            else:
-                ctx.command.reset_cooldown(ctx)
-                await send_generic_error_embed(
-                    ctx, error_data="You are not connected to a voice channel."
-                )
-                return
-        elif ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        brief="This command can be used to get information about a emoji.",
-        description="This command can be used to get information about a emoji.",
-        usage="emoji",
-        aliases=["emoji", "reaction", "reactioninfo", "emojinfo"],
-    )
-    @commands.guild_only()
-    async def emojiinfo(self, ctx, emoji: discord.Emoji):
-        animatemsg = ""
-        emojisyntax = "🚫 Error"
-        if emoji.animated:
-            animatemsg = "is animated and "
-            emojisyntax = f"<a:{emoji.name}:{emoji.id}>"
-        else:
-            emojisyntax = f"<:{emoji.name}:{emoji.id}>"
-        embed = discord.Embed(
-            title=emoji.name,
-            description=f"This emoji {animatemsg}has an id {emoji.id} and was created in {emoji.guild}.",
-            timestamp=emoji.created_at,
-        )
-        author_em = emoji.user
-        if author_em is None:
-            author_em = "Not Found ❌"
-            select_em = None
-            emojis_l = emoji.guild.emojis
-            for emojiloop in emojis_l:
-                if emoji.id == emojiloop.id:
-                    select_em = emojiloop
-            if select_em is not None:
-                author_em = select_em.user
-            else:
-                author_em = "Not Found ❌"
-
-        embed.add_field(name="Author :", value=author_em)
-        embed.add_field(name="Emoji URL :", value=emoji.url)
-        embed.add_field(name="Emoji Syntax :", value=f"`{emojisyntax}`")
-        embed.add_field(
-            name=f"Does it require colons? :{emoji.name}:",
-            value=check_emoji(emoji.require_colons),
-        )
-        emojimsg = "Is usable by bots ? :"
-        emojimention = ":red_circle:"
-        if emoji.is_usable():
-            if emoji.animated:
-                emojimention = f"<a:{emoji.name}:{emoji.id}>"
-            else:
-                emojimention = f"<:{emoji.name}:{emoji.id}>"
-
-            emojimsg = "Mentioned emoji :"
-        embed.add_field(name=emojimsg, value=emojimention)
-        await ctx.send(embed=embed, ephemeral=True)
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["server"],
-        brief="This command can be used to get guild information.",
-        description="This command can be used to get guild information.",
-        usage="",
-    )
-    @commands.guild_only()
-    async def serverinfo(self, ctx, *, guild: discord.Guild = None):
-        if guild is None:
-            guild = ctx.guild
-        guilddescription = guild.description
-        if guilddescription is None:
-            guilddescription = ""
-        else:
-            guilddescription = guilddescription + "\n"
-        if "COMMUNITY" in guild.features:
-            guilddescription = guilddescription + "Community server ✅ \n"
-        if "VANITY_URL" in guild.features:
-            guilddescription = guilddescription + "Vanity url ✅ \n"
-        if "VERIFIED" in guild.features:
-            guilddescription = guilddescription + "Verified server ✅ \n"
-        if "PARTNERED" in guild.features:
-            guilddescription = guilddescription + "Partnered server ✅ \n"
-        if len(guilddescription) == 0:
-            guilddescription = "** **"
-        id = str(guild.id)
-        member_count = str(guild.member_count)
-        role_count = str(len(guild.roles))
-        icon = guild.icon
-        banner = guild.banner
-        guild_owner = guild.owner
-        guild_owner_value = (
-            guild_owner.mention if guild_owner is not None else "⚫ Not found"
-        )
-        embedcolor = Color.blue()
-        embed = discord.Embed(title=guilddescription, color=embedcolor)
-        embed.add_field(name="Name", value=f"{guild.name}", inline=False)
-        embed.add_field(name="Owner", value=guild_owner_value, inline=True)
-        embed.add_field(name="Server ID", value=id, inline=True)
-        embed.add_field(name="Channel ID", value=ctx.channel.id, inline=True)
-        # list_of_bots = []
-        # for botloop in guild.members:
-        #    if botloop.bot:
-        #        list_of_bots.append(botloop)
-        #        botcount += 1
-
-        embed.add_field(
-            name="Bot Count",
-            value="⚫ Not found",
-            inline=True,
-        )
-        embed.add_field(name="Member Count", value=str(member_count), inline=True)
-        embed.add_field(name="Role Count", value=str(role_count), inline=True)
-        timel = guild.created_at
-        tuplea = timel.timetuple()
-        timestamp = int(
-            datetime(
-                tuplea.tm_year,
-                tuplea.tm_mon,
-                tuplea.tm_mday,
-                tuplea.tm_hour,
-                tuplea.tm_min,
-                tuplea.tm_sec,
-            ).timestamp()
-        )
-        embed.add_field(name="Created At", value=f"<t:{timestamp}:R>", inline=True)
-        embed.add_field(
-            name="Verification Level", value=guild.verification_level, inline=True
-        )
-        mfarequired = "No authorization required for moderation"
-        if guild.mfa_level == 1:
-            mfarequired = "Authorization required for moderation"
-        embed.add_field(name="Authorization", value=mfarequired, inline=True)
-        embed.add_field(
-            name="Server level 🚀",
-            value=f"Level {guild.premium_tier}",
-        )
-        embed.add_field(
-            name="Server boosts 🚀",
-            value=guild.premium_subscription_count,
-        )
-
-        if icon is not None:
-            embed.set_author(name=guild.name, icon_url=icon.url)
-        if banner is not None:
-            embed.set_thumbnail(url=banner.url)
-        try:
-            await ctx.send(embed=embed, ephemeral=True)
-        except Exception:
-            pass
-
-    @commands.cooldown(1, 60, BucketType.member)
-    @commands.hybrid_command(
-        aliases=["user", "userinfo", "memberinfo", "member"],
-        brief="Show a bounded Discord member profile.",
-        description=(
-            "Show account age, server roles, sensitive permissions, timeout state, "
-            "badges, avatar, and banner without scanning the server ban list."
-        ),
-        usage="[member]",
-    )
-    @commands.guild_only()
-    async def profile(self, ctx, *, member: discord.Member | discord.User = None):
-        member = member or ctx.author
-        await ctx.send(
-            embed=await build_profile_embed(client, member, ctx.guild), ephemeral=True
-        )
-
-
-class Social(commands.Cog):
-    """Social commands."""
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        brief="This command can be used to welcome users with a custom welcome image.",
-        description="This command can be used to welcome users with a custom welcome image.",
-        usage="@member",
-    )
-    @commands.guild_only()
-    async def welcomeuser(self, ctx, member: discord.Member = None):
-        check_ensure_permissions(ctx, ctx.guild.me, ["attach_files"])
-        if member is None:
-            member = ctx.author
-        avatar_bytes = await member.display_avatar.read()
-        destination = f"./resources/temp/welcome_{ctx.author.id}.jpg"
-        await asyncio.to_thread(
-            render_welcome_image,
-            avatar_bytes,
-            member.name,
-            member.guild.member_count,
-            str(member.guild),
-            destination,
-        )
-        file = discord.File(destination)
-        embed = discord.Embed()
-        embed.set_image(url=f"attachment://welcome_{ctx.author.id}.jpg")
-        await ctx.send(file=file, embed=embed, ephemeral=True)
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.hybrid_command(
-        brief="This command can be used to show users in a custom wanted poster.",
-        description="This command can be used to show users in a custom wanted poster.",
-        usage="@member",
-    )
-    @commands.guild_only()
-    async def wanteduser(self, ctx, member: discord.Member = None):
-        check_ensure_permissions(ctx, ctx.guild.me, ["attach_files"])
-        if member is None:
-            member = ctx.author
-        avatar_bytes = await member.display_avatar.read()
-        destination = f"./resources/temp/wanted_{ctx.author.id}.jpg"
-        await asyncio.to_thread(render_wanted_image, avatar_bytes, destination)
-        file = discord.File(destination)
-        embed = discord.Embed()
-        embed.set_image(url=f"attachment://wanted_{ctx.author.id}.jpg")
-        try:
-            await ctx.send(file=file, embed=embed, ephemeral=True)
-        except Exception:
-            pass
-
-
-def constructslashephemeralctx(ctx):
-    async def fakerespond(*args, **kwargs):
-        return await ctx.send(*args, **kwargs, ephemeral=True)
-
-    ctx.send = fakerespond
-    return ctx
-
-
-def message_probability(
-    user_message, recognised_words, single_response=False, required_words=[]
-):
-    message_certainty = 0
-    has_required_words = True
-
-    # Counts how many words are present in each predefined message
-    for word in user_message:
-        if word in recognised_words:
-            message_certainty += 1
-
-    # Calculates the percent of recognised words in a user message
-    percentage = float(message_certainty) / float(len(recognised_words))
-
-    # Checks that the required words are in the string
-    for word in required_words:
-        if word not in user_message:
-            has_required_words = False
-            break
-
-    # Must either have the required words, or be a single response
-    if has_required_words or single_response:
-        return int(percentage * 100)
-    else:
-        return 0
-
-
 class Support(commands.Cog):
     """Support related commands"""
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.command(
-        brief="This command can be used to add reaction to a message.",
-        description="This command can be used to add reaction to a message.",
-        usage="emoji messageid",
+        brief="Add a reaction to a specific message.",
+        description="Add one valid Unicode or custom emoji reaction to a message in this channel.",
+        usage="<emoji> <message ID> <channel>",
         aliases=["react", "addreact"],
     )
     @is_bot_staff()
@@ -3081,9 +1900,9 @@ class Support(commands.Cog):
         await ctx.send(f"Successfully added the reaction {emoji} to the _message.")
 
     @commands.hybrid_command(
-        brief="This command can be used for disabling all commands by admin per guild.",
-        description="This command can be used for disabling all commands by admin per guild.",
-        usage="command",
+        brief="Disable all optional commands in this server.",
+        description="Disable server-configurable commands while retaining essential help and admin access.",
+        usage="",
         aliases=["disableallcmd", "disableallcommand"],
     )
     @commands.guild_only()
@@ -3115,9 +1934,9 @@ class Support(commands.Cog):
         await ctx.send("Successfully disabled the commands!", ephemeral=True)
 
     @commands.hybrid_command(
-        brief="This command can be used for enabling all commands by admin per guild.",
-        description="This command can be used for enabling all commands by admin per guild.",
-        usage="command",
+        brief="Re-enable all optional commands in this server.",
+        description="Remove this server's command-disable overrides and restore optional commands.",
+        usage="",
         aliases=["enableallcmd", "enableallcommand"],
     )
     @commands.guild_only()
@@ -3152,9 +1971,9 @@ class Support(commands.Cog):
         await ctx.send("Successfully enabled the commands!", ephemeral=True)
 
     @commands.hybrid_command(
-        brief="This command can be used for disabling a command by admin per guild.",
-        description="This command can be used for disabling a command by admin per guild.",
-        usage="command",
+        brief="Disable one optional command in this server.",
+        description="Prevent regular members from using one named optional command in this server.",
+        usage="<command>",
         aliases=["disablecmd", "disablecommand"],
     )
     @commands.guild_only()
@@ -3199,9 +2018,9 @@ class Support(commands.Cog):
         await ctx.send(f"Successfully disabled the command {command}.", ephemeral=True)
 
     @commands.hybrid_command(
-        brief="This command can be used for enabling a command by admin per guild.",
-        description="This command can be used for enabling a command by admin per guild.",
-        usage="command",
+        brief="Re-enable one optional command in this server.",
+        description="Remove this server's disabled override for one named command.",
+        usage="<command>",
         aliases=["enablecmd", "enablecommand"],
     )
     @commands.guild_only()
@@ -3247,9 +2066,9 @@ class Support(commands.Cog):
         await ctx.send(f"Successfully enabled the command {command}.", ephemeral=True)
 
     @commands.command(
-        brief="This command can be used for disabling a command by bot staff.",
-        description="This command can be used for disabling a command by bot staff.",
-        usage="command",
+        brief="Disable a command globally for emergency maintenance.",
+        description="Bot-owner control that disables one command across every server.",
+        usage="<command>",
         aliases=["bug", "dstaff"],
     )
     @is_bot_staff()
@@ -3269,9 +2088,9 @@ class Support(commands.Cog):
         await ctx.send(f"The {command.name} command was successfully disabled.")
 
     @commands.command(
-        brief="This command can be used for enabling a command by bot staff.",
-        description="This command can be used for enabling a command by bot staff.",
-        usage="command",
+        brief="Re-enable a globally disabled command.",
+        description="Bot-owner control that restores one command after emergency maintenance.",
+        usage="<command>",
         aliases=["unbug", "estaff"],
     )
     @is_bot_staff()
@@ -3291,9 +2110,9 @@ class Support(commands.Cog):
         await ctx.send(f"The {command.name} command was successfully enabled.")
 
     @commands.command(
-        brief="This command can be used to delete a embed and message.",
-        description="This command can be used to delete a embed and message.",
-        usage="messageid",
+        brief="Delete one bot-authored message by ID.",
+        description="Delete a selected message only when it was authored by Aestron.",
+        usage="[message ID]",
     )
     @commands.guild_only()
     @is_bot_staff()
@@ -3339,9 +2158,9 @@ class Support(commands.Cog):
                 )
 
     @commands.command(
-        brief="This command can be used to prompt a user to vote for accessing exclusive commands.",
-        description="This command can be used to prompt a user to vote for accessing exclusive commands.",
-        usage="@member",
+        brief="Show another member the optional Top.gg vote prompt.",
+        description="Send a member the bot's Top.gg vote link without granting permissions or rewards.",
+        usage="[member]",
     )
     @commands.guild_only()
     @is_bot_staff()
@@ -3367,8 +2186,8 @@ class Support(commands.Cog):
 
     @commands.command(
         aliases=["maintanance", "maintenance", "togglem"],
-        brief="This command can be used for maintainence mode.",
-        description="This command can be used for maintainence mode.",
+        brief="Enable or disable owner-controlled maintenance mode.",
+        description="Pause regular command processing with a public maintenance reason.",
         usage="",
     )
     @is_bot_staff()
@@ -3393,9 +2212,9 @@ class Support(commands.Cog):
             await client.change_presence(activity=activity)
 
     @commands.command(
-        brief="This command can be used for checking user votes.",
-        description="This command can be used for checking user votes.",
-        usage="@member",
+        brief="Check whether a member has a current Top.gg vote.",
+        description="Query Top.gg for the selected member's current vote status.",
+        usage="[member]",
     )
     @commands.guild_only()
     @is_bot_staff()
@@ -3421,8 +2240,8 @@ class Support(commands.Cog):
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
-        brief="This command can be used to get support-server invite.",
-        description="This command can be used to get support-server invite.",
+        brief="Open Aestron's configured support server.",
+        description="Show the support server invite configured by this deployment.",
         usage="",
     )
     async def supportserver(self, ctx):
@@ -3448,8 +2267,8 @@ class Support(commands.Cog):
         await ctx.send(embed=embed_one, ephemeral=True)
 
     @commands.hybrid_command(
-        brief="This command can be used to get uptime of this bot.",
-        description="This command can be used to get uptime of this bot.",
+        brief="Show how long this process has been running.",
+        description="Show process uptime together with the currently deployed bot version.",
         usage="",
     )
     @is_bot_staff()
@@ -3465,8 +2284,8 @@ class Support(commands.Cog):
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
-        brief="This command can be used to invite this bot.",
-        description="This command can be used to invite this bot.",
+        brief="Get Aestron's Discord installation link.",
+        description="Create an OAuth installation link for this bot with its requested scopes.",
         usage="",
     )
     async def invite(self, ctx):
@@ -3487,8 +2306,8 @@ class Support(commands.Cog):
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
-        brief="This command can be used to vote for this bot.",
-        description="This command can be used to vote for this bot.",
+        brief="Open Aestron's Top.gg voting page.",
+        description="Show the configured Top.gg page used for optional vote rewards.",
         usage="",
     )
     async def vote(self, ctx):
@@ -3515,9 +2334,9 @@ class Support(commands.Cog):
 
     @commands.cooldown(1, 30, BucketType.member)
     @commands.hybrid_command(
-        brief="This command can be used to save text in a pastebin url.",
-        description="This command can be used to save text in a pastebin url.",
-        usage="*Text to post*",
+        brief="Upload bounded text to a shareable paste.",
+        description="Create a temporary shareable paste from supplied non-sensitive text.",
+        usage="<text...>",
         aliases=["savecode", "sharecode"],
     )
     async def pastebin(self, ctx, *, text: str):
@@ -3538,8 +2357,8 @@ class Support(commands.Cog):
         await ctx.send(embed=embedtwo, ephemeral=True)
 
     @commands.command(
-        brief="This command can be used to create an embed with message.",
-        description="This command can be used to create an embed with message(requires manage guild).",
+        brief="Create a previewed embed in this channel.",
+        description="Build and confirm a bounded embed before publishing it to this channel.",
         usage="",
         aliases=["embed", "message", "createmessage", "messagecreate", "createembed"],
     )
@@ -3578,94 +2397,6 @@ class Support(commands.Cog):
         await ctx.send(embed=embedone)
 
 
-class YoutubeTogether(commands.Cog):
-    """This YouTube command can play a video"""
-
-    @commands.cooldown(1, 30, BucketType.member)
-    @commands.command(
-        brief="This command can be used to start a youtube activity in a voice channel.",
-        description="This command can be used to start a youtube activity in a voice channel.",
-        usage="",
-        aliases=["youtubevideo", "video", "yt", "youtube", "ytstart"],
-    )
-    @commands.guild_only()
-    async def ytvideo(self, ctx):
-        check_ensure_permissions(ctx, ctx.guild.me, ["create_instant_invite"])
-        # Here we consider that the user is already in a VC accessible to the bot.
-        link = await create_activity_invite(
-            ctx.author.voice.channel, "youtube", max_age=300
-        )
-        embed_var = discord.Embed(
-            title="",
-            description=f'[Click to join]({link} "Join your friends in a youtube activity.")',
-            color=0x00FF00,
-        )
-        embed_var.set_author(
-            name="Youtube Together",
-            icon_url=client.user.display_avatar.url,
-        )
-        embed_var.set_footer(
-            text="Youtube together is a discord beta feature only supported on desktop versions of discord."
-        )
-        await ctx.send(embed=embed_var)
-
-    @ytvideo.before_invoke
-    async def ensure_voice(self, ctx):
-        if ctx.voice_client is None:
-            if ctx.author.voice:
-                pass
-            else:
-                ctx.command.reset_cooldown(ctx)
-                await send_generic_error_embed(
-                    ctx, error_data="You are not connected to a voice channel."
-                )
-                return
-        elif ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
-
-
-def get_int_portion(string):
-    intportion = ""
-    for s in string:
-        if s.isdigit():
-            intportion = intportion + s
-    return int(intportion)
-
-
-async def fetchaiohttp(session, url, authcontent=None):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36"
-    }
-    if authcontent:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36",
-            "Authorization": authcontent,
-        }
-    timeout = ClientTimeout(total=15)
-    async with session.get(url, headers=headers, timeout=timeout) as resp:
-        resp.raise_for_status()
-        return await resp.text()
-
-
-async def getimageurl(url):
-    session = client.session
-    html = await fetchaiohttp(session, url)
-    soup = BeautifulSoup(html, "html.parser")
-    meta_og_image = soup.find("meta", property="og:image")
-    return meta_og_image.get("content") if meta_og_image else None
-
-
-class ChannelNotProvidedError(Exception):
-    pass
-
-
-def get_guilds():
-    list_of_guilds = []
-    for guild in client.guilds:
-        list_of_guilds.append(guild.id)
-    return list_of_guilds
-
-
 @client.tree.context_menu(name="Profile")
 async def profile_context_menu(
     interaction: discord.Interaction, message: discord.Message
@@ -3677,18 +2408,17 @@ async def profile_context_menu(
     )
 
 
-@client.tree.context_menu()  # creates a global _message command. use guild_ids=[] to create guild-specific commands
-async def chatbot(ctx, _message: discord.Message):
-    text = _message.content
-    chatextract = ChatExtractor()
-    response = await chatextract.aget_response(text, _message.author)
-    embed = discord.Embed(title="Chatbot", description=response)
-    await ctx.send(embed=embed, ephemeral=True)
-
-
-@client.tree.context_menu()  # creates a global _message command. use guild_ids=[] to create guild-specific commands
-async def messagestats(ctx, _message: discord.Message):
-    text = _message.content
+@client.tree.context_menu(name="Analyze message")
+async def message_analysis(
+    interaction: discord.Interaction, message: discord.Message
+) -> None:
+    """Show configured Perspective scores for one selected message."""
+    text = message.content.strip()
+    if not text:
+        await interaction.response.send_message(
+            "That message has no text to analyze.", ephemeral=True
+        )
+        return
     attributes = ["TOXICITY", "INSULT", "FLIRTATION", "SPAM", "INCOHERENT"]
     emojis = {
         "FLIRTATION": "💋",
@@ -3700,30 +2430,57 @@ async def messagestats(ctx, _message: discord.Message):
     try:
         response = await analyze_message(text, attributes)
         if response is None:
+            await interaction.response.send_message(
+                "Message analysis is not configured on this deployment.", ephemeral=True
+            )
             return
-    except Exception:
+    except (aiohttp.ClientError, TimeoutError, KeyError, TypeError):
+        LOGGER.exception("Message context analysis failed message=%s", message.id)
+        await interaction.response.send_message(
+            "Message analysis is temporarily unavailable.", ephemeral=True
+        )
         return
-    embed = discord.Embed(title="Message stats")
+    embed = discord.Embed(title="Message analysis", color=discord.Color.blurple())
     for attribute in attributes:
         attribute_dict = response["attributeScores"][attribute]
         score_value = attribute_dict["spanScores"][0]["score"]["value"]
         embed.add_field(
-            name="** **",
-            value=f"Probability of {emojis[attribute]}{attribute} is {score_value * 100}% .",
+            name=f"{emojis[attribute]} {attribute.title()}",
+            value=f"{score_value * 100:.1f}%",
         )
-    await ctx.send(embed=embed, ephemeral=True)
+    embed.set_footer(text="Automated scores are signals, not moderation verdicts.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@client.tree.context_menu()  # creates a global message command. use guild_ids=[] to create guild-specific commands.
-async def translate(
-    ctx, _message: discord.Message
-):  # message commands return the message
-    text = _message.content
-    origmessage = text
-    origlanguage = await asyncio.to_thread(detect, text)
-    translator = Translator(to_lang="en", from_lang=origlanguage)
-    translatedmessage = await asyncio.to_thread(translator.translate, origmessage)
-    await ctx.send(translatedmessage, ephemeral=True)
+@client.tree.context_menu(name="Translate to English")
+async def translate_message(
+    interaction: discord.Interaction, message: discord.Message
+) -> None:
+    """Translate one bounded message to English privately."""
+    text = " ".join(message.content.split())
+    if not 2 <= len(text) <= 1500:
+        await interaction.response.send_message(
+            "Select a text message between 2 and 1,500 characters.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        source = await asyncio.to_thread(detect, text)
+        translated = await asyncio.to_thread(
+            Translator(to_lang="en", from_lang=source).translate, text
+        )
+    except (LangDetectException, TypeError, ValueError):
+        LOGGER.exception("Message context translation failed message=%s", message.id)
+        await interaction.followup.send(
+            "I could not detect or translate that message.", ephemeral=True
+        )
+        return
+    embed = discord.Embed(
+        title=f"{source.upper()} → EN",
+        description=str(translated)[:1900],
+        color=discord.Color.blurple(),
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class Minecraftpvp(discord.ui.View):
@@ -3946,7 +2703,7 @@ class Minecraftpvp(discord.ui.View):
                     self.membertwo_resistance = False
                 self.membertwo_healthpoint -= damagevalue
                 await interaction.response.send_message(
-                    f"You dealt {damagevalue} to {self.membertwoname}.",
+                    f"You dealt **{damagevalue:.1f}** damage to {self.membertwoname}.",
                     ephemeral=True,
                 )
                 play_minecraft_sound(self.vc, f"{attackchoice.title()}_attack1.ogg")
@@ -3975,12 +2732,16 @@ class Minecraftpvp(discord.ui.View):
                         self._finish()
                         return
                 if _message is not None:
-                    lastmessage = " ."
+                    last_message = "."
                     if shielddisabled:
                         play_minecraft_sound(self.vc, "Shield_block5.ogg")
-                        lastmessage = " and disabled the shields!"
+                        last_message = " and broke through their shield!"
                     embed = _message.embeds[0]
-                    embed.description = f"`{self.memberonename} landed {self.membertwoname} with a {attackchoice} hit and dealt {damagevalue}{lastmessage}`"
+                    embed.description = (
+                        f"**{self.memberonename}** landed a **{attackchoice}** hit on "
+                        f"**{self.membertwoname}** for **{damagevalue:.1f} damage**"
+                        f"{last_message}"
+                    )
                     embed.set_field_at(
                         index=1,
                         name=f"{self.membertwoname}'s health ",
@@ -4018,7 +2779,7 @@ class Minecraftpvp(discord.ui.View):
                     self.memberone_resistance = False
                 self.memberone_healthpoint -= damagevalue
                 await interaction.response.send_message(
-                    f"You dealt {damagevalue} to {self.memberonename}.",
+                    f"You dealt **{damagevalue:.1f}** damage to {self.memberonename}.",
                     ephemeral=True,
                 )
                 play_minecraft_sound(self.vc, f"{attackchoice.title()}_attack1.ogg")
@@ -4047,12 +2808,16 @@ class Minecraftpvp(discord.ui.View):
                         self._finish()
                         return
                 if _message is not None:
-                    lastmessage = " ."
+                    last_message = "."
                     if shielddisabled:
                         play_minecraft_sound(self.vc, "Shield_block5.ogg")
-                        lastmessage = " and disabled the shields!"
+                        last_message = " and broke through their shield!"
                     embed = _message.embeds[0]
-                    embed.description = f"`{self.membertwoname} landed {self.memberonename} with a {attackchoice} hit and dealt {damagevalue}{lastmessage}`"
+                    embed.description = (
+                        f"**{self.membertwoname}** landed a **{attackchoice}** hit on "
+                        f"**{self.memberonename}** for **{damagevalue:.1f} damage**"
+                        f"{last_message}"
+                    )
                     embed.set_field_at(
                         index=0,
                         name=f"{self.memberonename}'s health ",
@@ -4069,38 +2834,6 @@ class Minecraftpvp(discord.ui.View):
                     await _message.edit(
                         embed=embed, content=f"<@{self.moveturn}> 's turn to fight!"
                     )
-
-
-class ConfirmPrivate(discord.ui.View):
-    def __init__(self, memberids, membername, privatemsg):
-        self.memberids = memberids
-        self.msgauthor = membername
-        self.msg = privatemsg
-        super().__init__(timeout=None)
-
-    # When the confirm button is pressed, set the inner value to `True` and
-    # stop the View from listening to more input.
-    # We also send the user an ephemeral message that we're confirming their choice.
-
-    @discord.ui.button(
-        label="View Content",
-        style=discord.ButtonStyle.green,
-        custom_id="confirmprivate:green",
-    )
-    async def green(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in self.memberids and not checkstaff(
-            interaction.user
-        ):
-            await interaction.response.send_message(
-                "You do not have permissions to access that private message.",
-                ephemeral=True,
-            )
-        else:
-            embed = discord.Embed(
-                title="Private chat", description=f"Sent by {self.msgauthor}"
-            )
-            embed.add_field(name="Content", value=f"|| {self.msg} ||")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 def is_custom_command(command_name):
@@ -4544,11 +3277,6 @@ async def on_guild_join(guild):
                 break
     except Exception as error:
         logging.log(logging.ERROR, f" on_guild_join: {format_exception(error)}")
-
-
-@client.event
-async def on_raw_bulk_message_delete(payload):
-    pass
 
 
 @client.event

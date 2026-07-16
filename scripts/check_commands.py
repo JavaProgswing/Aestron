@@ -7,7 +7,13 @@ import asyncio
 import discord
 
 import main
-from aestron_bot import audit_command_metadata, normalize_command_metadata
+from aestron_bot import (
+    audit_application_command_metadata,
+    audit_command_metadata,
+    normalize_application_command_metadata,
+    normalize_command_metadata,
+)
+from aestron_bot.help_command import AestronHelpCommand
 
 
 async def check_commands() -> dict[str, int]:
@@ -15,7 +21,7 @@ async def check_commands() -> dict[str, int]:
     bot = main.MyBot(
         command_prefix="a!",
         intents=discord.Intents.none(),
-        help_command=main.MyHelp(),
+        help_command=AestronHelpCommand(),
     )
     try:
         for cog_type in main.get_cog_types():
@@ -23,7 +29,8 @@ async def check_commands() -> dict[str, int]:
         await bot.add_cog(main.Statistics(bot, bot.statistics))
         await bot.load_extension("jishaku")
         normalize_command_metadata(bot)
-        issues = audit_command_metadata(bot)
+        normalize_application_command_metadata(bot)
+        issues = audit_command_metadata(bot) + audit_application_command_metadata(bot)
         if issues:
             details = "\n".join(
                 f"- {issue.command}.{issue.field}: {issue.detail}" for issue in issues

@@ -12,6 +12,59 @@ from discord.ext import commands
 
 from .command_docs import command_invocation
 
+HELP_CATEGORY_LAYOUT = (
+    (
+        "Start Here",
+        "Bot information, help, support, feedback, and runtime statistics.",
+        {"AestronInfo", "Support", "Feedback", "Statistics"},
+    ),
+    (
+        "Safety & Moderation",
+        "Moderation, AutoMod, anti-raid, verification, and audit logging.",
+        {"Moderation", "AutoMod", "AntiRaid", "Captcha", "AuditLogging"},
+    ),
+    (
+        "Server Setup",
+        "Tickets, templates, custom commands, and server configuration.",
+        {"Tickets", "Templates", "CustomCommands"},
+    ),
+    (
+        "Community",
+        "Profiles, social cards, giveaways, leveling, and community activities.",
+        {"Community", "Social", "Giveaways", "Leveling"},
+    ),
+    (
+        "Games & Fun",
+        "Quick games, trivia, conversation starters, and Minecraft economy games.",
+        {"FunGames", "MinecraftFun"},
+    ),
+    (
+        "Music & Voice",
+        "Music playback, voice diagnostics, Discord activities, and private calls.",
+        {"Music", "Calls"},
+    ),
+    (
+        "VALORANT",
+        "Account linking, match history, performance analysis, and coaching.",
+        {"Valorant"},
+    ),
+    (
+        "Utilities",
+        "Reminders, calculations, weather, AFK status, and other practical tools.",
+        {"Misc"},
+    ),
+)
+
+
+def help_category_for(cog_name: str) -> tuple[str, str]:
+    """Map internal cog boundaries to a small user-facing category set."""
+    if cog_name == "Other":
+        return HELP_CATEGORY_LAYOUT[0][0], HELP_CATEGORY_LAYOUT[0][1]
+    for name, description, cog_names in HELP_CATEGORY_LAYOUT:
+        if cog_name in cog_names:
+            return name, description
+    return "Other", "Additional commands."
+
 
 @dataclass(frozen=True, slots=True)
 class HelpCategory:
@@ -43,6 +96,16 @@ def build_command_help_embed(
         embed.add_field(
             name="Command group",
             value=f"`{command.parent.qualified_name}`",
+            inline=False,
+        )
+    if isinstance(command, commands.Group) and command.commands:
+        subcommands = sorted(command.commands, key=lambda child: child.name)
+        embed.add_field(
+            name="Subcommands",
+            value="\n".join(
+                f"`{command_invocation(child, prefix)}` — {child.brief}"
+                for child in subcommands[:12]
+            )[:1024],
             inline=False,
         )
     placeholders = command.extras.get("placeholders")
