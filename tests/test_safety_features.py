@@ -409,28 +409,49 @@ def test_verification_button_is_restart_safe_and_template_urls_are_validated():
 
 
 def test_template_backup_refreshes_discords_single_existing_template():
-    """Backup must sync and edit the existing template instead of creating a second."""
+    """Backup must bypass discord.py's fragile source-guild deserialization."""
 
     async def run_test():
-        updated = SimpleNamespace()
-        synced = SimpleNamespace(edit=AsyncMock(return_value=updated))
-        existing = SimpleNamespace(sync=AsyncMock(return_value=synced))
-        guild = SimpleNamespace(
-            name="Example Guild",
-            templates=AsyncMock(return_value=[existing]),
+        payload = {
+            "code": "backup-code",
+            "name": "Example Guild backup",
+            "description": "Current server state",
+            "usage_count": 2,
+            "source_guild_id": "123",
+            "serialized_source_guild": {
+                "name": "Example Guild",
+                "channels": [{"id": "1"}],
+                # This nullable value is what crashes discord.Template in 2.7.1.
+                "roles": [{"id": "1", "colors": None}],
+            },
+        }
+        http = SimpleNamespace(
+            guild_templates=AsyncMock(return_value=[payload]),
+            sync_template=AsyncMock(return_value=payload),
+            edit_template=AsyncMock(return_value=payload),
             create_template=AsyncMock(),
+        )
+        guild = SimpleNamespace(
+            id=123,
+            name="Example Guild",
+            _state=SimpleNamespace(http=http),
         )
         cog = Templates(SimpleNamespace())
 
         result = await cog._create_backup(guild, "Current server state")
 
-        assert result is updated
-        existing.sync.assert_awaited_once_with()
-        synced.edit.assert_awaited_once_with(
-            name="Example Guild backup",
-            description="Current server state",
+        assert result.code == "backup-code"
+        assert result.role_count == 1
+        http.sync_template.assert_awaited_once_with(123, "backup-code")
+        http.edit_template.assert_awaited_once_with(
+            123,
+            "backup-code",
+            {
+                "name": "Example Guild backup",
+                "description": "Current server state",
+            },
         )
-        guild.create_template.assert_not_awaited()
+        http.create_template.assert_not_awaited()
 
     asyncio.run(run_test())
 

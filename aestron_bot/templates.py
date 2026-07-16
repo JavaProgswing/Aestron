@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlparse
 
 import discord
@@ -11,6 +14,49 @@ from discord import app_commands
 from discord.ext import commands
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateMetadata:
+    """Template metadata read without deserializing its guild snapshot."""
+
+    code: str
+    name: str
+    description: str | None
+    usage_count: int
+    source_guild_id: int
+    source_guild_name: str
+    channel_count: int
+    role_count: int
+
+
+def _template_metadata_from_payload(
+    payload: Mapping[str, Any], guild: discord.Guild | None = None
+) -> TemplateMetadata:
+    """Convert Discord's raw payload without constructing ``discord.Template``.
+
+    Template snapshots can contain nullable role colour objects. discord.py 2.7.1
+    currently assumes those objects are mappings while constructing the embedded
+    source guild, so owned-template commands deliberately use only bounded metadata.
+    """
+    source = payload.get("serialized_source_guild")
+    source = source if isinstance(source, Mapping) else {}
+    channels = source.get("channels")
+    roles = source.get("roles")
+    fallback_name = guild.name if guild is not None else "Discord server"
+    fallback_id = guild.id if guild is not None else 0
+    return TemplateMetadata(
+        code=str(payload["code"]),
+        name=str(payload.get("name") or f"{fallback_name} template"),
+        description=(
+            str(payload["description"]) if payload.get("description") else None
+        ),
+        usage_count=int(payload.get("usage_count") or 0),
+        source_guild_id=int(payload.get("source_guild_id") or fallback_id),
+        source_guild_name=str(source.get("name") or fallback_name),
+        channel_count=len(channels) if isinstance(channels, list) else 0,
+        role_count=len(roles) if isinstance(roles, list) else 0,
+    )
 
 
 def _template_code(value: str) -> str:
@@ -30,9 +76,8 @@ def _template_code(value: str) -> str:
     return value
 
 
-def _template_embed(template: discord.Template) -> discord.Embed:
-    """Render bounded, non-destructive template details."""
-    source = template.source_guild
+def _template_embed(template: TemplateMetadata) -> discord.Embed:
+    """Render template metadata without parsing its source guild."""
     embed = discord.Embed(
         title=template.name,
         description=template.description or "No description provided.",
@@ -41,9 +86,13 @@ def _template_embed(template: discord.Template) -> discord.Embed:
     )
     embed.add_field(name="Code", value=f"`{template.code}`")
     embed.add_field(name="Uses", value=str(template.usage_count))
-    embed.add_field(name="Source", value=f"{source.name} (`{source.id}`)", inline=False)
-    embed.add_field(name="Channels", value=str(len(source.channels)))
-    embed.add_field(name="Roles", value=str(len(source.roles)))
+    embed.add_field(
+        name="Source",
+        value=f"{template.source_guild_name} (`{template.source_guild_id}`)",
+        inline=False,
+    )
+    embed.add_field(name="Channels", value=str(template.channel_count))
+    embed.add_field(name="Roles", value=str(template.role_count))
     embed.set_footer(
         text="Opening a template creates a new server; it does not overwrite this one."
     )
@@ -67,50 +116,57 @@ class Templates(commands.Cog):
 
     async def _create_backup(
         self, guild: discord.Guild, description: str | None = None
-    ) -> discord.Template:
-        """Create the guild template or refresh Discord's single existing one."""
+    ) -> TemplateMetadata:
+        """Create or refresh the guild's template using raw API payloads."""
         name = f"{guild.name} backup"[:100]
         template_description = (description or "Aestron server backup")[:120]
-        templates = await guild.templates()
+        http = guild._state.http
+        templates = await http.guild_templates(guild.id)
         if templates:
-            synced = await templates[0].sync()
-            return await synced.edit(
-                name=name,
-                description=template_description,
+            code = str(templates[0]["code"])
+            await http.sync_template(guild.id, code)
+            updated = await http.edit_template(
+                guild.id,
+                code,
+                {"name": name, "description": template_description},
             )
+            return _template_metadata_from_payload(updated, guild)
 
         try:
-            return await guild.create_template(
-                name=name,
-                description=template_description,
+            created = await http.create_template(
+                guild.id,
+                {"name": name, "description": template_description},
             )
+            return _template_metadata_from_payload(created, guild)
         except discord.HTTPException as error:
             # Another process may create the one allowed guild template after
             # our initial lookup. Recover from that race instead of surfacing
             # Discord error 30031 to the command user.
             if error.code != 30031:
                 raise
-            templates = await guild.templates()
+            templates = await http.guild_templates(guild.id)
             if not templates:
                 raise
-            synced = await templates[0].sync()
-            return await synced.edit(
-                name=name,
-                description=template_description,
+            code = str(templates[0]["code"])
+            await http.sync_template(guild.id, code)
+            updated = await http.edit_template(
+                guild.id,
+                code,
+                {"name": name, "description": template_description},
             )
+            return _template_metadata_from_payload(updated, guild)
 
     async def _owned_template(
         self, guild: discord.Guild, code: str
-    ) -> discord.Template:
+    ) -> TemplateMetadata:
         normalized = _template_code(code).casefold()
-        template = discord.utils.find(
-            lambda item: item.code.casefold() == normalized, await guild.templates()
+        payloads = await guild._state.http.guild_templates(guild.id)
+        for payload in payloads:
+            if str(payload.get("code", "")).casefold() == normalized:
+                return _template_metadata_from_payload(payload, guild)
+        raise commands.BadArgument(
+            "That template is not owned by this server. Use template preview for external templates."
         )
-        if template is None:
-            raise commands.BadArgument(
-                "That template is not owned by this server. Use template preview for external templates."
-            )
-        return template
 
     @commands.cooldown(1, 30, commands.BucketType.guild)
     @commands.hybrid_command(
@@ -165,8 +221,11 @@ class Templates(commands.Cog):
     @commands.has_permissions(manage_guild=True)
     async def settemplate(self, ctx: commands.Context, template: str) -> None:
         """Safely preview the template old versions attempted to apply destructively."""
-        fetched = await self.bot.fetch_template(_template_code(template))
-        await ctx.send(embed=_template_embed(fetched), ephemeral=True)
+        payload = await self.bot.http.get_template(_template_code(template))
+        await ctx.send(
+            embed=_template_embed(_template_metadata_from_payload(payload)),
+            ephemeral=True,
+        )
 
     @template.command(
         name="backup", description="Create or refresh the server backup template."
@@ -196,7 +255,12 @@ class Templates(commands.Cog):
     async def slash_list(self, interaction: discord.Interaction) -> None:
         """List owned templates without exposing them publicly."""
         await interaction.response.defer(ephemeral=True)
-        templates = await interaction.guild.templates()
+        templates = [
+            _template_metadata_from_payload(payload, interaction.guild)
+            for payload in await interaction.guild._state.http.guild_templates(
+                interaction.guild_id
+            )
+        ]
         embed = discord.Embed(title="Server templates", color=0x5865F2)
         embed.description = (
             "\n".join(
@@ -218,8 +282,11 @@ class Templates(commands.Cog):
     ) -> None:
         """Preview a template through slash commands."""
         await interaction.response.defer(ephemeral=True)
-        template = await self.bot.fetch_template(_template_code(code_or_url))
-        await interaction.followup.send(embed=_template_embed(template), ephemeral=True)
+        payload = await self.bot.http.get_template(_template_code(code_or_url))
+        await interaction.followup.send(
+            embed=_template_embed(_template_metadata_from_payload(payload)),
+            ephemeral=True,
+        )
 
     @template.command(name="sync", description="Sync an owned template to this server.")
     @app_commands.default_permissions(manage_guild=True)
@@ -239,7 +306,10 @@ class Templates(commands.Cog):
             return
         async with lock:
             template = await self._owned_template(interaction.guild, template_code)
-            synced = await template.sync()
+            payload = await interaction.guild._state.http.sync_template(
+                interaction.guild_id, template.code
+            )
+            synced = _template_metadata_from_payload(payload, interaction.guild)
         await interaction.followup.send(embed=_template_embed(synced), ephemeral=True)
 
     @template.command(name="delete", description="Delete an owned server template.")
@@ -259,7 +329,9 @@ class Templates(commands.Cog):
             return
         async with lock:
             template = await self._owned_template(interaction.guild, template_code)
-            await template.delete()
+            await interaction.guild._state.http.delete_template(
+                interaction.guild_id, template.code
+            )
         await interaction.response.send_message(
             f"Deleted template `{template.code}`.", ephemeral=True
         )
