@@ -404,11 +404,17 @@ class GuildOperations(commands.Cog):
             if candidates
             else None
         )
-        response = await interaction.followup.send(
-            embed=self.pruning.preview_embed(candidates, inactive_days),
-            view=view,
-            ephemeral=True,
-            wait=True,
-        )
         if view is not None:
+            response = await interaction.followup.send(
+                embed=self.pruning.preview_embed(candidates, inactive_days),
+                view=view,
+                ephemeral=True,
+                wait=True,
+            )
             view.message = response
+        else:
+            await interaction.followup.send(
+                embed=self.pruning.preview_embed(candidates, inactive_days),
+                ephemeral=True,
+                wait=True,
+            )
