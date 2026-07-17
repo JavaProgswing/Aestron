@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from datetime import timedelta
@@ -69,6 +70,9 @@ class Giveaways(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         """Store the bot used by the due-giveaway worker."""
         self.bot = bot
+        # Keep the persisted entry count and its Discord message ordered when
+        # several component interactions arrive at nearly the same time.
+        self._entry_locks: dict[int, asyncio.Lock] = {}
 
     async def cog_load(self) -> None:
         """Register persistent controls, storage, and the due-date worker."""
@@ -217,39 +221,71 @@ class Giveaways(commands.Cog):
                 "This giveaway is unavailable.", ephemeral=True
             )
             return
-        async with self.bot.database.pool.acquire() as connection:
-            row = await connection.fetchrow(
-                "SELECT status, ends_at FROM aestron_giveaways WHERE message_id = $1",
-                interaction.message.id,
-            )
-            if row is None or row["status"] != "active":
-                await interaction.response.send_message(
-                    "This giveaway has ended.", ephemeral=True
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message_id = interaction.message.id
+        lock = self._entry_locks.setdefault(message_id, asyncio.Lock())
+        async with lock:
+            async with self.bot.database.pool.acquire() as connection:
+                async with connection.transaction():
+                    row = await connection.fetchrow(
+                        "SELECT * FROM aestron_giveaways "
+                        "WHERE message_id = $1 FOR UPDATE",
+                        message_id,
+                    )
+                    if row is None or row["status"] != "active":
+                        await interaction.followup.send(
+                            "This giveaway has ended.", ephemeral=True
+                        )
+                        return
+                    if row["ends_at"] <= discord.utils.utcnow():
+                        await interaction.followup.send(
+                            "This giveaway is ending now.", ephemeral=True
+                        )
+                        return
+                    if enter:
+                        changed_user_id = await connection.fetchval(
+                            "INSERT INTO aestron_giveaway_entries "
+                            "(message_id, user_id) VALUES ($1, $2) "
+                            "ON CONFLICT DO NOTHING RETURNING user_id",
+                            message_id,
+                            interaction.user.id,
+                        )
+                    else:
+                        changed_user_id = await connection.fetchval(
+                            "DELETE FROM aestron_giveaway_entries "
+                            "WHERE message_id = $1 AND user_id = $2 "
+                            "RETURNING user_id",
+                            message_id,
+                            interaction.user.id,
+                        )
+                    entries = int(
+                        await connection.fetchval(
+                            "SELECT COUNT(*) FROM aestron_giveaway_entries "
+                            "WHERE message_id = $1",
+                            message_id,
+                        )
+                    )
+
+            try:
+                await interaction.message.edit(
+                    embed=self._embed(row, entries=entries)
                 )
-                return
-            if row["ends_at"] <= discord.utils.utcnow():
-                await interaction.response.send_message(
-                    "This giveaway is ending now.", ephemeral=True
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                LOGGER.exception(
+                    "Could not refresh giveaway entry count message=%s", message_id
                 )
-                return
-            if enter:
-                await connection.execute(
-                    "INSERT INTO aestron_giveaway_entries (message_id, user_id) "
-                    "VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                    interaction.message.id,
-                    interaction.user.id,
-                )
+
+            if enter and changed_user_id is not None:
+                response = "You entered the giveaway."
+            elif enter:
+                response = "You are already entered in this giveaway."
+            elif changed_user_id is not None:
+                response = "You left the giveaway."
             else:
-                await connection.execute(
-                    "DELETE FROM aestron_giveaway_entries "
-                    "WHERE message_id = $1 AND user_id = $2",
-                    interaction.message.id,
-                    interaction.user.id,
-                )
-        await interaction.response.send_message(
-            "You entered the giveaway." if enter else "You left the giveaway.",
-            ephemeral=True,
-        )
+                response = "You were not entered in this giveaway."
+            await interaction.followup.send(
+                f"{response} **Entries: {entries}**", ephemeral=True
+            )
 
     async def _eligible_ids(self, row) -> list[int]:
         guild = self.bot.get_guild(int(row["guild_id"]))
@@ -308,6 +344,31 @@ class Giveaways(commands.Cog):
                 LOGGER.exception("Could not finalize giveaway message=%s", message_id)
         return winners
 
+    async def _refresh_active_messages(self) -> None:
+        """Reconcile active giveaway embeds with persisted entries after restart."""
+        async with self.bot.database.pool.acquire() as connection:
+            rows = await connection.fetch(
+                "SELECT g.*, (SELECT COUNT(*) FROM aestron_giveaway_entries e "
+                "WHERE e.message_id = g.message_id) AS entries "
+                "FROM aestron_giveaways g "
+                "WHERE g.status = 'active' AND g.ends_at > NOW()"
+            )
+        for row in rows:
+            guild = self.bot.get_guild(int(row["guild_id"]))
+            channel = guild.get_channel(int(row["channel_id"])) if guild else None
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            try:
+                message = await channel.fetch_message(int(row["message_id"]))
+                await message.edit(
+                    embed=self._embed(row, entries=int(row["entries"]))
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                LOGGER.warning(
+                    "Could not reconcile active giveaway message=%s",
+                    row["message_id"],
+                )
+
     @tasks.loop(seconds=15)
     async def finish_due_giveaways(self) -> None:
         """Resume and finish due giveaways after any bot restart."""
@@ -321,8 +382,9 @@ class Giveaways(commands.Cog):
 
     @finish_due_giveaways.before_loop
     async def before_finish_worker(self) -> None:
-        """Wait for Discord cache readiness before resolving guild members."""
+        """Wait for cache readiness and reconcile persisted giveaway messages."""
         await self.bot.wait_until_ready()
+        await self._refresh_active_messages()
 
     async def _reroll(self, message_id: int, winner_count: int = 1) -> list[int]:
         async with self.bot.database.pool.acquire() as connection:

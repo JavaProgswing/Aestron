@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+from datetime import timedelta
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -472,6 +473,69 @@ def test_ticket_views_are_persistent_and_channel_names_are_safe():
     assert _safe_channel_name("✨") == "member"
 
 
+def test_ticket_claim_button_does_not_overwrite_or_repeat_claims():
+    """Persistent claim clicks must report existing ownership truthfully."""
+
+    class AsyncContext:
+        async def __aenter__(self):
+            return connection
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Connection:
+        def __init__(self):
+            self.claim_updates = 0
+
+        async def fetchval(self, query, *args):
+            assert "claimed_by IS NULL" in query
+            self.claim_updates += 1
+            return args[0]
+
+    async def run_test():
+        nonlocal connection
+        connection = Connection()
+        pool = SimpleNamespace(acquire=AsyncContext)
+        bot = SimpleNamespace(database=SimpleNamespace(pool=pool))
+        cog = Tickets(bot)
+        cog._require_ticket_access = AsyncMock(
+            side_effect=[
+                {"claimed_by": None},
+                {"claimed_by": 55},
+                {"claimed_by": 99},
+            ]
+        )
+        cog._log_event = AsyncMock()
+
+        def interaction():
+            return SimpleNamespace(
+                user=SimpleNamespace(id=55, mention="<@55>"),
+                channel_id=456,
+                channel=SimpleNamespace(id=456),
+                guild=SimpleNamespace(id=123),
+                response=SimpleNamespace(send_message=AsyncMock()),
+            )
+
+        first = interaction()
+        await cog.claim_ticket(first)
+        assert "claimed by <@55>" in first.response.send_message.await_args.args[0]
+
+        duplicate = interaction()
+        await cog.claim_ticket(duplicate)
+        assert "already claimed" in duplicate.response.send_message.await_args.args[0]
+
+        occupied = interaction()
+        await cog.claim_ticket(occupied)
+        assert "already claimed by <@99>" in (
+            occupied.response.send_message.await_args.args[0]
+        )
+        assert connection.claim_updates == 1
+        cog._log_event.assert_awaited_once()
+
+    connection = None
+    asyncio.run(run_test())
+
+
 def test_guided_safety_setup_is_multi_channel_and_restart_safe():
     """Guides cover multiple channel types while public buttons survive restarts."""
     automod_source = inspect.getsource(AutoModSetupView)
@@ -558,6 +622,102 @@ def test_giveaway_buttons_are_restart_safe():
         "aestron:giveaway:enter:v1",
         "aestron:giveaway:leave:v1",
     }
+
+
+def test_giveaway_entry_buttons_report_real_changes_and_refresh_count():
+    """Duplicate entry/leave clicks must not claim a database change occurred."""
+
+    class AsyncContext:
+        def __init__(self, value=None):
+            self.value = value
+
+        async def __aenter__(self):
+            return self.value
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class GiveawayConnection:
+        def __init__(self):
+            self.entries: set[int] = set()
+            self.row = {
+                "message_id": 987,
+                "guild_id": 123,
+                "channel_id": 456,
+                "host_id": 42,
+                "prize": "A useful prize",
+                "winner_count": 1,
+                "ends_at": discord.utils.utcnow() + timedelta(hours=1),
+                "status": "active",
+            }
+
+        def transaction(self):
+            return AsyncContext()
+
+        async def fetchrow(self, query, message_id):
+            assert "FOR UPDATE" in query
+            assert message_id == self.row["message_id"]
+            return self.row
+
+        async def fetchval(self, query, message_id, user_id=None):
+            assert message_id == self.row["message_id"]
+            if query.startswith("INSERT"):
+                if user_id in self.entries:
+                    return None
+                self.entries.add(user_id)
+                return user_id
+            if query.startswith("DELETE"):
+                if user_id not in self.entries:
+                    return None
+                self.entries.remove(user_id)
+                return user_id
+            assert "COUNT(*)" in query
+            return len(self.entries)
+
+    async def run_test():
+        connection = GiveawayConnection()
+        pool = SimpleNamespace(acquire=lambda: AsyncContext(connection))
+        bot = SimpleNamespace(database=SimpleNamespace(pool=pool))
+        cog = Giveaways(bot)
+        message = SimpleNamespace(id=987, edit=AsyncMock())
+
+        def interaction():
+            return SimpleNamespace(
+                message=message,
+                guild=SimpleNamespace(id=123),
+                user=SimpleNamespace(id=55),
+                response=SimpleNamespace(defer=AsyncMock()),
+                followup=SimpleNamespace(send=AsyncMock()),
+            )
+
+        entered = interaction()
+        await cog.update_entry(entered, enter=True)
+        assert "You entered" in entered.followup.send.await_args.args[0]
+        assert "Entries: 1" in entered.followup.send.await_args.args[0]
+
+        duplicate = interaction()
+        await cog.update_entry(duplicate, enter=True)
+        assert "already entered" in duplicate.followup.send.await_args.args[0]
+        assert len(connection.entries) == 1
+
+        left = interaction()
+        await cog.update_entry(left, enter=False)
+        assert "You left" in left.followup.send.await_args.args[0]
+        assert "Entries: 0" in left.followup.send.await_args.args[0]
+
+        missing = interaction()
+        await cog.update_entry(missing, enter=False)
+        assert "were not entered" in missing.followup.send.await_args.args[0]
+        assert len(connection.entries) == 0
+
+        latest_embed = message.edit.await_args.kwargs["embed"]
+        entries_field = next(
+            field for field in latest_embed.fields if field.name == "Entries"
+        )
+        assert entries_field.value == "0"
+        assert message.edit.await_count == 4
+
+    asyncio.run(run_test())
 
 
 def test_private_call_invites_are_bounded_and_consent_based():

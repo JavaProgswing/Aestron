@@ -569,12 +569,36 @@ class Tickets(commands.Cog):
         ticket = await self._require_ticket_access(interaction, staff_only=True)
         if ticket is None:
             return
+        claimed_by = ticket["claimed_by"]
+        if claimed_by is not None:
+            message = (
+                "You already claimed this ticket."
+                if int(claimed_by) == interaction.user.id
+                else f"This ticket is already claimed by <@{claimed_by}>."
+            )
+            await interaction.response.send_message(message, ephemeral=True)
+            return
         async with self.bot.database.pool.acquire() as connection:
-            await connection.execute(
-                "UPDATE support_tickets SET claimed_by = $1 WHERE channel_id = $2",
+            claimed_by = await connection.fetchval(
+                "UPDATE support_tickets SET claimed_by = $1 "
+                "WHERE channel_id = $2 AND claimed_by IS NULL "
+                "RETURNING claimed_by",
                 interaction.user.id,
                 interaction.channel_id,
             )
+            if claimed_by is None:
+                claimed_by = await connection.fetchval(
+                    "SELECT claimed_by FROM support_tickets WHERE channel_id = $1",
+                    interaction.channel_id,
+                )
+        if claimed_by != interaction.user.id:
+            message = (
+                f"This ticket was just claimed by <@{claimed_by}>."
+                if claimed_by is not None
+                else "This ticket is no longer available to claim."
+            )
+            await interaction.response.send_message(message, ephemeral=True)
+            return
         await self._log_event(
             interaction.guild,
             kind="claim",
