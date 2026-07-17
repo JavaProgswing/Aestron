@@ -43,6 +43,7 @@ def test_runtime_settings_have_safe_project_agnostic_defaults():
     assert settings.error_logging_channel_id is None
     assert settings.bug_logging_channel_id is None
     assert settings.development_channel_id is None
+    assert settings.operations_guild_id is None
     assert settings.support_server_invite is None
     assert settings.default_prefix == "a!"
     assert settings.version == "development"
@@ -54,6 +55,7 @@ def test_runtime_settings_parse_optional_values():
         {
             "BOT_OWNER_IDS": "123, 456,123",
             "CHANNEL_DEV_ID": "789",
+            "OPERATIONS_GUILD_ID": "987",
             "SUPPORT_SERVER_INVITE": "https://discord.gg/example",
             "DEFAULT_PREFIX": "!",
             "BOT_VERSION": "3.0.0",
@@ -61,6 +63,7 @@ def test_runtime_settings_parse_optional_values():
     )
     assert settings.owner_ids == frozenset({123, 456})
     assert settings.development_channel_id == 789
+    assert settings.operations_guild_id == 987
     assert settings.support_server_invite == "https://discord.gg/example"
     assert settings.default_prefix == "!"
     assert settings.version == "3.0.0"
@@ -76,6 +79,7 @@ def test_runtime_settings_parse_optional_values():
         ({"AESTRON_SITE_BASE_URL": "not-a-url"}, "absolute HTTP"),
         ({"AESTRON_SERVICE_TOKEN": "too-short"}, "at least 32"),
         ({"SYNC_COMMANDS_ON_STARTUP": "sometimes"}, "must be one of"),
+        ({"OPERATIONS_GUILD_ID": "not-a-guild"}, "OPERATIONS_GUILD_ID"),
     ],
 )
 def test_runtime_settings_reject_invalid_values(environment, message):

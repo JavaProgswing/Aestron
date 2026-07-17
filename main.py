@@ -51,7 +51,7 @@ from aestron_bot.community import Community
 from aestron_bot.feedback import Feedback
 from aestron_bot.fun import FunGames
 from aestron_bot.giveaways import Giveaways
-from aestron_bot.guild_operations import GuildOperations
+from aestron_bot.guild_operations import GuildOperations, scope_operations_commands
 from aestron_bot.help_command import AestronHelpCommand, SlashHelp
 from aestron_bot.info import AestronInfo
 from aestron_bot.leveling import Leveling
@@ -465,16 +465,24 @@ async def run_bot():
 
 
 async def sync_application_commands() -> None:
-    """Reconcile Discord's global slash commands with the loaded command tree."""
+    """Reconcile global commands and configured guild-only operation groups."""
     if not SETTINGS.sync_commands_on_startup:
         LOGGER.warning(
             "Slash-command startup sync is disabled; removed commands may remain visible"
         )
         return
 
+    operations_guild = scope_operations_commands(
+        client.tree, SETTINGS.operations_guild_id
+    )
     retry_delays = (1, 3)
     for attempt in range(len(retry_delays) + 1):
         try:
+            guild_synced = (
+                await client.tree.sync(guild=operations_guild)
+                if operations_guild is not None
+                else []
+            )
             synced = await client.tree.sync()
         except discord.HTTPException:
             if attempt == len(retry_delays):
@@ -498,6 +506,13 @@ async def sync_application_commands() -> None:
             len(synced),
             names,
         )
+        if operations_guild is not None:
+            LOGGER.info(
+                "Operations slash commands reconciled guild=%s count=%s names=%s",
+                operations_guild.id,
+                len(guild_synced),
+                ", ".join(command.name for command in guild_synced),
+            )
         return
 
 

@@ -4,7 +4,9 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from aestron_bot.guild_operations import GuildOperations
+import discord
+
+from aestron_bot.guild_operations import GuildOperations, scope_operations_commands
 from aestron_bot.update_broadcasts import BroadcastDraft
 
 
@@ -33,6 +35,23 @@ def test_guild_operations_groups_are_bounded_and_owner_checked():
         "broadcasts",
     }
     assert all(command.checks for command in GuildOperations.botadmin.commands)
+
+
+def test_operation_groups_move_to_one_configured_guild():
+    client = discord.Client(intents=discord.Intents.none())
+    tree = discord.app_commands.CommandTree(client)
+    tree.add_command(discord.app_commands.Group(name="updates", description="Updates"))
+    tree.add_command(
+        discord.app_commands.Group(name="botadmin", description="Administration")
+    )
+
+    guild = scope_operations_commands(tree, 123)
+
+    assert guild is not None and guild.id == 123
+    assert tree.get_command("updates") is None
+    assert tree.get_command("botadmin") is None
+    assert tree.get_command("updates", guild=guild) is not None
+    assert tree.get_command("botadmin", guild=guild) is not None
 
 
 def test_activity_is_batched_without_message_content_or_author_data():

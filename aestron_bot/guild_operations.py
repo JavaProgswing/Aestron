@@ -17,6 +17,26 @@ from .update_broadcasts import (
     UpdateBroadcastService,
 )
 
+OPERATIONS_COMMAND_NAMES = ("updates", "botadmin")
+
+
+def scope_operations_commands(
+    tree: app_commands.CommandTree,
+    guild_id: int | None,
+) -> discord.Object | None:
+    """Move fleet-operation slash groups from global scope to one guild."""
+    if guild_id is None:
+        return None
+    guild = discord.Object(id=guild_id)
+    for command_name in OPERATIONS_COMMAND_NAMES:
+        command = tree.remove_command(command_name)
+        if command is None:
+            raise RuntimeError(
+                f"Application command group {command_name!r} is not registered."
+            )
+        tree.add_command(command, guild=guild, override=True)
+    return guild
+
 
 async def _owner_only(interaction: discord.Interaction) -> bool:
     """Allow application commands only for a configured Discord bot owner."""

@@ -43,6 +43,7 @@ class RuntimeSettings:
     bug_logging_channel_id: int | None
     feedback_channel_id: int | None
     development_channel_id: int | None
+    operations_guild_id: int | None
     support_server_invite: str | None
     default_prefix: str
     version: str
@@ -105,6 +106,9 @@ class RuntimeSettings:
             ),
             feedback_channel_id=_optional_snowflake(values, "CHANNEL_FEEDBACK_ID"),
             development_channel_id=_optional_snowflake(values, "CHANNEL_DEV_ID"),
+            operations_guild_id=_optional_snowflake(
+                values, "OPERATIONS_GUILD_ID"
+            ),
             support_server_invite=support_invite,
             default_prefix=default_prefix,
             version=(

@@ -111,7 +111,9 @@ when the node has no working audio source.
 - `/botadmin activity`, `/botadmin broadcast`, and `/botadmin broadcasts` are
   owner-only fleet tools for private aggregate activity reports, confirmed
   subscriber broadcasts, and persisted delivery history. No message content or
-  author data is stored for activity tracking.
+  author data is stored for activity tracking. Set `OPERATIONS_GUILD_ID` to
+  register both `/updates` and `/botadmin` only in one server; startup performs
+  the separate guild sync and removes stale global copies.
 - `/help` (or `/help topic:<command or category>`) privately presents eight
   task-based categories instead of exposing internal cog boundaries. It
   acknowledges immediately, supports autocomplete, and shares the same
@@ -253,6 +255,8 @@ CHANNEL_DEV_ID=your-development-channel-id
 SUPPORT_SERVER_INVITE=https://discord.gg/your-invite
 DEFAULT_PREFIX=a!
 SYNC_COMMANDS_ON_STARTUP=true
+# Optional: make /updates and /botadmin immediately available only in this guild.
+OPERATIONS_GUILD_ID=your-discord-server-id
 BOT_VERSION=development
 ```
 
