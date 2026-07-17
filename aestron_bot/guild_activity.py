@@ -111,7 +111,14 @@ class GuildActivityTracker:
                     INSERT INTO aestron_guild_activity
                         (guild_id, message_count, command_count,
                          last_message_at, last_command_at, last_active_at)
-                    VALUES ($1, $2, $3, $4, $5, GREATEST($4, $5))
+                    VALUES (
+                        $1::BIGINT,
+                        $2::BIGINT,
+                        $3::BIGINT,
+                        $4::TIMESTAMPTZ,
+                        $5::TIMESTAMPTZ,
+                        GREATEST($4::TIMESTAMPTZ, $5::TIMESTAMPTZ)
+                    )
                     ON CONFLICT (guild_id) DO UPDATE SET
                         message_count = aestron_guild_activity.message_count
                             + EXCLUDED.message_count,

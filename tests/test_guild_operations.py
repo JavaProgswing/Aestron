@@ -42,6 +42,9 @@ def test_activity_is_batched_without_message_content_or_author_data():
 
         async def executemany(self, query, rows):
             assert "aestron_guild_activity" in query
+            assert "$4::TIMESTAMPTZ" in query
+            assert "$5::TIMESTAMPTZ" in query
+            assert "GREATEST($4::TIMESTAMPTZ, $5::TIMESTAMPTZ)" in query
             self.rows.extend(rows)
 
     async def run_test():
@@ -62,6 +65,46 @@ def test_activity_is_batched_without_message_content_or_author_data():
         assert len(connection.rows) == 1
         guild_id, messages, commands, last_message, last_command = connection.rows[0]
         assert (guild_id, messages, commands) == (91, 2, 1)
+        assert last_message is not None and last_command is not None
+        assert cog.activity.pending == {}
+
+    asyncio.run(run_test())
+
+
+def test_failed_activity_flush_is_retried_without_losing_new_events():
+    """A failed batch must merge back with events recorded before its retry."""
+
+    class Connection:
+        def __init__(self):
+            self.fail = True
+            self.rows = []
+
+        async def executemany(self, _query, rows):
+            if self.fail:
+                raise RuntimeError("temporary database failure")
+            self.rows.extend(rows)
+
+    async def run_test():
+        connection = Connection()
+        bot = SimpleNamespace(
+            database=SimpleNamespace(
+                connected=True,
+                pool=SimpleNamespace(acquire=lambda: AsyncContext(connection)),
+            )
+        )
+        cog = GuildOperations(bot)
+        cog.activity.record(91, command=False)
+
+        await cog.activity.flush()
+        assert cog.activity.pending[91].messages == 1
+
+        cog.activity.record(91, command=True)
+        connection.fail = False
+        await cog.activity.flush()
+
+        assert len(connection.rows) == 1
+        guild_id, messages, commands, last_message, last_command = connection.rows[0]
+        assert (guild_id, messages, commands) == (91, 1, 1)
         assert last_message is not None and last_command is not None
         assert cog.activity.pending == {}
 
