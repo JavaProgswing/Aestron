@@ -78,6 +78,33 @@ class GuildActivityTracker:
             self._flush_task = None
         await self.flush()
 
+    async def seed_guilds(self, guild_ids: list[int]) -> None:
+        """Begin a durable observation window without inventing activity."""
+        if not guild_ids or not self.bot.database.connected:
+            return
+        rows = [(guild_id,) for guild_id in dict.fromkeys(guild_ids)]
+        async with self.bot.database.pool.acquire() as connection:
+            await connection.executemany(
+                "INSERT INTO aestron_guild_activity (guild_id) "
+                "VALUES ($1::BIGINT) ON CONFLICT (guild_id) DO NOTHING",
+                rows,
+            )
+
+    async def reset_joined_guild(self, guild_id: int) -> None:
+        """Start a new observation window after a genuine bot rejoin."""
+        if not self.bot.database.connected:
+            return
+        async with self.bot.database.pool.acquire() as connection:
+            await connection.execute(
+                "INSERT INTO aestron_guild_activity (guild_id) "
+                "VALUES ($1::BIGINT) "
+                "ON CONFLICT (guild_id) DO UPDATE SET "
+                "message_count = 0, command_count = 0, "
+                "last_message_at = NULL, last_command_at = NULL, "
+                "last_active_at = NULL, first_seen_at = NOW(), updated_at = NOW()",
+                guild_id,
+            )
+
     def record(self, guild_id: int, *, command: bool) -> None:
         """Record a timestamp and count without database I/O."""
         delta = self.pending.setdefault(guild_id, ActivityDelta())

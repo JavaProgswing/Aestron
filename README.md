@@ -114,6 +114,10 @@ when the node has no working audio source.
   author data is stored for activity tracking. Set `OPERATIONS_GUILD_ID` to
   register both `/updates` and `/botadmin` only in one server; startup performs
   the separate guild sync and removes stale global copies.
+- `/botadmin prune [inactive_days] [farewell_message] [invite_url]` privately
+  previews guilds observed for the complete inactivity window, protects the
+  operations guild, requires confirmation, rechecks activity, optionally sends
+  a farewell in a writable public channel, and exports the result as CSV.
 - `/help` (or `/help topic:<command or category>`) privately presents eight
   task-based categories instead of exposing internal cog boundaries. It
   acknowledges immediately, supports autocomplete, and shares the same

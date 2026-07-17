@@ -1,12 +1,14 @@
 """Regression coverage for fleet activity and consent-based broadcasts."""
 
 import asyncio
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import discord
 
 from aestron_bot.guild_operations import GuildOperations, scope_operations_commands
+from aestron_bot.guild_pruning import PruneCandidate
 from aestron_bot.update_broadcasts import BroadcastDraft
 
 
@@ -33,6 +35,7 @@ def test_guild_operations_groups_are_bounded_and_owner_checked():
         "activity",
         "broadcast",
         "broadcasts",
+        "prune",
     }
     assert all(command.checks for command in GuildOperations.botadmin.commands)
 
@@ -126,6 +129,116 @@ def test_failed_activity_flush_is_retried_without_losing_new_events():
         assert (guild_id, messages, commands) == (91, 1, 1)
         assert last_message is not None and last_command is not None
         assert cog.activity.pending == {}
+
+    asyncio.run(run_test())
+
+
+def test_guild_observation_seeding_does_not_invent_activity():
+    """Current guilds get observation rows with zero synthetic messages."""
+
+    class Connection:
+        def __init__(self):
+            self.query = ""
+            self.rows = []
+            self.reset_query = ""
+            self.reset_guild_id = None
+
+        async def executemany(self, query, rows):
+            self.query = query
+            self.rows.extend(rows)
+
+        async def execute(self, query, guild_id):
+            self.reset_query = query
+            self.reset_guild_id = guild_id
+
+    async def run_test():
+        connection = Connection()
+        bot = SimpleNamespace(
+            database=SimpleNamespace(
+                connected=True,
+                pool=SimpleNamespace(acquire=lambda: AsyncContext(connection)),
+            )
+        )
+        cog = GuildOperations(bot)
+
+        await cog.activity.seed_guilds([91, 92, 91])
+
+        assert connection.rows == [(91,), (92,)]
+        assert "ON CONFLICT (guild_id) DO NOTHING" in connection.query
+        assert "message_count" not in connection.query
+
+        await cog.activity.reset_joined_guild(91)
+        assert connection.reset_guild_id == 91
+        assert "first_seen_at = NOW()" in connection.reset_query
+        assert "last_active_at = NULL" in connection.reset_query
+
+    asyncio.run(run_test())
+
+
+def test_prune_revalidates_activity_and_protects_the_control_guild():
+    """Cleanup leaves only still-inactive guilds from the confirmed snapshot."""
+
+    class Connection:
+        async def fetch(self, _query, _guild_ids):
+            now = discord.utils.utcnow()
+            return [
+                {
+                    "guild_id": 91,
+                    "first_seen_at": now - timedelta(days=60),
+                    "last_active_at": now - timedelta(days=45),
+                },
+                {
+                    "guild_id": 92,
+                    "first_seen_at": now - timedelta(days=60),
+                    "last_active_at": now - timedelta(minutes=1),
+                },
+                {
+                    "guild_id": 93,
+                    "first_seen_at": now - timedelta(days=60),
+                    "last_active_at": now - timedelta(days=45),
+                },
+            ]
+
+    async def run_test():
+        connection = Connection()
+        guilds = {
+            guild_id: SimpleNamespace(
+                id=guild_id,
+                name=f"Guild {guild_id}",
+                leave=AsyncMock(),
+            )
+            for guild_id in (91, 92, 93)
+        }
+        bot = SimpleNamespace(
+            database=SimpleNamespace(
+                pool=SimpleNamespace(acquire=lambda: AsyncContext(connection))
+            ),
+            get_guild=lambda guild_id: guilds.get(guild_id),
+        )
+        cog = GuildOperations(bot)
+        cog.pruning._send_notice = AsyncMock(return_value="not_requested")
+        old = discord.utils.utcnow() - timedelta(days=60)
+        candidates = [
+            PruneCandidate(guild_id, f"Guild {guild_id}", 10, old, old)
+            for guild_id in (91, 92, 93)
+        ]
+
+        results = await cog.pruning.execute(
+            candidates,
+            inactive_for=timedelta(days=30),
+            protected_guild_id=93,
+            farewell_message=None,
+            invite_url=None,
+        )
+
+        guilds[91].leave.assert_awaited_once()
+        guilds[92].leave.assert_not_awaited()
+        guilds[93].leave.assert_not_awaited()
+        assert [(result.guild_id, result.outcome) for result in results] == [
+            (91, "left"),
+            (92, "skipped"),
+            (93, "skipped"),
+        ]
 
     asyncio.run(run_test())
 

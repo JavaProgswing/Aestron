@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from datetime import timedelta
 from typing import cast
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from .guild_activity import GuildActivityTracker
+from .guild_pruning import GuildPruneConfirmation, GuildPruneService
 from .update_broadcasts import (
     BroadcastConfirmationView,
     BroadcastDraft,
@@ -62,6 +64,7 @@ class GuildOperations(commands.Cog):
         """Create modular activity and broadcast services."""
         self.bot = bot
         self.activity = GuildActivityTracker(bot)
+        self.pruning = GuildPruneService(bot)
         self.broadcasts = UpdateBroadcastService(bot)
         self._closed = False
 
@@ -90,6 +93,16 @@ class GuildOperations(commands.Cog):
             and not message.author.bot
         ):
             self.activity.record(message.guild.id, command=False)
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        """Start observation windows for every currently connected guild."""
+        await self.activity.seed_guilds([guild.id for guild in self.bot.guilds])
+
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        """Start a fresh observation window when Aestron joins a guild."""
+        await self.activity.reset_joined_guild(guild.id)
 
     @commands.Cog.listener()
     async def on_command(self, ctx: commands.Context) -> None:
@@ -328,3 +341,74 @@ class GuildOperations(commands.Cog):
             embed=await self.broadcasts.history_embed(),
             ephemeral=True,
         )
+
+    @botadmin.command(
+        name="prune",
+        description="Preview leaving guilds inactive for a complete observation window.",
+    )
+    @app_commands.describe(
+        inactive_days="Required observed inactivity, from 7 to 365 days.",
+        farewell_message="Optional message sent before Aestron leaves.",
+        invite_url="Optional Discord invite appended to the farewell.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.check(_owner_only)
+    @app_commands.checks.cooldown(1, 60, key=lambda interaction: interaction.user.id)
+    async def prune_guilds(
+        self,
+        interaction: discord.Interaction,
+        inactive_days: app_commands.Range[int, 7, 365] = 30,
+        farewell_message: app_commands.Range[str, 1, 1500] | None = None,
+        invite_url: app_commands.Range[str, 1, 300] | None = None,
+    ) -> None:
+        """Preview a guarded owner-confirmed inactive-guild cleanup."""
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Run this command in the configured operations guild.", ephemeral=True
+            )
+            return
+        if invite_url:
+            parsed = urlparse(invite_url.strip())
+            valid_invite = (
+                parsed.scheme == "https"
+                and parsed.netloc.casefold() in {"discord.gg", "discord.com"}
+                and (
+                    parsed.netloc.casefold() == "discord.gg"
+                    or parsed.path.casefold().startswith("/invite/")
+                )
+            )
+            if not valid_invite:
+                await interaction.response.send_message(
+                    "The invite must be an HTTPS discord.gg or discord.com/invite URL.",
+                    ephemeral=True,
+                )
+                return
+            invite_url = invite_url.strip()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        candidates = await self.pruning.candidates(
+            inactive_for=timedelta(days=inactive_days),
+            protected_guild_id=interaction.guild_id,
+        )
+        view = (
+            GuildPruneConfirmation(
+                self.pruning,
+                owner_id=interaction.user.id,
+                protected_guild_id=interaction.guild_id,
+                candidates=candidates,
+                inactive_days=inactive_days,
+                farewell_message=(
+                    farewell_message.strip() if farewell_message else None
+                ),
+                invite_url=invite_url,
+            )
+            if candidates
+            else None
+        )
+        response = await interaction.followup.send(
+            embed=self.pruning.preview_embed(candidates, inactive_days),
+            view=view,
+            ephemeral=True,
+            wait=True,
+        )
+        if view is not None:
+            view.message = response
