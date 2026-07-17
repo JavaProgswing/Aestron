@@ -105,6 +105,13 @@ when the node has no working audio source.
 - `/voicehealth` — diagnose the Lavalink node and latest voice error.
 - `/stats` — show commands used, successful/failed invocations, current and
   historical guild activity, uptime, latency, process activity, and music health.
+- `/updates subscribe [channel]`, `/updates unsubscribe`, and `/updates status`
+  let server managers explicitly opt one channel into official release and
+  service-status announcements. Aestron never searches for a fallback channel.
+- `/botadmin activity`, `/botadmin broadcast`, and `/botadmin broadcasts` are
+  owner-only fleet tools for private aggregate activity reports, confirmed
+  subscriber broadcasts, and persisted delivery history. No message content or
+  author data is stored for activity tracking.
 - `/help` (or `/help topic:<command or category>`) privately presents eight
   task-based categories instead of exposing internal cog boundaries. It
   acknowledges immediately, supports autocomplete, and shares the same

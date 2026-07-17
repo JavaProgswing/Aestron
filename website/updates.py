@@ -24,6 +24,29 @@ class ProductUpdate:
 
 PRODUCT_UPDATES = (
     ProductUpdate(
+        published="2026-07-17",
+        category="Fleet operations",
+        title="Consent-based bot updates and private guild activity reports",
+        summary=(
+            "Server managers can opt one explicit channel into release notices, "
+            "while bot owners get private aggregate activity and delivery reports."
+        ),
+        details=(
+            "Update announcements require /updates subscribe and never search for an unapproved fallback channel.",
+            "Owner broadcasts show an ephemeral preview and require confirmation before sequential, mention-free delivery.",
+            "Delivery outcomes persist per guild, including missing channels and permission failures.",
+            "Guild activity stores only batched counts and timestamps; message content, authors, and channel history are never retained.",
+            "The private activity command includes active-now and selected-window totals plus a complete CSV export.",
+        ),
+        commands=(
+            "/updates subscribe",
+            "/updates status",
+            "/botadmin activity",
+            "/botadmin broadcast",
+            "/botadmin broadcasts",
+        ),
+    ),
+    ProductUpdate(
         published="2026-07-16",
         category="Game dashboards",
         title="VALORANT and Minecraft become image-first",

@@ -51,6 +51,7 @@ from aestron_bot.community import Community
 from aestron_bot.feedback import Feedback
 from aestron_bot.fun import FunGames
 from aestron_bot.giveaways import Giveaways
+from aestron_bot.guild_operations import GuildOperations
 from aestron_bot.help_command import AestronHelpCommand, SlashHelp
 from aestron_bot.info import AestronInfo
 from aestron_bot.leveling import Leveling
@@ -390,6 +391,7 @@ def get_cog_types():
         AuditLogging,
         Moderation,
         AutoMod,
+        GuildOperations,
         SlashHelp,
         ServerOnboarding,
         Templates,
@@ -564,6 +566,9 @@ class MyBot(commands.Bot):
         if self.background_tasks:
             await asyncio.gather(*self.background_tasks, return_exceptions=True)
         self.background_tasks.clear()
+        guild_operations = self.get_cog("GuildOperations")
+        if guild_operations is not None:
+            await guild_operations.close()
         await self.statistics.close()
         await self.lavalink.close()
         for session_name in ("session",):

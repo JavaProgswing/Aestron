@@ -89,8 +89,10 @@ def test_every_registered_command_has_complete_documentation():
                 "help",
                 "minecraft",
                 "social",
+                "updates",
                 "valorant",
             } <= application_roots
+            assert "botadmin" in application_roots
             assert {
                 "enableantiraid",
                 "modsettings",

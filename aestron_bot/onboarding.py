@@ -47,7 +47,8 @@ def _guide_embed(guild: discord.Guild) -> discord.Embed:
         name="Useful checks",
         value=(
             "`/logs overview` shows safety, verification, ticket, and logging health.\n"
-            "`/automod status` and `/verification status` explain missing permissions."
+            "`/automod status` and `/verification status` explain missing permissions.\n"
+            "`/updates subscribe` opts one explicit channel into bot release updates."
         ),
         inline=False,
     )

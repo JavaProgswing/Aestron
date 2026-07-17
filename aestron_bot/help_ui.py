@@ -19,6 +19,7 @@ HELP_CATEGORY_LAYOUT = (
         {
             "AestronInfo",
             "Help",
+            "GuildOperations",
             "ServerOnboarding",
             "Support",
             "Feedback",
